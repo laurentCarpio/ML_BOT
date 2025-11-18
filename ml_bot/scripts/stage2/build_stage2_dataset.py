@@ -32,7 +32,7 @@ from collections import defaultdict
 _MONTH_RE = re.compile(r"(\d{4})-(\d{2})")
 BOOK_LEVELS = 15
 
-# Par défaut: 16 symbols & 4 TF (tu peux toujours passer --symbols / --tfs au CLI)
+# Par défaut: 15 symbols & 4 TF (tu peux toujours passer --symbols / --tfs au CLI)
 DEFAULT_SYMBOLS = [
     "APTUSDT","BCHUSDT","BNBUSDT","BTCUSDT","CRVUSDT","DOGEUSDT","DOTUSDT","ETHUSDT",
     "LINKUSDT","LTCUSDT","OPUSDT","SOLUSDT","SUIUSDT","WLDUSDT","XRPUSDT"
