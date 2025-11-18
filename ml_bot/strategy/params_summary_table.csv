@@ -1,0 +1,37 @@
+feature,description,source,window,unit
+t,timestamp UTC du signal,signals,n/a,datetime
+symbol,symbole de l'actif,signals,n/a,string
+side,côté du trade (buy/sell),signals,n/a,string
+entry,prix d'entrée au signal,signals,n/a,float
+chosen_freq,fréquence/stratégie d'origine,signals,n/a,string
+year,année du signal,signals,n/a,int
+,,,,
+atr_pct,ATR (14 périodes) / prix d’entrée,bougies,"[t−120min,t]",ratio
+,,,,
+spread_bps_entry,spread instantané L1=((ask−bid)/mid)*1e4,book L1,t,bps
+spread_widen_flag_10s,"flag=1 si spread_t ≥ P90(spread[t−10s,t])",book L1,"[t−10s,t]",bool
+quote_churn_10s,nombre de changements L1/sec,book L1,"[t−10s,t]",Hz
+microprice_bias,(microprice−mid)/mid avec pondération par size L1,book L1,t,ratio
+,,,,
+obi_5,Order Book Imbalance top-5 niveaux,book L2,t,ratio
+obi_15,Order Book Imbalance top-15 niveaux,book L2,t,ratio
+slope_bid_5,pente (livrabilité) côté bid (K=5),book L2,t,dimensionless
+slope_ask_5,pente (livrabilité) côté ask (K=5),book L2,t,dimensionless
+slope_bid_15,pente (livrabilité) côté bid (K=15),book L2,t,dimensionless
+slope_ask_15,pente (livrabilité) côté ask (K=15),book L2,t,dimensionless
+wall_opp_share_5,part du plus gros mur côté opposé (K=5),book L2,t,ratio
+wall_opp_share_15,part du plus gros mur côté opposé (K=15),book L2,t,ratio
+cum_depth_within_5bps_opp,profondeur cumulée côté opposé ±5bps,book L2,t,qty
+cum_depth_within_10bps_opp,profondeur cumulée côté opposé ±10bps,book L2,t,qty
+,,,,
+aggr_ratio_10s,ratio buy_qty/(buy+sell) sur 10s,trades,"[t−10s,t]",ratio
+aggr_ratio_15s,ratio buy_qty/(buy+sell) sur 15s,trades,"[t−15s,t]",ratio
+net_delta_15s,(buy−sell)/(buy+sell) sur 15s,trades,"[t−15s,t]",ratio
+,,,,
+ret_stdev_1s_10s_bps,σ des retours 1s sur 10s,book L1,"[t−10s,t]",bps
+mid_jump_bps_3s,variation absolue du mid sur 3s,book L1,"[t−3s,t]",bps
+,,,,
+pnl_net_rr{rr}_rf{rf}_ts{ts},PnL net RR ou SLIDE pour chaque combo,mid L1 post-signal,"[t, t+H]",ratio
+best_mode_rr{rr}_rf{rf}_ts{ts},"moteur gagnant (""RR""/""SLIDE"")",simulation,n/a,string
+pnl_net_frontier,meilleur PnL parmi les combos,simulation,n/a,ratio
+best_combo_frontier,"tuple (rr, rf, ts) gagnant",simulation,n/a,json

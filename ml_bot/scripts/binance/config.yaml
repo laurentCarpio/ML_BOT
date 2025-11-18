@@ -1,0 +1,70 @@
+data:
+  inputs:
+    - symbol: "APTUSDT"
+      freq: "1m"
+    - symbol: "BCHUSDT"
+      freq: "1m"
+    - symbol: "BNBUSDT"
+      freq: "1m"
+    - symbol: "BTCUSDT"
+      freq: "1m"
+    - symbol: "CRVUSDT"
+      freq: "1m"
+    - symbol: "DOGEUSDT"
+      freq: "1m"
+    - symbol: "DOTUSDT"
+      freq: "1m"
+    - symbol: "ETHUSDT"
+      freq: "1m"
+    - symbol: "LINKUSDT"
+      freq: "1m"
+    - symbol: "LTCUSDT"
+      freq: "1m"
+    - symbol: "MKRUSDT"
+      freq: "1m"
+    - symbol: "OPUSDT"
+      freq: "1m"
+    - symbol: "SOLUSDT"
+      freq: "1m"
+    - symbol: "SUIUSDT"
+      freq: "1m"
+    - symbol: "WLDUSDT"
+      freq: "1m"
+    - symbol: "XRPUSDT"
+      freq: "1m"
+
+sanity:
+  drop_duplicates: true
+  sort_by_ts: true
+  timezone: "UTC"
+
+exclusions:
+  global: []
+  by_symbol:
+    BTCUSDT: []
+    ETHUSDT: []
+    SOLUSDT: []
+
+outputs:
+  report_dir: "s3://tradebot-config-tokyo/data/bougie/binance_sanity"
+  write_clean_series: false   # les séries clean sont maintenant écrites en Parquet sur S3
+
+s3:
+  binance_daily_root: "s3://tradebot-config-tokyo/data/binance/futures/um/daily/klines"
+  bougies_root: "s3://tradebot-config-tokyo/data/bougie"
+
+anomaly_scan:
+  rules:
+    flat_candle_min: 10        # >=10 bougies consécutives sans mouvement = suspect
+    zero_volume_min: 15        # >=15 bougies volume==0 = suspect
+    pct_jump_close: 0.08       # jump close-to-close > 8% = drapeau
+    high_low_guard: true       # high>=max(open,close) & low<=min(open,close)
+    neg_values_guard: true
+    dup_row_guard: true
+  severity_weights:
+    flat_candle: 1
+    zero_volume: 2
+    pct_jump: 2
+    ohlc_inconsistent: 3
+    negative_values: 3
+    duplicates: 2

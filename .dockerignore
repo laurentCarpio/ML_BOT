@@ -1,0 +1,30 @@
+# Ignore sensitive or unnecessary files/folders in the image
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb
+.DS_Store
+
+# Ignore local environments
+.venv/
+.env
+
+# Logs and reports
+*.log
+*.csv
+
+# Logs and reports
+*.parquet
+
+# Local test files or scratch code
+theBot/misc/
+theBot/*.ipynb
+
+# Ignore data and logs
+theBot/trade_bot/data/
+theBot/trade_bot/reports/
+
+# Ignore VSCode workspace stuff
+.vscode/
+*.code-workspace
