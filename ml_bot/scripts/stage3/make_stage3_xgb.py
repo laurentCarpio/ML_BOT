@@ -55,6 +55,12 @@ ZSCORE_FEATURES = [
     "atr_percentile",
     "atr_bps",
     "executed_vs_added_ratio",
+    "lf_bid_absorb_ratio_3s",
+    "lf_bid_refill_ticks_3s",
+    "lf_mid_minus_vwap_3s_bps",
+    "lf_bb_width_pct",
+    "lf_atr_rank_30m",
+    "lf_ask_wall_decay_3s",
     # versions *_side
     "obi_5_side", "obi_15_side",
     "microprice_bias_side",

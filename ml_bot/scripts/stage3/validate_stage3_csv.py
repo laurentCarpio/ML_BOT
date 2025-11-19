@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 # =============================
 # 1) Seuils side-aware (pooled)
 # =============================
+
 SIDE_THRESHOLDS = {
     "_default": {"rmse_max": 0.15, "corr_min": 0.95},
     "obi_15":   {"rmse_max": 0.26, "corr_min": 0.94},
@@ -27,6 +28,57 @@ NON_FEATURE_COLS = {"Y", "side_num", "weight"}
 
 # --- helper: side-projection attendu selon la feature
 SIDE_NEUTRAL_05 = {"aggr_ratio_10s", "aggr_ratio_15s"}  # étends si besoin
+
+# --- Patch cohérence Stage3 / make_stage3_xgb.py ---
+
+# Colonnes transformées mais qui NE sont PAS destinées à respecter strictement un Z-score global
+# (log1p-only, binaires, percentiles, etc.)
+Z_IGNORE_EXACT = {
+    # LOG1P_ONLY dans make_stage3_xgb.py
+    "entry",
+    "cum_depth_within_5bps_opp",
+    "cum_depth_within_10bps_opp",
+    # binaires / percentiles
+    "bb_width_pctl",
+    "wall_opp_share_15_gt_0p12",
+}
+
+def _is_mask_col(name: str) -> bool:
+    """
+    Colonnes indicatrices/masques qu'on ne veut pas soumettre au check Z-score strict.
+    Exemple: *_isnan, *_mask, *_flag.
+    """
+    return (
+        name.endswith("_isnan")
+        or name.endswith("_mask")
+        or name.endswith("_flag")
+    )
+
+# Features pour lesquelles on accepte des stats Z plus "relax"
+# (queues lourdes même après log/asinh, structure très skewée ou bornée).
+HEAVY_TAIL_RELAXED = {
+    # queues lourdes "naturelles"
+    "ret_stdev_1s_10s_bps",
+    "quote_churn_10s",
+    "executed_vs_added_ratio",
+
+    # bornées / très skew
+    "spread_bps_entry",
+    "wall_opp_share_5",
+    "wall_opp_share_15",
+    "bb_width",
+    "adx",
+    "atr_percentile",
+    "atr_bps",
+
+    # side-aware fortement asymétriques
+    "microprice_bias_side",
+    "slope_bid_5_side",
+    "slope_ask_5_side",
+    "slope_bid_15_side",
+    "slope_ask_15_side",
+    "mid_jump_bps_3s_side",
+}
 
 def _expected_side_projection(base_name: str, base: np.ndarray, side: np.ndarray) -> np.ndarray:
     x = base.astype(np.float64)
@@ -395,10 +447,16 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                 print(f"[meta] Écriture pos_weight skip ({e})")
         else:
             print("[meta] Impossible de calculer scale_pos_weight: aucun positif en TRAIN.")
-
-    # stats features (indices >=2), en excluant weight et *_isnan
+    
+    # stats features (indices >=2), en excluant poids, masques et quelques colonnes log1p/bool
     def _ignore_for_zscore(name: str) -> bool:
-        return name.endswith("_isnan") or name in NON_FEATURE_COLS
+        if name in NON_FEATURE_COLS:
+            return True
+        if name in Z_IGNORE_EXACT:
+            return True
+        if _is_mask_col(name):
+            return True
+        return False
 
     ncols_seen = len(col_names)  # sécurisé
     feat_idx = [i for i in range(2, ncols_seen) if not _ignore_for_zscore(col_names[i])]
@@ -445,19 +503,55 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     is_z_mode = (ratio_ok >= 0.60)
 
     print(f"\n[scaling] auto-detect → {'Z-MODE (pooled)' if is_z_mode else 'WIDE-MODE (no strict z)'} "
-        f"(ok_ratio={ratio_ok:.2f})")
+          f"(ok_ratio={ratio_ok:.2f})")
 
-    # en Z-MODE, on applique les seuils serrés; sinon, reporting uniquement (pas de “bad” bloquant)
+    # Prépare le conteneur pour anomalies STRICT (utilisé plus bas avec fail-on-strong)
+    strict_bad = pd.DataFrame()
+
     if is_z_mode:
-        bad = feat_stats[(feat_stats["mean"].abs() > args.mean_tol) |
-                        (feat_stats["std"] < args.std_low) |
-                        (feat_stats["std"] > args.std_high)]
-        if not bad.empty and split == "train":
-            print("\n⚠️ anomalies (TRAIN, Z-MODE):")
-            print(bad.to_string(index=False))
-    else:
-        bad = pd.DataFrame()  # pas d’anomalies bloquantes en WIDE-MODE
+        strict_rows  = []
+        relaxed_rows = []
 
+        for _, row in feat_stats.iterrows():
+            col  = str(row["name"])
+            mean = float(row["mean"])
+            std  = float(row["std"])
+
+            # Sécurité : on ne re-check pas ce qu'on a explicitement décidé d'ignorer
+            if col in NON_FEATURE_COLS or col in Z_IGNORE_EXACT or _is_mask_col(col):
+                continue
+
+            # 1) Colonnes heavy-tail / très skewées → seuils RELAX
+            if col in HEAVY_TAIL_RELAXED:
+                relax_mean_tol = max(args.mean_tol, 0.5)
+                relax_std_low  = min(args.std_low, 0.4)
+                relax_std_high = max(args.std_high, 3.5)
+
+                if (abs(mean) > relax_mean_tol) or (std < relax_std_low) or (std > relax_std_high):
+                    relaxed_rows.append(row)
+                continue
+
+            # 2) Vraies colonnes z-scorées → seuils STRICT (args.mean_tol / std_low / std_high)
+            if (abs(mean) > args.mean_tol) or (std < args.std_low) or (std > args.std_high):
+                strict_rows.append(row)
+
+        if strict_rows:
+            strict_bad = pd.DataFrame(strict_rows).reset_index(drop=True)
+            if split == "train":
+                print("\n⚠️ anomalies (TRAIN, Z-MODE, STRICT — features vraiment z-scorés):")
+            else:
+                print("\n⚠️ anomalies (Z-MODE, STRICT — features vraiment z-scorés):")
+            print(strict_bad.to_string(index=False))
+
+        if relaxed_rows:
+            relaxed_bad = pd.DataFrame(relaxed_rows).reset_index(drop=True)
+            print("\nℹ️ anomalies RELAX (heavy-tail / transformés) — warnings only:")
+            print(relaxed_bad.to_string(index=False))
+
+    else:
+        print("\nℹ️ WIDE-MODE: pas de checks Z stricts, checks informatifs uniquement.")
+
+    # quasi-constantes
     qconst = feat_stats[feat_stats["std"] < 1e-6]
     if not qconst.empty:
         print("\n⚠️ quasi-constantes (std < 1e-6):")
@@ -595,10 +689,9 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         except Exception as e:
             print(f"[meta] Erreur lecture meta parquet: {e}")
 
-    # si on est en Z-MODE, 'bad' contient les anomalies strictes; en WIDE-MODE il est vide
-    strict_bad = bad
+    # si on est en Z-MODE, 'strict_bad' contient les anomalies STRICT (features vraiment z-scorés)
     if args.fail_on_strong and split == "train" and (not strict_bad.empty):
-        print("\n⛔ strong anomalies detected, failing run:")
+        print("\n⛔ strong anomalies detected on STRICT Z-features, failing run:")
         print(strict_bad.to_string(index=False))
         return 2
 

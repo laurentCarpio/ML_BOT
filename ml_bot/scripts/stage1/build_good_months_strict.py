@@ -39,6 +39,9 @@ import pyarrow.dataset as ds
 
 BOOK_LEVELS = 15
 
+# Symboles "blue chips" pour lesquels on garde tous les mois existants
+BLUECHIP_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
+
 # ────────────────────── Seuils par symbole ──────────────────────
 # _default : garde les valeurs "globales" (les args --strict-*)
 # BTCUSDT / ETHUSDT : overrides symbol-spécifiques sur les seuils stricts.
@@ -375,10 +378,14 @@ def build_good_months(df: pd.DataFrame, args) -> pd.DataFrame:
     - lat_neg <= strict_lat_neg_max
     - lat_ms_p99 <= strict_lat_ms99_max
     - pas d'erreur_book
+
+    MAIS :
+      - pour BTCUSDT / ETHUSDT, on inclut toujours tous les mois
+        où le BOOK existe (et TRADES si trade_root fourni),
+        quel que soit le strict_ok.
     """
     df = df.copy()
 
-    # On prépare un vecteur de strict_ok à False, puis on applique ligne par ligne
     strict_ok = []
     for idx, row in df.iterrows():
         sym = str(row.get("symbol", ""))
@@ -424,12 +431,43 @@ def build_good_months(df: pd.DataFrame, args) -> pd.DataFrame:
 
     df["strict_ok"] = strict_ok
 
-    kept = df[df["strict_ok"]].copy()
-    dropped = df[~df["strict_ok"]].copy()
+    # ─────────────────────────────────────────────
+    # Sélection finale :
+    #  - symboles "normaux" : strict_ok == True
+    #  - BTCUSDT / ETHUSDT : tous les mois avec BOOK existant
+    #    (+ TRADES existants si trade_root fourni)
+    # ─────────────────────────────────────────────
+    sym_series = df["symbol"].astype(str)
+    is_blue = sym_series.isin(BLUECHIP_SYMBOLS)
+
+    # Mois strictement "bons" pour tous les symboles sauf BTC/ETH
+    mask_strict_non_blue = df["strict_ok"] & ~is_blue
+
+    # Mois gardés en force pour BTC/ETH : juste présence de données
+    if args.trade_root:
+        mask_blue = (
+            is_blue &
+            df["has_book"].fillna(False) &
+            df["has_trades"].fillna(False)
+        )
+    else:
+        mask_blue = (
+            is_blue &
+            df["has_book"].fillna(False)
+        )
+
+    mask_kept = mask_strict_non_blue | mask_blue
+
+    kept = df[mask_kept].copy()
+    dropped = df[~mask_kept].copy()
+
+    n_strict_non_blue = int(mask_strict_non_blue.sum())
+    n_blue = int(mask_blue.sum())
 
     print("\nRésumé filtrage strict :")
     print(f"  total mois analysés : {len(df)}")
-    print(f"  mois retenus (strict_ok) : {len(kept)}")
+    print(f"  mois retenus strict (hors BTC/ETH) : {n_strict_non_blue}")
+    print(f"  mois forcés BTC/ETH (BOOK existant{' + TRADES' if args.trade_root else ''}) : {n_blue}")
     print(f"  mois rejetés : {len(dropped)}")
 
     # Table symbol/ym (good_months)

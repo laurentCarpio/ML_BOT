@@ -48,7 +48,6 @@ TF_HORIZONS_REF = {
 }
 
 # colonnes numériques attendues (pour min/max/NaN rate)
-# colonnes numériques attendues (pour min/max/NaN rate)
 NUM_LIKE = [
     "spread_bps_entry","quote_churn_10s",
     "cum_depth_within_5bps_opp","cum_depth_within_10bps_opp",
@@ -57,7 +56,7 @@ NUM_LIKE = [
     "slope_bid_5","slope_ask_5","slope_bid_15","slope_ask_15",
     "aggr_ratio_10s","aggr_ratio_15s","net_delta_15s",
     "ret_stdev_1s_10s_bps","mid_jump_bps_3s",
-    "bb_width","adx","atr_percentile","fees_bps","atr_bps","exchange_latency_ms",
+    "bb_width","adx","atr_percentile","fees_bps","atr_bps",
     "imbalance_persistence","executed_vs_added_ratio",
     "horizon_sec","pnl_net_max_bps","pnl_net_min_bps","THRESH_BPS",
     "obi_5_side","obi_15_side","microprice_bias_side",
@@ -98,6 +97,14 @@ NUM_LIKE = [
     "bid_absorb_ratio_3s",
     "bid_absorb_ratio_10s",
     "bid_refill_persistence_ticks",
+
+    # ✨ NOUVEAUX signaux LONG-friendly (communs aux 2 sides)
+    "lf_bid_absorb_ratio_3s",
+    "lf_bid_refill_ticks_3s",
+    "lf_mid_minus_vwap_3s_bps",
+    "lf_bb_width_pct",
+    "lf_atr_rank_30m",
+    "lf_ask_wall_decay_3s",
 ]
 
 CAT_LIKE = ["symbol","tf","side"]
@@ -493,15 +500,19 @@ def _validate_paths(paths: List[str], so: dict, batch_rows: int) -> None:
                 alarms.append(f"{col}: amplitude > 5% (min={mn:.3g}, max={mx:.3g}) — unités OK ?")
 
     # mid_minus_vwap_3s en bps : éviter les délires > 1000 bps
-    if "mid_minus_vwap_3s" in metrics.numeric_min:
-        mn = metrics.numeric_min["mid_minus_vwap_3s"]
-        mx = metrics.numeric_max["mid_minus_vwap_3s"]
-        if mn < -1000 or mx > 1000:
-            alarms.append(f"mid_minus_vwap_3s: amplitude > 1000 bps (min={mn:.3g}, max={mx:.3g}) — vérifier normalisation/échelle.")
+    for col in ("mid_minus_vwap_3s", "lf_mid_minus_vwap_3s_bps"):
+        if col in metrics.numeric_min:
+            mn = metrics.numeric_min[col]
+            mx = metrics.numeric_max[col]
+            if mn < -1000 or mx > 1000:
+                alarms.append(
+                    f"{col}: amplitude > 1000 bps (min={mn:.3g}, max={mx:.3g}) — vérifier normalisation/échelle."
+                )
 
     # Ratios absorption/refill: >=0 et pas astronomiques
     for col in ("bid_absorb_ratio_3s", "bid_absorb_ratio_10s",
-                "executed_vs_added_ratio", "best_bid_refill_rate"):
+                "executed_vs_added_ratio", "best_bid_refill_rate",
+                "lf_bid_absorb_ratio_3s"):
         if col in metrics.numeric_min:
             mn = metrics.numeric_min[col]
             mx = metrics.numeric_max[col]
@@ -509,12 +520,23 @@ def _validate_paths(paths: List[str], so: dict, batch_rows: int) -> None:
                 alarms.append(f"{col}: valeurs hors [0,100] (min={mn:.3g}, max={mx:.3g}) — clip recommandé.")
 
     # bb_width_pctl / atr_pct_rank_30m ∈ [0,1]
-    for col in ("bb_width_pctl", "atr_pct_rank_30m"):
+    for col in ("bb_width_pctl", "atr_pct_rank_30m",
+                "lf_bb_width_pct", "lf_atr_rank_30m"):
         if col in metrics.numeric_min:
             mn = metrics.numeric_min[col]
             mx = metrics.numeric_max[col]
             if mn < -0.01 or mx > 1.01:
                 alarms.append(f"{col}: devrait être un percentile ∈ [0,1], min={mn:.3g}, max={mx:.3g}.")
+    
+    # Décroissance des murs ask: devrait rester dans un range raisonnable [-2,2]
+    for col in ("ask_wall_decay_3s", "lf_ask_wall_decay_3s"):
+        if col in metrics.numeric_min:
+            mn = metrics.numeric_min[col]
+            mx = metrics.numeric_max[col]
+            if mn < -2.0 or mx > 2.0:
+                alarms.append(
+                    f"{col}: valeurs hors [-2,2] (min={mn:.3g}, max={mx:.3g}) — vérifier le calcul/scale."
+                )
 
     if alarms:
         print("\n-- ALARMES / REMARQUES --")

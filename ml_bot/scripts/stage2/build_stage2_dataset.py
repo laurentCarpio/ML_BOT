@@ -11,6 +11,12 @@ Entrées (S3 uniquement):
 
 Sorties:
   - s3://.../stage2/<SPLIT>/<SYMBOL>/<YEAR>/parts/part-*.parquet
+
+NOTE IMPORTANTE:
+  Ce script ne fait PLUS AUCUNE NORMALISATION des features.
+  Il produit un dataset "brut" (features microstructure + label Y).
+  Toute la normalisation, scaling, winsorisation, etc. est faite en Stage3
+  par make_stage3_xgb.py.
 """
 
 from __future__ import annotations
@@ -26,8 +32,6 @@ from datetime import datetime
 from calendar import monthrange
 from pyarrow import types as patypes
 from pandas.api.types import is_numeric_dtype
-import json
-from collections import defaultdict
 
 _MONTH_RE = re.compile(r"(\d{4})-(\d{2})")
 BOOK_LEVELS = 15
@@ -35,29 +39,10 @@ BOOK_LEVELS = 15
 # Par défaut: 15 symbols & 4 TF (tu peux toujours passer --symbols / --tfs au CLI)
 DEFAULT_SYMBOLS = [
     "APTUSDT","BCHUSDT","BNBUSDT","BTCUSDT","CRVUSDT","DOGEUSDT","DOTUSDT","ETHUSDT",
-    "LINKUSDT","LTCUSDT","OPUSDT","SOLUSDT","SUIUSDT","WLDUSDT","XRPUSDT"
+    "LINKUSDT","LTCUSDT","OPUSUSDT","SOLUSDT","SUIUSDT","WLDUSDT","XRPUSDT"
 ]
 
 DEFAULT_TFS = ["5m","15m","30m","1h","2h","4h"]
-
-# Colonnes meta/label à exclure de la normalisation
-EXCLUDE_FROM_NORM = {
-    "t","symbol","year","tf","side","entry","horizon_sec","Y",
-    # Labels/outcomes & coûts
-    "pnl_net_max_bps","pnl_net_min_bps","THRESH_BPS",
-    # (Optionnel) si tu préfères ne PAS normaliser ces features de coût/latence :
-    # "fees_bps"
-}
-
-# === Ajout recommandé (étend l’exclusion sans écraser) ===
-EXCLUDE_FROM_NORM |= {
-    "has_trades_win10s", "has_trades_win15s",
-    "trades_win_sec_used", "horizon_sec",
-    # Flags event-driven (on ne les normalise pas)
-    "best_bid_refill_rate_isnan",
-    "bid_absorb_ratio_3s_isnan",
-    "bid_absorb_ratio_10s_isnan",
-}
 
 TRADE_WIN_DEFAULT = [15, 30, 60, 120]
 
@@ -76,6 +61,181 @@ TRADE_WIN_TF_FACTOR = {
     "4h": 1.5,
 }
 
+import numpy as np
+import pandas as pd
+
+# ----------------------------
+# Helpers Stage2 "LONG-friendly"
+# ----------------------------
+
+def _safe_div(a: float, b: float, eps: float = 1e-12) -> float:
+    if b is None:
+        return 0.0
+    b2 = float(b) if abs(b) > eps else (eps if b >= 0 else -eps)
+    return float(a) / b2
+
+def compute_bid_absorb_ratio_3s(trades_win_3s: pd.DataFrame,
+                                best_bid_start: float,
+                                best_bid_end: float) -> float:
+    """
+    trades_win_3s: DataFrame avec au moins colonnes ['side', 'price', 'qty']
+                   - side == 'sell' (ou -1) => agressif vendeur
+    best_bid_start/best_bid_end: prix best bid à t-3s et t
+    """
+    if trades_win_3s is None or trades_win_3s.empty:
+        return 0.0
+
+    # Adapter le filtre side à ton codage actuel ('sell'/ -1 / 0/1 etc.)
+    mask_sell = (trades_win_3s["side"] == "sell") if "side" in trades_win_3s.columns else np.zeros(len(trades_win_3s), dtype=bool)
+    vol_sell = float(trades_win_3s.loc[mask_sell, "qty"].sum()) if "qty" in trades_win_3s.columns else 0.0
+
+    # variation du best bid en bps (approx)
+    if best_bid_start is None or best_bid_end is None or best_bid_start <= 0:
+        delta_bps = 0.0
+    else:
+        delta_bps = 10_000.0 * (best_bid_end / best_bid_start - 1.0)
+
+    # On ne pénalise que la baisse du bid (delta_bps < 0)
+    penalty = max(-delta_bps, 0.0)
+
+    # k permet de "traduire" un nombre de bps en volume fictif équivalent
+    k = 1.0
+    denom = vol_sell + k * penalty
+    if denom <= 0:
+        return 0.0
+    return vol_sell / denom
+
+def compute_bid_refill_ticks_3s(book_win_3s: pd.DataFrame) -> float:
+    """
+    book_win_3s: snapshots L1 ordonnés dans le temps, avec colonnes:
+        'best_bid_price', 'best_bid_qty'
+    On compte combien de "refill" du bid après une baisse nette.
+    """
+    if book_win_3s is None or book_win_3s.empty:
+        return 0.0
+
+    df = book_win_3s.sort_values("t") if "t" in book_win_3s.columns else book_win_3s.copy()
+    if not {"best_bid_price", "best_bid_qty"}.issubset(df.columns):
+        return 0.0
+
+    qty = df["best_bid_qty"].to_numpy(dtype=float)
+    if qty.size < 3:
+        return 0.0
+
+    # On considère qu'il y a "refill" si:
+    # - qty(t_i) < 0.7 * qty(t_{i-1})  => vidage
+    # - puis qty(t_{i+1}) > 1.2 * qty(t_i) => refill
+    refills = 0
+    for i in range(1, len(qty) - 1):
+        if qty[i] < 0.7 * qty[i - 1] and qty[i + 1] > 1.2 * qty[i]:
+            refills += 1
+    return float(refills)
+
+def compute_mid_minus_vwap_3s_bps(trades_win_3s: pd.DataFrame, mid_t: float) -> float:
+    """
+    VWAP sur la fenêtre 3s, puis écart mid vs VWAP en bps.
+    """
+    if mid_t is None or mid_t <= 0:
+        return 0.0
+    if trades_win_3s is None or trades_win_3s.empty:
+        return 0.0
+
+    if not {"price", "qty"}.issubset(trades_win_3s.columns):
+        return 0.0
+
+    px = trades_win_3s["price"].to_numpy(dtype=float)
+    q  = trades_win_3s["qty"].to_numpy(dtype=float)
+    vol = q.sum()
+    if vol <= 0:
+        return 0.0
+    vwap = float((px * q).sum() / vol)
+    if vwap <= 0:
+        return 0.0
+
+    return 10_000.0 * (mid_t / vwap - 1.0)
+
+def compute_bb_width_pct(bb_width_raw: float,
+                         mid_t: float,
+                         atr_bps: float | None = None,
+                         mode: str = "price") -> float:
+    """
+    bb_width_raw:
+      - si en prix absolu => mode='price' et on divise par (mid * 10_000)
+      - si déjà en bps   => mode='bps'   et on peut normaliser par atr_bps
+    """
+    if bb_width_raw is None:
+        return 0.0
+
+    if mode == "price":
+        if mid_t is None or mid_t <= 0:
+            return 0.0
+        # largeur en bps "equivalente"
+        bw_bps = 10_000.0 * (bb_width_raw / mid_t)
+    else:
+        # on suppose que bb_width_raw est déjà un écart en bps
+        bw_bps = float(bb_width_raw)
+
+    if atr_bps is not None and atr_bps > 0:
+        return bw_bps / atr_bps
+    else:
+        # fallback: simple scaling
+        return bw_bps / 100.0  # "largeur" en dizaines de bps
+
+def compute_atr_rank_30m(atr_hist_30m: np.ndarray,
+                         atr_bps_t: float) -> float:
+    """
+    Percentile rank de atr_bps_t au sein de atr_hist_30m (dernier 30 min).
+    atr_hist_30m: array[float] des niveaux d'ATR (en bps) sur la fenêtre 30 min
+    """
+    if atr_bps_t is None or not np.isfinite(atr_bps_t):
+        return 0.0
+    if atr_hist_30m is None or len(atr_hist_30m) < 10:
+        return 0.0
+
+    arr = np.asarray(atr_hist_30m, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0
+
+    # proportion des valeurs <= atr_bps_t
+    rank = (arr <= atr_bps_t).mean()
+    return float(rank)
+
+def compute_ask_wall_decay_3s(book_win_3s: pd.DataFrame,
+                              mid_t: float,
+                              bps_window: float = 20.0) -> float:
+    """
+    Approx "wall ask" = volume cumulé des asks dans une fenêtre [mid, mid + bps_window].
+    On regarde le ratio de décroissance sur 3s.
+    """
+    if book_win_3s is None or book_win_3s.empty or mid_t is None or mid_t <= 0:
+        return 0.0
+
+    df = book_win_3s.sort_values("t") if "t" in book_win_3s.columns else book_win_3s.copy()
+    if not {"ask_price", "ask_qty"}.issubset(df.columns):
+        return 0.0
+
+    # On prend approximativement le premier et dernier snapshot
+    first = df.iloc[0]
+    last  = df.iloc[-1]
+
+    def _cum_wall(row):
+        # si tu as plusieurs niveaux, adapte pour faire un sum conditionnel
+        # Ici, on suppose un L1 simplifié pour l'exemple
+        ap = float(row["ask_price"])
+        aq = float(row["ask_qty"])
+        # check si ask dans la fenêtre [mid, mid * (1 + bps_window/10_000)]
+        max_ask = mid_t * (1.0 + bps_window / 10_000.0)
+        if ap <= max_ask:
+            return aq
+        return 0.0
+
+    wall_start = _cum_wall(first)
+    wall_end   = _cum_wall(last)
+
+    if wall_start <= 0:
+        return 0.0
+    return (wall_start - wall_end) / wall_start
 
 # ------------------------------
 # Trades helpers (factorisés)
@@ -111,43 +271,6 @@ def _trade_windows_for(symbol: str, tf: str) -> list[int]:
     fac = TRADE_WIN_TF_FACTOR.get(tf, 1.0)
     wins = sorted({ max(1, int(round(w * fac))) for w in base })
     return wins
-
-# Welford: stats incrémentales (mean, var, count)
-class _Welford:
-    __slots__ = ("n","mean","M2")
-    def __init__(self): self.n = 0; self.mean = 0.0; self.M2 = 0.0
-    def update_arr(self, arr: np.ndarray):
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0: return
-        for x in arr:
-            self.n += 1
-            delta = x - self.mean
-            self.mean += delta / self.n
-            self.M2 += delta * (x - self.mean)
-    def result(self):
-        if self.n < 2: return float(self.mean), float("nan")
-        var = self.M2 / (self.n - 1)
-        return float(self.mean), float(np.sqrt(max(var, 1e-30)))
-
-# Stats normalisation par TF
-class NormStats:
-    # store: dict[tf][col] = {"mean":..., "std":...}
-    def __init__(self): self.stats = defaultdict(dict)
-    def save(self, path: str, so: dict):
-        data = {"by_tf": self.stats}
-        with fsspec.open(_normalize_url(path), "w", **(so or {})) as f:
-            json.dump(data, f)
-    @classmethod
-    def load(cls, path: str, so: dict):
-        ns = cls()
-        with fsspec.open(_normalize_url(path), "r", **(so or {})) as f:
-            data = json.load(f)
-        ns.stats = defaultdict(dict, data.get("by_tf", {}))
-        return ns
-    def get(self, tf: str, col: str):
-        return self.stats.get(tf, {}).get(col, None)
-    def set(self, tf: str, col: str, mean: float, std: float):
-        self.stats[tf][col] = {"mean": float(mean), "std": float(std)}
 
 # ------------------------------
 # TF horizons
@@ -547,7 +670,6 @@ def _process_symbol_year(
             _log(True, f"[signals] tf vides: {nan_tf} -> {default_tf}")
 
     # Filtrer sur TF autorisés (passés au main via closure)
-    # On injectera 'allowed_tfs' via un param additionnel dans _process_symbol_year
     if allowed_tfs is not None:
         sig = sig[sig["tf"].isin(allowed_tfs)]
         if sig.empty:
@@ -591,7 +713,7 @@ def _process_symbol_year(
         _log(True, f"[ohlc] vide pour {symbol} {year} -> skip")
         return 0
 
-    # NEW: estimer la durée d'une bougie en secondes (pour 30m)
+    # estimer la durée d'une bougie en secondes (pour la fenêtre ATR/BB sur 30m)
     if len(ohlc.index) >= 2:
         dt_secs = (ohlc.index[1] - ohlc.index[0]).total_seconds()
         bar_secs = max(float(dt_secs), 1.0)
@@ -647,6 +769,7 @@ def _process_symbol_year(
     for i, (_, r) in enumerate(sig.sort_values("t").iterrows(), start=1):
         # init systématique pour éviter UnboundLocalError et faciliter le finally
         book_win = tob = tr1 = tr10 = tr15 = tr_lat = None
+        tr_raw = None
         try:
             if debug and (i % 100 == 0):
                 _log(True, f"[progress] {symbol} {year} processed={i}/{len_sig}")
@@ -655,7 +778,7 @@ def _process_symbol_year(
             entry = float(r["entry"]); fees_bps = float(r["fees_bps"]); tf = str(r["tf"])
             H = int(TF_HORIZONS.get(tf, DEFAULT_H))
 
-            # 🔹 helper side-aware local basé sur le signe du trade
+            # helper side-aware local basé sur le signe du trade
             def SA(x: float) -> float:
                 return float(sgn * x) if np.isfinite(x) else np.nan
 
@@ -693,14 +816,12 @@ def _process_symbol_year(
                 skip_stats["tob_missing"] += 1
                 continue
             row_t = book_win.iloc[j]
-            # --- cap d’ancienneté (mitigation "stale quotes") ---
+            # cap d’ancienneté (mitigation "stale quotes")
             ts_last = idx_ev[j]
             MAX_STALE = pd.Timedelta(seconds=10)
             if (t - ts_last) > MAX_STALE:
-                # Dernière quote trop ancienne par rapport à t → on considère manquant
                 skip_stats["tob_missing"] += 1
                 continue
-            # (optionnel) vérifier que les séries resamplées ont bien un point récent
             if bid0.loc[:t].last_valid_index() is None or (t - bid0.loc[:t].last_valid_index()) > MAX_STALE:
                 skip_stats["tob_missing"] += 1
                 continue
@@ -717,7 +838,7 @@ def _process_symbol_year(
             tr10 = tr1.loc[w10] if not tr1.empty else pd.DataFrame()
             tr15 = tr1.loc[w15] if not tr1.empty else pd.DataFrame()
 
-            # NEW: fenêtre 3s pour features short/long
+            # fenêtre 3s pour features short/long
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             tr3 = tr1.loc[w3] if not tr1.empty else pd.DataFrame()
 
@@ -751,7 +872,6 @@ def _process_symbol_year(
             imbl_aggr_3s_side  = _imbl_side(imbl_aggr_3s)
             imbl_aggr_10s_side = _imbl_side(imbl_aggr_10s)
 
-
             aggr_ratio_10s = _aggr_ratio(tr10)
             aggr_ratio_15s = _aggr_ratio(tr15)
             b15 = float(tr15.get("buy_qty",  pd.Series(dtype=float)).sum())
@@ -759,24 +879,20 @@ def _process_symbol_year(
             den15 = b15 + s15
             net_delta_15s = ((b15 - s15)/den15) if den15 > 0 else np.nan
 
-            # ---- Fallbacks neutres si pas de trades (évite NaN dans le dataset) ----
-            # aggr_ratio_*       ∈ [0..1]  → 0.5
-            # aggr_ratio_*_side  ∈ [-1..1] → 0.0 (centré)
-            # net_delta_15s/_side∈ [-1..1] → 0.0
+            # Fallbacks neutres si pas de trades
             has10 = int((not tr10.empty) and (tr10.get("tot_qty", pd.Series(dtype=float)).sum() > 0))
             has15 = int((not tr15.empty) and (tr15.get("tot_qty", pd.Series(dtype=float)).sum() > 0))
-            # versions "remplies"
             agr10 = float(aggr_ratio_10s) if np.isfinite(aggr_ratio_10s) else 0.5
             agr15 = float(aggr_ratio_15s) if np.isfinite(aggr_ratio_15s) else 0.5
             nd15  = float(net_delta_15s)  if np.isfinite(net_delta_15s)  else 0.0
-            # sides centrés
+
             def _side_map(x: float) -> float:
                 return float((1 if side=="buy" else -1) * x) if np.isfinite(x) else 0.0
             agr10_side = _side_map(2*agr10 - 1.0)
             agr15_side = _side_map(2*agr15 - 1.0)
             nd15_side  = _side_map(nd15)
 
-            # NEW: ajout / exécution au bid pour 3s/10s
+            # ajout / exécution au bid pour 3s/10s
             b0_3  = b0sz.loc[w3]  if b0sz.loc[w3].size  > 0 else pd.Series(dtype=float)
             b0_10 = b0sz.loc[w10] if b0sz.loc[w10].size > 0 else pd.Series(dtype=float)
 
@@ -819,15 +935,12 @@ def _process_symbol_year(
                     if not np.isfinite(d):
                         continue
                     if not expecting_refill and d < 0:
-                        # "hit"
                         expecting_refill = True
                     elif expecting_refill:
                         if d > 0:
-                            # refill après hit
                             refill_cycles += 1
                             expecting_refill = False
                         elif d < 0:
-                            # plusieurs hits de suite, on reste en attente de refill
                             continue
                 bid_refill_persistence_ticks = float(refill_cycles)
 
@@ -835,7 +948,7 @@ def _process_symbol_year(
             _sp = spread_bps.loc[:t]
             spread_bps_entry = float(_sp.iloc[-1]) if len(_sp) else np.nan
 
-            # NEW: delta_spread_3s = spread_now - min(spread sur 3s)
+            # delta_spread_3s = spread_now - min(spread sur 3s)
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             sp3 = spread_bps.loc[w3]
             if sp3.size > 0 and np.isfinite(spread_bps_entry):
@@ -844,7 +957,7 @@ def _process_symbol_year(
             else:
                 delta_spread_3s = np.nan
             
-             # NEW: spread moyen sur la dernière seconde [t-1s, t]
+            # spread moyen sur la dernière seconde [t-1s, t]
             spread_bps_mean_1s = np.nan
             w1 = slice(t - pd.Timedelta(seconds=1), t)
             sp1 = spread_bps.loc[w1]
@@ -859,7 +972,6 @@ def _process_symbol_year(
             quote_churn_10s = float(abs_d_bsz + abs_d_asz) if np.isfinite(abs_d_bsz) and np.isfinite(abs_d_asz) else np.nan
 
             def _last_at_or_before(s: pd.Series, tt: pd.Timestamp) -> float:
-                # renvoie la dernière valeur ≤ tt, NaN si introuvable
                 if s.loc[:tt].empty:
                     return np.nan
                 return float(s.loc[:tt].ffill().iloc[-1])
@@ -875,7 +987,7 @@ def _process_symbol_year(
             microprice = w_mp*ask_t + (1.0-w_mp)*bid_t if np.isfinite(w_mp) and np.isfinite(bid_t) and np.isfinite(ask_t) else np.nan
             microprice_bias = ((microprice - mid_t)/mid_t) if (np.isfinite(microprice) and np.isfinite(mid_t) and mid_t>0) else np.nan
 
-            # NEW: microprice_bias_ma_1s / 3s + microprice_shift_1s
+            # microprice_bias_ma_1s / 3s + microprice_shift_1s
             mp_ma_1s = np.nan
             mp_ma_3s = np.nan
             microprice_shift_1s = np.nan
@@ -894,7 +1006,6 @@ def _process_symbol_year(
                     mp_win["asz"] / den,
                     0.5
                 )
-                # série microprice sur la fenêtre 3s
                 micro_s = pd.Series(
                     w_mp_s * mp_win["ask"].to_numpy()
                     + (1.0 - w_mp_s) * mp_win["bid"].to_numpy(),
@@ -907,7 +1018,6 @@ def _process_symbol_year(
                     mp_ma_1s = float(mp_bias_s_clean.iloc[-1])
                     mp_ma_3s = float(mp_bias_s_clean.mean())
 
-                # NEW: microprice_shift_1s = variation (en bps) sur 1 seconde
                 if micro_s.size > 0 and np.isfinite(mid_t) and mid_t > 0:
                     last_micro = float(micro_s.iloc[-1])
                     t_minus_1s = t - pd.Timedelta(seconds=1)
@@ -918,31 +1028,6 @@ def _process_symbol_year(
                             microprice_shift_1s = float(
                                 1e4 * (last_micro - micro_prev_last) / mid_t
                             )
-
-            microprice_bias_ma_1s = mp_ma_1s
-            microprice_bias_ma_3s = mp_ma_3s
-
-            mp_win = pd.DataFrame({
-                "bid": bid0.loc[w3],
-                "ask": ask0.loc[w3],
-                "bsz": b0sz.loc[w3],
-                "asz": a0sz.loc[w3],
-            }).dropna()
-            if not mp_win.empty:
-                mid_s = (mp_win["bid"] + mp_win["ask"]) / 2.0
-                den = mp_win["bsz"] + mp_win["asz"]
-                w_mp_s = np.where((den > 0) & np.isfinite(den), mp_win["asz"] / den, 0.5)
-                micro_s = w_mp_s * mp_win["ask"] + (1.0 - w_mp_s) * mp_win["bid"]
-                mp_bias_s = np.where(
-                    (mid_s > 0) & np.isfinite(mid_s) & np.isfinite(micro_s),
-                    (micro_s - mid_s) / mid_s,
-                    np.nan,
-                )
-                # dernier point = ~MA 1s, moyenne = MA 3s
-                if np.isfinite(mp_bias_s).any():
-                    mp_bias_s_clean = mp_bias_s[np.isfinite(mp_bias_s)]
-                    mp_ma_1s = float(mp_bias_s_clean[-1])
-                    mp_ma_3s = float(np.nanmean(mp_bias_s_clean))
 
             microprice_bias_ma_1s = mp_ma_1s
             microprice_bias_ma_3s = mp_ma_3s
@@ -972,7 +1057,7 @@ def _process_symbol_year(
             mid_t0 = float(_m0.iloc[-1]) if len(_m0) else np.nan
             mid_jump_bps_3s = (10000.0 * (mid_t0 - mid_t3)/mid_t3) if (np.isfinite(mid_t0) and np.isfinite(mid_t3) and mid_t3>0) else np.nan
 
-            # NEW: mid_vs_VWAP_3s (bps) basé sur trades bruts tr_raw
+            # mid_vs_VWAP_3s (bps) basé sur trades bruts tr_raw
             mid_minus_vwap_3s = np.nan
             if tr_raw is not None and not tr_raw.empty:
                 tr3_raw = tr_raw.loc[w3] if isinstance(tr_raw.index, pd.DatetimeIndex) else pd.DataFrame()
@@ -988,7 +1073,7 @@ def _process_symbol_year(
                         if np.isfinite(vwap_3s) and vwap_3s > 0:
                             mid_minus_vwap_3s = float(1e4 * (mid_t - vwap_3s) / vwap_3s)
             
-            # NEW: ask_wall_decay_3s (dynamique du mur côté ask sur 3s)
+            # ask_wall_decay_3s (dynamique du mur côté ask sur 3s)
             ask_wall_decay_3s = np.nan
             sub_bw_3s = book_win.loc[w3] if not book_win.empty else pd.DataFrame()
             if not sub_bw_3s.empty:
@@ -999,12 +1084,11 @@ def _process_symbol_year(
                     if np.isfinite(ask_wall_max) and ask_wall_max > 0 and np.isfinite(ask_wall_now):
                         ask_wall_decay_3s = float((ask_wall_now - ask_wall_max) / (ask_wall_max + 1e-9))
             
-            # NEW: wall_persistence_score_5s (mur persistant côté opposé sur 5s)
+            # wall_persistence_score_5s (mur persistant côté opposé sur 5s)
             wall_persistence_score_5s = np.nan
             w5 = slice(t - pd.Timedelta(seconds=5), t)
             sub_bw_5s = book_win.loc[w5] if not book_win.empty else pd.DataFrame()
             if not sub_bw_5s.empty:
-                # on réutilise _wall_opp_share(row, 5, side) pour chaque event
                 shares_5s = sub_bw_5s.apply(
                     lambda rr: _wall_opp_share(rr, 5, side),
                     axis=1
@@ -1033,18 +1117,95 @@ def _process_symbol_year(
             atr_window = octx["atr"].dropna()
             atr_percentile = float((atr_window.rank(pct=True).iloc[-1])) if len(atr_window) > 10 else np.nan
 
-            # NEW: ATR percentile sur ~30m d'historique
+            # ATR percentile sur ~30m d'historique
             atr_pct_rank_30m = np.nan
             if not octx_full.empty:
                 atr_win_30m = octx_full["atr"].dropna().tail(bars_30m)
                 if len(atr_win_30m) >= 2:
                     atr_pct_rank_30m = float(atr_win_30m.rank(pct=True).iloc[-1])
 
-            # NEW: percentile de bb_width sur l'historique local (regime compression/expansion)
+            # percentile de bb_width sur l'historique local (regime compression/expansion)
             bb_width_pctl = np.nan
             bb_hist = octx_full["bb_width"].dropna()
             if len(bb_hist) >= 20:
                 bb_width_pctl = float(bb_hist.rank(pct=True).iloc[-1])
+
+            # === LONG-friendly helpers (lf_*) communs aux 2 sides ===
+
+            # Fenêtre 3s côté BOOK (resample L1 en "best_*")
+            w3 = slice(t - pd.Timedelta(seconds=3), t)
+            tob_3s = tob.loc[w3] if not tob.loc[w3].empty else tob.tail(1)
+
+            if not tob_3s.empty:
+                book_lf_3s = pd.DataFrame({
+                    "t": tob_3s.index,
+                    "best_bid_price": tob_3s["bid_0_price"].astype(float).values,
+                    "best_bid_qty":   tob_3s["bid_0_size"].astype(float).values,
+                    "ask_price":      tob_3s["ask_0_price"].astype(float).values,
+                    "ask_qty":        tob_3s["ask_0_size"].astype(float).values,
+                }).set_index("t")
+            else:
+                book_lf_3s = pd.DataFrame(columns=["best_bid_price","best_bid_qty","ask_price","ask_qty"])
+
+            # Fenêtre 3s côté TRADES pour les helpers
+            # Si tr3 n'a pas les colonnes 'side'/'qty', on fabrique un petit DF consolidé
+            if tr3 is not None and not tr3.empty and {"side","qty"}.issubset(tr3.columns):
+                trades_lf_3s = tr3[["side","qty"]].copy()
+            else:
+                trades_lf_3s = pd.DataFrame([
+                    {"side": "buy",  "qty": float(b3)},
+                    {"side": "sell", "qty": float(s3)},
+                ])
+
+            # Best bid au début et à la fin des 3s
+            t3 = t - pd.Timedelta(seconds=3)
+            _b3 = bid0.loc[:t3]
+            _b0 = bid0.loc[:t]
+            best_bid_start = float(_b3.iloc[-1]) if len(_b3) else np.nan
+            best_bid_end   = float(_b0.iloc[-1]) if len(_b0) else np.nan
+
+            # 1) Absorption sur le bid sur 3s
+            lf_bid_absorb_ratio_3s = compute_bid_absorb_ratio_3s(
+                trades_win_3s=trades_lf_3s,
+                best_bid_start=best_bid_start,
+                best_bid_end=best_bid_end,
+            )
+
+            # 2) Nombre de "refill" du bid sur 3s
+            lf_bid_refill_ticks_3s = compute_bid_refill_ticks_3s(
+                book_win_3s=book_lf_3s,
+            )
+
+            # 3) Ecart mid vs VWAP_3s en bps
+            lf_mid_minus_vwap_3s_bps = compute_mid_minus_vwap_3s_bps(
+                trades_win_3s=trades_lf_3s,
+                mid_t=mid_t,
+            )
+
+            # 4) bb_width normalisé (compression / expansion)
+            lf_bb_width_pct = compute_bb_width_pct(
+                bb_width_raw=bb_width,
+                mid_t=mid_t,
+                atr_bps=atr_bps,
+                mode="price",  # bb_width est en prix absolu ici
+            )
+
+            # 5) Rang percentile de l'ATR sur ~30 min
+            atr_hist_30m = None
+            if not octx_full.empty:
+                atr_hist_30m = octx_full["atr"].dropna().tail(bars_30m).to_numpy(dtype=float)
+
+            lf_atr_rank_30m = compute_atr_rank_30m(
+                atr_hist_30m=atr_hist_30m,
+                atr_bps_t=atr_bps,
+            )
+
+            # 6) Décroissance des murs ask sur 3s
+            lf_ask_wall_decay_3s = compute_ask_wall_decay_3s(
+                book_win_3s=book_lf_3s,
+                mid_t=mid_t,
+                bps_window=20.0,  # fenêtre [mid, mid+20 bps] pour les murs ask
+            )
 
             # OBI persistence (10s)
             times_10s = pd.date_range(t - pd.Timedelta(seconds=10), t, freq="1s")
@@ -1056,22 +1217,19 @@ def _process_symbol_year(
             side_num = 1 if side=="buy" else -1
             imbalance_persistence = float(np.nanmean((np.sign(obi_hist) == side_num).astype(float))) if np.isfinite(obi_hist).any() else np.nan
 
-            # NEW: OBI delta & ratio sur 1 seconde (K=5)
+            # OBI delta & ratio sur 1 seconde (K=5)
             obi_5_delta_1s = np.nan
             obi_5_ratio_1s = np.nan
             obi_5_delta_1s_side = np.nan
             obi_5_ratio_1s_side = np.nan
 
-            obi_now = obi_5  # OBI(5) au temps t, déjà calculé plus haut
+            obi_now = obi_5
             obi_prev = _obi_at(t - pd.Timedelta(seconds=1))
 
             if np.isfinite(obi_now) and np.isfinite(obi_prev):
-                # variation brute
                 obi_5_delta_1s = float(obi_now - obi_prev)
-                # ratio normalisé dans [-1,1]
                 denom = abs(obi_now) + abs(obi_prev) + 1e-9
                 obi_5_ratio_1s = float(obi_now / denom)
-                # versions side-aware
                 obi_5_delta_1s_side = SA(obi_5_delta_1s)
                 obi_5_ratio_1s_side = SA(obi_5_ratio_1s)
 
@@ -1121,15 +1279,15 @@ def _process_symbol_year(
             row = {
                 "t": t, "symbol": symbol, "year": year, "tf": tf, "side": side, "entry": entry,
                 "spread_bps_entry": spread_bps_entry,
-                "spread_bps_mean_1s": spread_bps_mean_1s,  # NEW
+                "spread_bps_mean_1s": spread_bps_mean_1s,
                 "spread_widen_flag_10s": int(spread_widen_flag_10s),
                 "cum_depth_within_5bps_opp": cum_depth_within_5bps_opp,
                 "cum_depth_within_10bps_opp": cum_depth_within_10bps_opp,
                 "quote_churn_10s": quote_churn_10s,
                 "wall_opp_share_5": wall_opp_share_5, "wall_opp_share_15": wall_opp_share_15,
                 "obi_5": obi_5, "obi_15": obi_15,
-                "obi_5_delta_1s": obi_5_delta_1s,      # NEW
-                "obi_5_ratio_1s": obi_5_ratio_1s,      # NEW
+                "obi_5_delta_1s": obi_5_delta_1s,
+                "obi_5_ratio_1s": obi_5_ratio_1s,
                 "microprice_bias": microprice_bias,
                 "slope_bid_5": slope_bid_5, "slope_ask_5": slope_ask_5,
                 "slope_bid_15": slope_bid_15, "slope_ask_15": slope_ask_15,
@@ -1149,7 +1307,6 @@ def _process_symbol_year(
                 "has_trades_win15s": has15,
                 "trades_win_sec_used": int(used_win_sec),
                 "Y": Y,
-                # NEW: features spécialisés SHORT/LONG
                 "imbl_aggr_3s": imbl_aggr_3s,
                 "imbl_aggr_10s": imbl_aggr_10s,
                 "delta_spread_3s": delta_spread_3s,
@@ -1159,22 +1316,29 @@ def _process_symbol_year(
                 "bid_refill_persistence_ticks": bid_refill_persistence_ticks,
                 "microprice_bias_ma_1s": microprice_bias_ma_1s,
                 "microprice_bias_ma_3s": microprice_bias_ma_3s,
-                "microprice_shift_1s": microprice_shift_1s,  # NEW
+                "microprice_shift_1s": microprice_shift_1s,
                 "mid_minus_vwap_3s": mid_minus_vwap_3s,
                 "atr_pct_rank_30m": atr_pct_rank_30m,
                 "bb_width_pctl": bb_width_pctl,
                 "ask_wall_decay_3s": ask_wall_decay_3s,
-                "wall_persistence_score_5s": wall_persistence_score_5s,  # NEW
-                # NEW: flags NaN sur les ratios événementiels
+                "wall_persistence_score_5s": wall_persistence_score_5s,
                 "best_bid_refill_rate_isnan": best_bid_refill_rate_isnan,
                 "bid_absorb_ratio_3s_isnan": bid_absorb_ratio_3s_isnan,
                 "bid_absorb_ratio_10s_isnan": bid_absorb_ratio_10s_isnan,
+
+                # ✨ NOUVEAUX signaux LONG-friendly (communs aux 2 sides)
+                "lf_bid_absorb_ratio_3s": lf_bid_absorb_ratio_3s,
+                "lf_bid_refill_ticks_3s": lf_bid_refill_ticks_3s,
+                "lf_mid_minus_vwap_3s_bps": lf_mid_minus_vwap_3s_bps,
+                "lf_bb_width_pct": lf_bb_width_pct,
+                "lf_atr_rank_30m": lf_atr_rank_30m,
+                "lf_ask_wall_decay_3s": lf_ask_wall_decay_3s,
             }
 
             row.update({
                 "obi_5_side": SA(obi_5), "obi_15_side": SA(obi_15),
-                "obi_5_delta_1s_side": obi_5_delta_1s_side,   # NEW
-                "obi_5_ratio_1s_side": obi_5_ratio_1s_side,   # NEW
+                "obi_5_delta_1s_side": obi_5_delta_1s_side,
+                "obi_5_ratio_1s_side": obi_5_ratio_1s_side,
                 "microprice_bias_side": SA(microprice_bias),
                 "slope_bid_5_side": SA(slope_bid_5), "slope_ask_5_side": SA(slope_ask_5),
                 "slope_bid_15_side": SA(slope_bid_15), "slope_ask_15_side": SA(slope_ask_15),
@@ -1182,12 +1346,11 @@ def _process_symbol_year(
                 "aggr_ratio_15s_side": agr15_side,
                 "net_delta_15s_side": nd15_side,
                 "mid_jump_bps_3s_side": SA(mid_jump_bps_3s) if np.isfinite(mid_jump_bps_3s) else np.nan,
-                # NEW side-aware
                 "imbl_aggr_3s_side": imbl_aggr_3s_side,
                 "imbl_aggr_10s_side": imbl_aggr_10s_side,
                 "microprice_bias_ma_1s_side": SA(microprice_bias_ma_1s) if np.isfinite(microprice_bias_ma_1s) else np.nan,
                 "microprice_bias_ma_3s_side": SA(microprice_bias_ma_3s) if np.isfinite(microprice_bias_ma_3s) else np.nan,
-                "microprice_shift_1s_side": SA(microprice_shift_1s) if np.isfinite(microprice_shift_1s) else np.nan,  # NEW
+                "microprice_shift_1s_side": SA(microprice_shift_1s) if np.isfinite(microprice_shift_1s) else np.nan,
                 "mid_minus_vwap_3s_side": SA(mid_minus_vwap_3s) if np.isfinite(mid_minus_vwap_3s) else np.nan,
                 "wall_persistence_score_5s_side": SA(wall_persistence_score_5s - 0.5) if np.isfinite(wall_persistence_score_5s) else np.nan,
             })
@@ -1197,14 +1360,12 @@ def _process_symbol_year(
                 sink.write(batch); batch.clear(); gc.collect()
 
         finally:
-            # Libère les bindings explicitement (locals() n'est pas fiable ici)
             try: del book_win
             except Exception: pass
             try: del tob, tr1, tr10, tr15, tr_lat, tr_raw
             except Exception: pass
             gc.collect()
         
-    # --- fin de la boucle ---
     if batch:
         sink.write(batch); batch.clear()
 
@@ -1214,122 +1375,9 @@ def _process_symbol_year(
         _log(True, f"[WARN] no rows for {symbol} {year} — vérifiez globs BOOK/TRADES, colonnes 'timestamp', et plage temporelle signals vs data")
     return total
 
-def _dataset_from_parts_glob(glob_path: str, so: dict) -> ds.Dataset:
-    pafs = _pa_filesystem_from_so(so or {})
-    paths = _expand_paths(glob_path, so or {})
-    if not paths:
-        raise FileNotFoundError(f"No parts found: {glob_path}")
-    return ds.dataset(paths, format="parquet", filesystem=pafs)
-
-def _fit_norm_from_train_parts(train_root: str, so: dict) -> NormStats:
-    """
-    Parcourt tous les parts du split 'train' (tous symboles/années), regroupe par TF,
-    et calcule mean/std pour chaque colonne numérique (hors EXCLUDE_FROM_NORM).
-    """
-    ns = NormStats()
-
-    # On ouvre tout le split train d'un coup via un dataset Arrow
-    dset = _dataset_from_parts_glob(f"{_normalize_url(train_root).rstrip('/')}/**/parts/*.parquet", so)
-    cols = list(dset.schema.names)
-
-    # Determiner les colonnes normalisables: colonnes numériques présentes + pas dans EXCLUDE
-    # On s'aide d'un petit scan de schéma
-    schema = dset.schema
-    numeric_cols = []
-    for f in schema:
-        if f.name in EXCLUDE_FROM_NORM:
-            continue
-        if patypes.is_floating(f.type):     # <- floats only
-            numeric_cols.append(f.name)
-
-    # On a besoin de 'tf' pour regrouper par TF
-    if "tf" not in cols:
-        raise ValueError("Parts train sans colonne 'tf' — requis pour la normalisation par-TF")
-
-    # On lit par batches pour rester mémoire-safe
-    # Note: Arrow Scanner permet un batch_size; on itère sur batches
-    scanner = dset.scanner(columns=["tf"] + numeric_cols, batch_size=200_000)
-    # Accumulateurs Welford: dict[tf][col] -> Welford()
-    acc = defaultdict(lambda: defaultdict(_Welford))
-
-    for batch in scanner.to_batches():
-        tbl = pa.Table.from_batches([batch])
-        pdf = tbl.to_pandas(types_mapper=pd.ArrowDtype)
-        if pdf.empty: continue
-
-        pdf["tf"] = pdf["tf"].astype(str)
-        for tf_val, g in pdf.groupby("tf"):
-            for col in numeric_cols:
-                if col not in g.columns: 
-                    continue
-                arr = pd.to_numeric(g[col], errors="coerce").to_numpy(dtype=float)
-                acc[tf_val][col].update_arr(arr)
-
-        del pdf
-
-    # Finaliser stats
-    for tf_val, cols_map in acc.items():
-        for col, wf in cols_map.items():
-            mean, std = wf.result()
-            ns.set(tf_val, col, mean, std if np.isfinite(std) and std>0 else 1.0)
-
-    return ns
-
-def _rewrite_split_with_norm(src_split_root: str, dst_split_root: str, ns: NormStats, so: dict):
-    dset = _dataset_from_parts_glob(f"{_normalize_url(src_split_root).rstrip('/')}/**/parts/*.parquet", so)
-    schema = dset.schema
-
-    # floats only (paired with change #1)
-    numeric_cols = []
-    for f in schema:
-        if f.name in EXCLUDE_FROM_NORM: 
-            continue
-        if patypes.is_floating(f.type):
-            numeric_cols.append(f.name)
-
-    scanner = dset.scanner(columns=list(schema.names), batch_size=200_000)
-
-    for batch in scanner.to_batches():
-        tbl = pa.Table.from_batches([batch])
-
-        # IMPORTANT: no ArrowDtype here
-        pdf = tbl.to_pandas()                     # <- do NOT pass types_mapper=pd.ArrowDtype
-        if pdf.empty:
-            continue
-
-        pdf["tf"] = pdf["tf"].astype(str)
-
-        for tf_val, g_tf in pdf.groupby("tf"):
-            stats_tf = ns.stats.get(tf_val, {})
-            if not stats_tf:
-                continue
-
-            cols_norm = [c for c in numeric_cols if (c in g_tf.columns) and (c in stats_tf)]
-            if not cols_norm:
-                continue
-
-            # ensure destination columns are float64 BEFORE any assignment
-            for c in cols_norm:
-                if not pd.api.types.is_float_dtype(pdf[c].dtype):
-                    pdf[c] = pd.to_numeric(pdf[c], errors="coerce").astype("float64")
-
-            # now standardize
-            for c in cols_norm:
-                st = stats_tf[c]
-                m = float(st["mean"])
-                s = float(st["std"]) if float(st["std"]) > 0 else 1.0
-                vals = pd.to_numeric(g_tf[c], errors="coerce").astype("float64")
-                pdf.loc[g_tf.index, c] = (vals - m) / s
-
-        for (sym, year), g_sy in pdf.groupby(["symbol", "year"]):
-            out_dir = f"{_normalize_url(dst_split_root).rstrip('/')}/{sym}/{int(year)}/parts"
-            part_path = f"{out_dir}/part-{int(np.random.randint(0, 1e9)):09d}.parquet"
-            g_sy.to_parquet(part_path, engine="pyarrow", index=False, compression="zstd", storage_options=so)
-
 # ------------------------------
 # Split bounds
 # ------------------------------
-# --- replace _split_bounds() with this version (adds pad hours) ---
 def _split_bounds(name: str, pad_hours: int = 4) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     name = (name or "all").lower()
     if name == "train":
@@ -1375,13 +1423,13 @@ def parse_args():
 
     # === Split temporel
     p.add_argument("--split", choices=["train", "val", "test", "all", "all_splits"], default="all_splits",
-    help=("Fenêtre temporelle : "
-          "train=2024-01..2025-03, "
-          "val=2025-04..2025-06, "
-          "test=2025-07..2025-09, "
-          "all=sans contrainte, "
-          "all_splits=tous les trois d'un coup")
-)
+        help=("Fenêtre temporelle : "
+              "train=2024-01..2025-03, "
+              "val=2025-04..2025-06, "
+              "test=2025-07..2025-09, "
+              "all=sans contrainte, "
+              "all_splits=tous les trois d'un coup")
+    )
 
     # === Options AWS / S3
     p.add_argument("--s3-region", default="ap-northeast-1",
@@ -1394,19 +1442,9 @@ def parse_args():
     p.add_argument("--default-fees-bps", type=float, default=6.0,
                    help="Frais en bps si 'fees_bps' manque dans le CSV (ex: 6.0)")
     
-    # === Timeframes & Normalisation
-    p.add_argument("--tfs", nargs="+", default=DEFAULT_TFS, help="TF autorisés (défaut: 5m 15m 30m 1h 2h 4h)")
-    
-    p.add_argument("--norm-mode", choices=["none","fit","apply","fit_apply"], default="fit_apply",
-                   help=("Normalisation par-TF globale: "
-                         "fit=calcule stats sur parts train, "
-                         "apply=applique stats existantes à tous les splits, "
-                         "fit_apply=fit sur train puis applique à tous les splits, "
-                         "none=aucune normalisation"))
-    p.add_argument("--norm-path", default=None,
-                   help="Chemin S3 pour sauvegarder/charger les stats (ex: s3://.../stage2/_norm/stats.json)")
-    p.add_argument("--norm-out-root", default=None,
-                   help="Racine de sortie pour datasets normalisés (défaut: <out-root> avec suffixe _norm)")
+    # === Timeframes
+    p.add_argument("--tfs", nargs="+", default=DEFAULT_TFS,
+                   help="TF autorisés (défaut: 5m 15m 30m 1h 2h 4h)")
 
     return p.parse_args()
 
@@ -1465,7 +1503,6 @@ def main():
             if split_months:
                 split_months |= {_next_ym(max(split_months))}
         else:
-            # 'all' : pas de contrainte => tous les mois des symbols
             split_months = set().union(*allowed_by_symbol.values()) if allowed_by_symbol else set()
 
         for sym in args.symbols:
@@ -1497,40 +1534,6 @@ def main():
                         print(f"⚠️ [{split_name}] no rows for {sym} {year}")
                 except FileNotFoundError as e:
                     print(f"⚠️ [{split_name}] skip {sym} {year}: {e}")
-
-    # =========================
-    # Normalisation post-build
-    # =========================
-    out_root_norm = args.norm_out_root or (_normalize_url(args.out_root).rstrip("/") + "_norm")
-    norm_stats_path = args.norm_path or (out_root_norm.rstrip("/") + "/_norm/stats.json")
-
-    if args.norm_mode in ("fit","fit_apply"):
-        # Fit sur TRAIN SEULEMENT
-        train_root = f"{_normalize_url(args.out_root).rstrip('/')}/train"
-        print(f"[norm] FIT from train: {train_root}", flush=True)
-        try:
-            ns = _fit_norm_from_train_parts(train_root, so)
-            ns.save(norm_stats_path, so)
-            print(f"[norm] stats saved to {norm_stats_path}", flush=True)
-        except FileNotFoundError:
-            print("[norm] ⚠️ aucun parts train trouvés pour fit; skip", flush=True)
-
-    if args.norm_mode in ("apply","fit_apply"):
-        # Charger stats avec protection
-        try:
-            ns = NormStats.load(norm_stats_path, so)
-        except FileNotFoundError:
-            print(f"[norm] ⚠️ stats introuvables: {norm_stats_path} — skip APPLY", flush=True)
-        else:
-            print(f"[norm] APPLY using {norm_stats_path}", flush=True)
-            for split_name in (["train","val","test"] if args.split=="all_splits" else [args.split]):
-                src_split_root = f"{_normalize_url(args.out_root).rstrip('/')}/{split_name}"
-                dst_split_root = f"{_normalize_url(out_root_norm).rstrip('/')}/{split_name}"
-                try:
-                    _rewrite_split_with_norm(src_split_root, dst_split_root, ns, so)
-                    print(f"✅ [norm] wrote normalized parts under {dst_split_root}", flush=True)
-                except FileNotFoundError:
-                    print(f"⚠️ [norm] no parts found to normalize in {src_split_root}", flush=True)
 
 if __name__ == "__main__":
     main()

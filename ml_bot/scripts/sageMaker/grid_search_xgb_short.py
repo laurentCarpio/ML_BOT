@@ -19,9 +19,9 @@ from sagemaker.estimator import Estimator
 REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
-# ✅ dataset short-only + dossier modèles séparé pour ne pas mélanger avec le global/long
-DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3-xgb/v3-go-shortonly"
-MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-short"
+# ✅ nouveau dataset v44, short-only
+DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v44-shortonly"
+MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v44-shortonly"
 
 INSTANCE_TYPE   = "ml.c5.xlarge"
 SPOT            = True

@@ -19,9 +19,9 @@ from sagemaker.estimator import Estimator
 REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
-# ✅ dataset long-only + dossier modèles séparé pour ne pas mélanger avec le global/long
-DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3-xgb/v3-go-longonly"
-MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-long"
+# ✅ nouveau dataset v44, long-only
+DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v44-longonly"
+MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v44-longonly"
 
 INSTANCE_TYPE   = "ml.c5.xlarge"
 SPOT            = True
@@ -291,18 +291,18 @@ def main():
     
     # GRID pour passe structurelle
     GRID = {
-        "scale_pos_weight": spw_grid,        # lue depuis _meta → ~53.45 chez toi
+        "scale_pos_weight": spw_grid,        # lu depuis meta ou fallback
         "max_depth":        [7],
         "min_child_weight": [2],
-        "max_delta_step":   [2],             # 👈 anti-FP
+        "max_delta_step":   [2],             # <-- structurelle : 2
         "reg_lambda":       [1.0, 2.0],
-        "reg_alpha":        [0.5],           # 👈 L1 pour limiter FP
+        "reg_alpha":        [0.5],           # <-- structurelle : 0.5
         "gamma":            [0.0],
         "subsample":        [0.8],
         "colsample_bytree": [0.8],
     }
 
-    # === Run prioritaire (ancre "structure anti-FP" pour short-only) ===
+    # === Run prioritaire (ancre "structure anti-FP" pour long-only) ===
     PRIORITY_COMBOS = [
         dict(
             scale_pos_weight=SPW0,  # lu depuis DATA_ROOT/_meta/train_pos_weight.json
@@ -626,7 +626,7 @@ def _per_pocket_reports(model_uri: str):
 
 def make_thresholds_json_from_breakdown(
     model_uri: str,
-    auprc_floor: float = 0.10,
+    auprc_floor: float = 0.12,
     policy: str = "thr_f1",       # "thr_f1" ou "prec_floor" (à ajouter plus tard)
     prec_floor: float | None = None
 ) -> str:
