@@ -20,18 +20,17 @@ NOTE IMPORTANTE:
 """
 
 from __future__ import annotations
-import argparse, re, gc, os, itertools
+import argparse, re, gc, os
 from typing import Optional, Dict, Any, List, Set
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 from pyarrow import fs as pa_fs
-import sys, fsspec
+import fsspec
 from datetime import datetime
 from calendar import monthrange
 from pyarrow import types as patypes
-from pandas.api.types import is_numeric_dtype
 
 _MONTH_RE = re.compile(r"(\d{4})-(\d{2})")
 BOOK_LEVELS = 15
@@ -61,9 +60,6 @@ TRADE_WIN_TF_FACTOR = {
     "4h": 1.5,
 }
 
-import numpy as np
-import pandas as pd
-
 # ----------------------------
 # Helpers Stage2 "LONG-friendly"
 # ----------------------------
@@ -85,20 +81,16 @@ def compute_bid_absorb_ratio_3s(trades_win_3s: pd.DataFrame,
     if trades_win_3s is None or trades_win_3s.empty:
         return 0.0
 
-    # Adapter le filtre side à ton codage actuel ('sell'/ -1 / 0/1 etc.)
     mask_sell = (trades_win_3s["side"] == "sell") if "side" in trades_win_3s.columns else np.zeros(len(trades_win_3s), dtype=bool)
     vol_sell = float(trades_win_3s.loc[mask_sell, "qty"].sum()) if "qty" in trades_win_3s.columns else 0.0
 
-    # variation du best bid en bps (approx)
     if best_bid_start is None or best_bid_end is None or best_bid_start <= 0:
         delta_bps = 0.0
     else:
         delta_bps = 10_000.0 * (best_bid_end / best_bid_start - 1.0)
 
-    # On ne pénalise que la baisse du bid (delta_bps < 0)
     penalty = max(-delta_bps, 0.0)
 
-    # k permet de "traduire" un nombre de bps en volume fictif équivalent
     k = 1.0
     denom = vol_sell + k * penalty
     if denom <= 0:
@@ -122,9 +114,6 @@ def compute_bid_refill_ticks_3s(book_win_3s: pd.DataFrame) -> float:
     if qty.size < 3:
         return 0.0
 
-    # On considère qu'il y a "refill" si:
-    # - qty(t_i) < 0.7 * qty(t_{i-1})  => vidage
-    # - puis qty(t_{i+1}) > 1.2 * qty(t_i) => refill
     refills = 0
     for i in range(1, len(qty) - 1):
         if qty[i] < 0.7 * qty[i - 1] and qty[i + 1] > 1.2 * qty[i]:
@@ -169,16 +158,13 @@ def compute_bb_width_pct(bb_width_raw: float,
     if mode == "price":
         if mid_t is None or mid_t <= 0:
             return 0.0
-        # largeur en bps "equivalente"
         bw_bps = 10_000.0 * (bb_width_raw / mid_t)
     else:
-        # on suppose que bb_width_raw est déjà un écart en bps
         bw_bps = float(bb_width_raw)
 
     if atr_bps is not None and atr_bps > 0:
         return bw_bps / atr_bps
     else:
-        # fallback: simple scaling
         return bw_bps / 100.0  # "largeur" en dizaines de bps
 
 def compute_atr_rank_30m(atr_hist_30m: np.ndarray,
@@ -197,7 +183,6 @@ def compute_atr_rank_30m(atr_hist_30m: np.ndarray,
     if arr.size == 0:
         return 0.0
 
-    # proportion des valeurs <= atr_bps_t
     rank = (arr <= atr_bps_t).mean()
     return float(rank)
 
@@ -215,16 +200,12 @@ def compute_ask_wall_decay_3s(book_win_3s: pd.DataFrame,
     if not {"ask_price", "ask_qty"}.issubset(df.columns):
         return 0.0
 
-    # On prend approximativement le premier et dernier snapshot
     first = df.iloc[0]
     last  = df.iloc[-1]
 
     def _cum_wall(row):
-        # si tu as plusieurs niveaux, adapte pour faire un sum conditionnel
-        # Ici, on suppose un L1 simplifié pour l'exemple
         ap = float(row["ask_price"])
         aq = float(row["ask_qty"])
-        # check si ask dans la fenêtre [mid, mid * (1 + bps_window/10_000)]
         max_ask = mid_t * (1.0 + bps_window / 10_000.0)
         if ap <= max_ask:
             return aq
@@ -284,6 +265,29 @@ def _month_tag_from_path(p: str) -> Optional[str]:
     m = _MONTH_RE.search(p)
     return f"{m.group(1)}-{m.group(2)}" if m else None
 
+def _log(debug: bool, msg: str) -> None:
+    if debug:
+        print(str(msg), flush=True)
+
+def _normalize_url(url: str) -> str:
+    return re.sub(r"^([A-Za-z0-9]+)://", lambda m: m.group(1).lower() + "://", url.strip())
+
+def _ensure_s3(url: str):
+    if not re.match(r"^[a-z0-9]+://", url.strip()):
+        raise ValueError(f"Chemin non-fsspec: {url}. On n’accepte que s3:// ...")
+
+def _expand_paths(path_or_glob: str, so: dict) -> list[str]:
+    uri = _normalize_url(path_or_glob)
+    _ensure_s3(uri)
+    fs, _, matches = fsspec.get_fs_token_paths(uri, storage_options=so or {})
+    proto = fs.protocol[0] if isinstance(fs.protocol, (list, tuple)) else fs.protocol
+    out = []
+    for m in matches:
+        if not re.match(r"^[a-z0-9]+://", str(m)):
+            m = f"{proto}://{m}"
+        out.append(_normalize_url(m))
+    return sorted(out)
+
 def _available_span_from_glob(path_glob: str, so: dict, debug: bool=False, tag: str="") -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     paths = _expand_paths(path_glob, so or {})
     if not paths:
@@ -306,46 +310,6 @@ def _available_span_from_glob(path_glob: str, so: dict, debug: bool=False, tag: 
     if debug:
         _log(True, f"[span] {tag} months={months_sorted[:3]}{'...' if len(months_sorted)>3 else ''} -> {start} .. {end}")
     return start, end
-
-def _arrow_time_filter(dset: ds.Dataset, ts_field: str, t0: pd.Timestamp, t1: pd.Timestamp):
-    f = dset.schema.field(ts_field)
-    ftype = f.type
-    if not patypes.is_timestamp(ftype):
-        raise ValueError(f"Field {ts_field} is not a timestamp: {ftype}")
-    t0 = pd.Timestamp(t0).tz_convert("UTC") if t0.tzinfo else pd.Timestamp(t0, tz="UTC")
-    t1 = pd.Timestamp(t1).tz_convert("UTC") if t1.tzinfo else pd.Timestamp(t1, tz="UTC")
-    if ftype.tz is None:
-        t0v = t0.tz_convert("UTC").to_pydatetime().replace(tzinfo=None)
-        t1v = t1.tz_convert("UTC").to_pydatetime().replace(tzinfo=None)
-    else:
-        t0v = t0.tz_convert(ftype.tz).to_pydatetime()
-        t1v = t1.tz_convert(ftype.tz).to_pydatetime()
-    s0 = pa.scalar(t0v, type=ftype)
-    s1 = pa.scalar(t1v, type=ftype)
-    return (ds.field(ts_field) >= s0) & (ds.field(ts_field) <= s1)
-
-def _log(debug: bool, msg: str) -> None:
-    if debug:
-        print(str(msg), flush=True)
-
-def _expand_paths(path_or_glob: str, so: dict) -> list[str]:
-    uri = _normalize_url(path_or_glob)
-    _ensure_s3(uri)
-    fs, _, matches = fsspec.get_fs_token_paths(uri, storage_options=so or {})
-    proto = fs.protocol[0] if isinstance(fs.protocol, (list, tuple)) else fs.protocol
-    out = []
-    for m in matches:
-        if not re.match(r"^[a-z0-9]+://", str(m)):
-            m = f"{proto}://{m}"
-        out.append(_normalize_url(m))
-    return sorted(out)
-
-def _ensure_s3(url: str):
-    if not re.match(r"^[a-z0-9]+://", url.strip()):
-        raise ValueError(f"Chemin non-fsspec: {url}. On n’accepte que s3:// ...")
-
-def _normalize_url(url: str) -> str:
-    return re.sub(r"^([A-Za-z0-9]+)://", lambda m: m.group(1).lower() + "://", url.strip())
 
 def _so(region: str | None, anon: bool) -> dict:
     so = {}
@@ -372,6 +336,23 @@ def _dataset_from_glob_s3(path_glob: str, so: dict, debug: bool=False, tag: str=
     d = ds.dataset(paths, format="parquet", filesystem=pafs)
     _log(debug, f"[dataset] {tag} schema={list(d.schema.names)}")
     return d
+
+def _arrow_time_filter(dset: ds.Dataset, ts_field: str, t0: pd.Timestamp, t1: pd.Timestamp):
+    f = dset.schema.field(ts_field)
+    ftype = f.type
+    if not patypes.is_timestamp(ftype):
+        raise ValueError(f"Field {ts_field} is not a timestamp: {ftype}")
+    t0 = pd.Timestamp(t0).tz_convert("UTC") if t0.tzinfo else pd.Timestamp(t0, tz="UTC")
+    t1 = pd.Timestamp(t1).tz_convert("UTC") if t1.tzinfo else pd.Timestamp(t1, tz="UTC")
+    if ftype.tz is None:
+        t0v = t0.tz_convert("UTC").to_pydatetime().replace(tzinfo=None)
+        t1v = t1.tz_convert("UTC").to_pydatetime().replace(tzinfo=None)
+    else:
+        t0v = t0.tz_convert(ftype.tz).to_pydatetime()
+        t1v = t1.tz_convert(ftype.tz).to_pydatetime()
+    s0 = pa.scalar(t0v, type=ftype)
+    s1 = pa.scalar(t1v, type=ftype)
+    return (ds.field(ts_field) >= s0) & (ds.field(ts_field) <= s1)
 
 def _read_book_window_ds(book_glob: str, t0: pd.Timestamp, t1: pd.Timestamp,
                          so: dict, columns: list[str]) -> pd.DataFrame:
@@ -565,7 +546,6 @@ def _months_touched(t0: pd.Timestamp, t1: pd.Timestamp) -> Set[str]:
     out = set()
     while cur <= end:
         out.add(f"{cur.year:04d}-{cur.month:02d}")
-        # next month
         if cur.month == 12:
             cur = pd.Timestamp(year=cur.year+1, month=1, day=1, tz="UTC")
         else:
@@ -669,7 +649,7 @@ def _process_symbol_year(
             sig.loc[sig["tf"].eq(""), "tf"] = str(default_tf)
             _log(True, f"[signals] tf vides: {nan_tf} -> {default_tf}")
 
-    # Filtrer sur TF autorisés (passés au main via closure)
+    # Filtrer sur TF autorisés
     if allowed_tfs is not None:
         sig = sig[sig["tf"].isin(allowed_tfs)]
         if sig.empty:
@@ -744,13 +724,8 @@ def _process_symbol_year(
         _log(True, f"[span] Aucun intervalle exploitable pour {symbol} {year} — skip")
         return 0
 
-    H_MAX = max(TF_HORIZONS.values())
-
     before_prune = len(sig)
-    # par (ne garde que la marge de 15s en entrée) :
     sig = sig[sig["t"] >= (eff_start + pd.Timedelta(seconds=15))].copy()
-    # la borne de fin est vérifiée plus tard par signal: if t_out1 > eff_end: continue
-
     _log(debug, f"[signals] pruned_to_available_span rows={len(sig)} (was {before_prune}) eff={eff_start}..{eff_end}")
     if sig.empty:
         _log(True, f"[WARN] aucun signal restant après pruning sur span dispo")
@@ -767,9 +742,7 @@ def _process_symbol_year(
 
     len_sig = len(sig)
     for i, (_, r) in enumerate(sig.sort_values("t").iterrows(), start=1):
-        # init systématique pour éviter UnboundLocalError et faciliter le finally
-        book_win = tob = tr1 = tr10 = tr15 = tr_lat = None
-        tr_raw = None
+        book_win = tob = tr1 = tr10 = tr15 = tr_raw = None
         try:
             if debug and (i % 100 == 0):
                 _log(True, f"[progress] {symbol} {year} processed={i}/{len_sig}")
@@ -778,11 +751,10 @@ def _process_symbol_year(
             entry = float(r["entry"]); fees_bps = float(r["fees_bps"]); tf = str(r["tf"])
             H = int(TF_HORIZONS.get(tf, DEFAULT_H))
 
-            # helper side-aware local basé sur le signe du trade
             def SA(x: float) -> float:
                 return float(sgn * x) if np.isfinite(x) else np.nan
 
-            t_feat0 = _ensure_utc(t - pd.Timedelta(seconds=20))  # élargi à 20s
+            t_feat0 = _ensure_utc(t - pd.Timedelta(seconds=20))
             t_feat1 = _ensure_utc(t + pd.Timedelta(seconds=15))
             t_out0  = _ensure_utc(t + pd.Timedelta(seconds=15))
             t_out1  = _ensure_utc(t + pd.Timedelta(seconds=H))
@@ -816,7 +788,6 @@ def _process_symbol_year(
                 skip_stats["tob_missing"] += 1
                 continue
             row_t = book_win.iloc[j]
-            # cap d’ancienneté (mitigation "stale quotes")
             ts_last = idx_ev[j]
             MAX_STALE = pd.Timedelta(seconds=10)
             if (t - ts_last) > MAX_STALE:
@@ -835,10 +806,6 @@ def _process_symbol_year(
             w10 = slice(t - pd.Timedelta(seconds=10), t)
             w15 = slice(t - pd.Timedelta(seconds=15), t)
 
-            tr10 = tr1.loc[w10] if not tr1.empty else pd.DataFrame()
-            tr15 = tr1.loc[w15] if not tr1.empty else pd.DataFrame()
-
-            # fenêtre 3s pour features short/long
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             tr3 = tr1.loc[w3] if not tr1.empty else pd.DataFrame()
 
@@ -849,10 +816,12 @@ def _process_symbol_year(
                 s = float(dfw.get("sell_qty", pd.Series(dtype=float)).sum())
                 return b, s
 
+            tr10 = tr1.loc[w10] if not tr1.empty else pd.DataFrame()
+            tr15 = tr1.loc[w15] if not tr1.empty else pd.DataFrame()
+
             b3,  s3  = _sum_buy_sell(tr3)
             b10, s10 = _sum_buy_sell(tr10)
 
-            # Imbalance d'agression (sell / (sell+buy))
             def _imbl_raw(s: float, b: float) -> float:
                 den = s + b
                 return float(s/den) if den > 0 else np.nan
@@ -866,7 +835,6 @@ def _process_symbol_year(
             def _imbl_side(imbl: float) -> float:
                 if not np.isfinite(imbl):
                     return 0.0
-                # centré, côté-aware : (imbl - 0.5) * side_num
                 return float((1 if side == "buy" else -1) * (imbl - 0.5))
 
             imbl_aggr_3s_side  = _imbl_side(imbl_aggr_3s)
@@ -879,7 +847,6 @@ def _process_symbol_year(
             den15 = b15 + s15
             net_delta_15s = ((b15 - s15)/den15) if den15 > 0 else np.nan
 
-            # Fallbacks neutres si pas de trades
             has10 = int((not tr10.empty) and (tr10.get("tot_qty", pd.Series(dtype=float)).sum() > 0))
             has15 = int((not tr15.empty) and (tr15.get("tot_qty", pd.Series(dtype=float)).sum() > 0))
             agr10 = float(aggr_ratio_10s) if np.isfinite(aggr_ratio_10s) else 0.5
@@ -892,7 +859,6 @@ def _process_symbol_year(
             agr15_side = _side_map(2*agr15 - 1.0)
             nd15_side  = _side_map(nd15)
 
-            # ajout / exécution au bid pour 3s/10s
             b0_3  = b0sz.loc[w3]  if b0sz.loc[w3].size  > 0 else pd.Series(dtype=float)
             b0_10 = b0sz.loc[w10] if b0sz.loc[w10].size > 0 else pd.Series(dtype=float)
 
@@ -902,29 +868,25 @@ def _process_symbol_year(
             executed_sell_3s  = float(s3)
             executed_sell_10s = float(s10)
 
-            # LONG: absorption (sells / added bid) — versions "raw" avant clip
             bid_absorb_ratio_3s_raw  = np.nan
             best_bid_refill_rate_raw = np.nan
             bid_absorb_ratio_10s_raw = np.nan
 
             if np.isfinite(added_bid_3s) and added_bid_3s > 0 and executed_sell_3s > 0:
                 bid_absorb_ratio_3s_raw  = float(executed_sell_3s / added_bid_3s)
-                best_bid_refill_rate_raw = float(added_bid_3s / executed_sell_3s)  # SHORT
+                best_bid_refill_rate_raw = float(added_bid_3s / executed_sell_3s)
 
             if np.isfinite(added_bid_10s) and added_bid_10s > 0 and executed_sell_10s > 0:
                 bid_absorb_ratio_10s_raw = float(executed_sell_10s / added_bid_10s)
 
-            # Flags "événement" : 1 si ratio indéfini (NaN) avant clip
-            bid_absorb_ratio_3s_isnan  = int(not np.isfinite(bid_absorb_ratio_3s_raw))
-            bid_absorb_ratio_10s_isnan = int(not np.isfinite(bid_absorb_ratio_10s_raw))
-            best_bid_refill_rate_isnan = int(not np.isfinite(best_bid_refill_rate_raw))
+            bid_absorb_ratio_3s_isnan  = int( not np.isfinite(bid_absorb_ratio_3s_raw))
+            bid_absorb_ratio_10s_isnan = int( not np.isfinite(bid_absorb_ratio_10s_raw))
+            best_bid_refill_rate_isnan = int( not np.isfinite(best_bid_refill_rate_raw))
 
-            # Clip dans [0, upper] (non négatif)
             bid_absorb_ratio_3s  = _clip_ratio_nonneg(bid_absorb_ratio_3s_raw,  upper=100.0)
             bid_absorb_ratio_10s = _clip_ratio_nonneg(bid_absorb_ratio_10s_raw, upper=100.0)
             best_bid_refill_rate = _clip_ratio_nonneg(best_bid_refill_rate_raw, upper=100.0)
 
-            # LONG: persistance refill (ticks) sur 10s
             bid_refill_persistence_ticks = np.nan
             b0_for_refill = b0sz.loc[w10]
             if b0_for_refill.size > 1:
@@ -944,11 +906,9 @@ def _process_symbol_year(
                             continue
                 bid_refill_persistence_ticks = float(refill_cycles)
 
-            # ===== Features =====
             _sp = spread_bps.loc[:t]
             spread_bps_entry = float(_sp.iloc[-1]) if len(_sp) else np.nan
 
-            # delta_spread_3s = spread_now - min(spread sur 3s)
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             sp3 = spread_bps.loc[w3]
             if sp3.size > 0 and np.isfinite(spread_bps_entry):
@@ -957,7 +917,6 @@ def _process_symbol_year(
             else:
                 delta_spread_3s = np.nan
             
-            # spread moyen sur la dernière seconde [t-1s, t]
             spread_bps_mean_1s = np.nan
             w1 = slice(t - pd.Timedelta(seconds=1), t)
             sp1 = spread_bps.loc[w1]
@@ -987,7 +946,6 @@ def _process_symbol_year(
             microprice = w_mp*ask_t + (1.0-w_mp)*bid_t if np.isfinite(w_mp) and np.isfinite(bid_t) and np.isfinite(ask_t) else np.nan
             microprice_bias = ((microprice - mid_t)/mid_t) if (np.isfinite(microprice) and np.isfinite(mid_t) and mid_t>0) else np.nan
 
-            # microprice_bias_ma_1s / 3s + microprice_shift_1s
             mp_ma_1s = np.nan
             mp_ma_3s = np.nan
             microprice_shift_1s = np.nan
@@ -1057,10 +1015,18 @@ def _process_symbol_year(
             mid_t0 = float(_m0.iloc[-1]) if len(_m0) else np.nan
             mid_jump_bps_3s = (10000.0 * (mid_t0 - mid_t3)/mid_t3) if (np.isfinite(mid_t0) and np.isfinite(mid_t3) and mid_t3>0) else np.nan
 
-            # mid_vs_VWAP_3s (bps) basé sur trades bruts tr_raw
+            # mid_vs_VWAP_3s (bps) basé sur trades bruts tr_raw — v46 fix
             mid_minus_vwap_3s = np.nan
             if tr_raw is not None and not tr_raw.empty:
-                tr3_raw = tr_raw.loc[w3] if isinstance(tr_raw.index, pd.DatetimeIndex) else pd.DataFrame()
+                if not isinstance(tr_raw.index, pd.DatetimeIndex):
+                    tmp_idx = pd.to_datetime(tr_raw.index, utc=True, errors="coerce")
+                    tr_raw = tr_raw.copy()
+                    tr_raw.index = tmp_idx
+
+                t0_3s = t - pd.Timedelta(seconds=3)
+                mask_win = (tr_raw.index >= t0_3s) & (tr_raw.index <= t)
+                tr3_raw = tr_raw[mask_win]
+
                 if not tr3_raw.empty and "price" in tr3_raw.columns and "qty" in tr3_raw.columns:
                     v_q = pd.to_numeric(tr3_raw["qty"], errors="coerce")
                     v_p = pd.to_numeric(tr3_raw["price"], errors="coerce")
@@ -1068,12 +1034,18 @@ def _process_symbol_year(
                     v_q = v_q[mask]
                     v_p = v_p[mask]
                     den_v = float(v_q.sum())
-                    if den_v > 0 and np.isfinite(mid_t) and mid_t > 0:
-                        vwap_3s = float((v_p * v_q).sum() / den_v)
-                        if np.isfinite(vwap_3s) and vwap_3s > 0:
-                            mid_minus_vwap_3s = float(1e4 * (mid_t - vwap_3s) / vwap_3s)
-            
-            # ask_wall_decay_3s (dynamique du mur côté ask sur 3s)
+                    if den_v > 0:
+                        # fallback mid_t si NaN
+                        if not np.isfinite(mid_t) or mid_t <= 0:
+                            _mid_hist = mid.loc[:t]
+                            if _mid_hist.size > 0:
+                                mid_t = float(_mid_hist.iloc[-1])
+                        if np.isfinite(mid_t) and mid_t > 0:
+                            vwap_3s = float((v_p * v_q).sum() / den_v)
+                            if np.isfinite(vwap_3s) and vwap_3s > 0:
+                                mid_minus_vwap_3s = float(1e4 * (mid_t - vwap_3s) / vwap_3s)
+
+            # ask_wall_decay_3s
             ask_wall_decay_3s = np.nan
             sub_bw_3s = book_win.loc[w3] if not book_win.empty else pd.DataFrame()
             if not sub_bw_3s.empty:
@@ -1084,7 +1056,6 @@ def _process_symbol_year(
                     if np.isfinite(ask_wall_max) and ask_wall_max > 0 and np.isfinite(ask_wall_now):
                         ask_wall_decay_3s = float((ask_wall_now - ask_wall_max) / (ask_wall_max + 1e-9))
             
-            # wall_persistence_score_5s (mur persistant côté opposé sur 5s)
             wall_persistence_score_5s = np.nan
             w5 = slice(t - pd.Timedelta(seconds=5), t)
             sub_bw_5s = book_win.loc[w5] if not book_win.empty else pd.DataFrame()
@@ -1101,7 +1072,6 @@ def _process_symbol_year(
                             np.mean(vals[mask] >= 0.5)
                         )
 
-            # Contexte bougies
             octx_full = ohlc.loc[:t].copy()
             octx = octx_full.tail(200)
 
@@ -1117,22 +1087,18 @@ def _process_symbol_year(
             atr_window = octx["atr"].dropna()
             atr_percentile = float((atr_window.rank(pct=True).iloc[-1])) if len(atr_window) > 10 else np.nan
 
-            # ATR percentile sur ~30m d'historique
             atr_pct_rank_30m = np.nan
             if not octx_full.empty:
                 atr_win_30m = octx_full["atr"].dropna().tail(bars_30m)
                 if len(atr_win_30m) >= 2:
                     atr_pct_rank_30m = float(atr_win_30m.rank(pct=True).iloc[-1])
 
-            # percentile de bb_width sur l'historique local (regime compression/expansion)
             bb_width_pctl = np.nan
             bb_hist = octx_full["bb_width"].dropna()
             if len(bb_hist) >= 20:
                 bb_width_pctl = float(bb_hist.rank(pct=True).iloc[-1])
 
-            # === LONG-friendly helpers (lf_*) communs aux 2 sides ===
-
-            # Fenêtre 3s côté BOOK (resample L1 en "best_*")
+            # LONG-friendly helpers (lf_*)
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             tob_3s = tob.loc[w3] if not tob.loc[w3].empty else tob.tail(1)
 
@@ -1147,8 +1113,6 @@ def _process_symbol_year(
             else:
                 book_lf_3s = pd.DataFrame(columns=["best_bid_price","best_bid_qty","ask_price","ask_qty"])
 
-            # Fenêtre 3s côté TRADES pour les helpers
-            # Si tr3 n'a pas les colonnes 'side'/'qty', on fabrique un petit DF consolidé
             if tr3 is not None and not tr3.empty and {"side","qty"}.issubset(tr3.columns):
                 trades_lf_3s = tr3[["side","qty"]].copy()
             else:
@@ -1157,40 +1121,34 @@ def _process_symbol_year(
                     {"side": "sell", "qty": float(s3)},
                 ])
 
-            # Best bid au début et à la fin des 3s
             t3 = t - pd.Timedelta(seconds=3)
             _b3 = bid0.loc[:t3]
             _b0 = bid0.loc[:t]
             best_bid_start = float(_b3.iloc[-1]) if len(_b3) else np.nan
             best_bid_end   = float(_b0.iloc[-1]) if len(_b0) else np.nan
 
-            # 1) Absorption sur le bid sur 3s
             lf_bid_absorb_ratio_3s = compute_bid_absorb_ratio_3s(
                 trades_win_3s=trades_lf_3s,
                 best_bid_start=best_bid_start,
                 best_bid_end=best_bid_end,
             )
 
-            # 2) Nombre de "refill" du bid sur 3s
             lf_bid_refill_ticks_3s = compute_bid_refill_ticks_3s(
                 book_win_3s=book_lf_3s,
             )
 
-            # 3) Ecart mid vs VWAP_3s en bps
             lf_mid_minus_vwap_3s_bps = compute_mid_minus_vwap_3s_bps(
                 trades_win_3s=trades_lf_3s,
                 mid_t=mid_t,
             )
 
-            # 4) bb_width normalisé (compression / expansion)
             lf_bb_width_pct = compute_bb_width_pct(
                 bb_width_raw=bb_width,
                 mid_t=mid_t,
                 atr_bps=atr_bps,
-                mode="price",  # bb_width est en prix absolu ici
+                mode="price",
             )
 
-            # 5) Rang percentile de l'ATR sur ~30 min
             atr_hist_30m = None
             if not octx_full.empty:
                 atr_hist_30m = octx_full["atr"].dropna().tail(bars_30m).to_numpy(dtype=float)
@@ -1200,14 +1158,12 @@ def _process_symbol_year(
                 atr_bps_t=atr_bps,
             )
 
-            # 6) Décroissance des murs ask sur 3s
             lf_ask_wall_decay_3s = compute_ask_wall_decay_3s(
                 book_win_3s=book_lf_3s,
                 mid_t=mid_t,
-                bps_window=20.0,  # fenêtre [mid, mid+20 bps] pour les murs ask
+                bps_window=20.0,
             )
 
-            # OBI persistence (10s)
             times_10s = pd.date_range(t - pd.Timedelta(seconds=10), t, freq="1s")
             def _obi_at(second_ts: pd.Timestamp) -> float:
                 jj = idx_ev.searchsorted(second_ts, side="right") - 1
@@ -1217,7 +1173,6 @@ def _process_symbol_year(
             side_num = 1 if side=="buy" else -1
             imbalance_persistence = float(np.nanmean((np.sign(obi_hist) == side_num).astype(float))) if np.isfinite(obi_hist).any() else np.nan
 
-            # OBI delta & ratio sur 1 seconde (K=5)
             obi_5_delta_1s = np.nan
             obi_5_ratio_1s = np.nan
             obi_5_delta_1s_side = np.nan
@@ -1242,7 +1197,6 @@ def _process_symbol_year(
             if np.isfinite(executed_vs_added_ratio):
                 executed_vs_added_ratio = float(np.clip(executed_vs_added_ratio, 0.0, 50.0))
 
-            # ===== Label — [t+15s, t+H]
             if t_out1 > eff_end:
                 continue
             try:
@@ -1326,7 +1280,7 @@ def _process_symbol_year(
                 "bid_absorb_ratio_3s_isnan": bid_absorb_ratio_3s_isnan,
                 "bid_absorb_ratio_10s_isnan": bid_absorb_ratio_10s_isnan,
 
-                # ✨ NOUVEAUX signaux LONG-friendly (communs aux 2 sides)
+                # NOUVEAUX signaux LONG-friendly (communs aux 2 sides)
                 "lf_bid_absorb_ratio_3s": lf_bid_absorb_ratio_3s,
                 "lf_bid_refill_ticks_3s": lf_bid_refill_ticks_3s,
                 "lf_mid_minus_vwap_3s_bps": lf_mid_minus_vwap_3s_bps,
@@ -1362,7 +1316,7 @@ def _process_symbol_year(
         finally:
             try: del book_win
             except Exception: pass
-            try: del tob, tr1, tr10, tr15, tr_lat, tr_raw
+            try: del tob, tr1, tr10, tr15, tr_raw
             except Exception: pass
             gc.collect()
         
@@ -1389,16 +1343,14 @@ def _split_bounds(name: str, pad_hours: int = 4) -> tuple[pd.Timestamp | None, p
     else:
         return (None, None)
 
-    # pad end by +4h so labels [t+15s, t+H] fit when H=4h
     return (s0, s1 + pd.Timedelta(hours=pad_hours))
 
 # ------------------------------
 # CLI
 # ------------------------------
 def parse_args():
-    p = argparse.ArgumentParser("Stage2 dataset builder (micro + label Y)")
+    p = argparse.ArgumentParser("Stage2 dataset builder (micro + label Y) v46")
 
-    # === Entrées obligatoires
     p.add_argument("--signals-root", required=True,
                    help="s3://.../report (contient <SYMBOL>/<YEAR>_signals.csv)")
     p.add_argument("--bougie-root", required=True,
@@ -1410,39 +1362,33 @@ def parse_args():
     p.add_argument("--out-root", required=True,
                    help="s3://.../stage2 (dossier de sortie)")
 
-    # === Liste des symboles / années à traiter
     p.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS,
                help="Liste des symboles (défaut: 16 majeurs)")
     
     p.add_argument("--years", nargs="+", type=int, default=None,
                    help="Liste des années ex: 2023 2024 2025 (défaut: déduit de good_months.csv pour les symboles fournis)")
 
-    # === Fichier de contrôle qualité
     p.add_argument("--good-months", required=True,
                    help="Chemin S3 vers good_months.csv (filtrage des mois valides)")
 
-    # === Split temporel
     p.add_argument("--split", choices=["train", "val", "test", "all", "all_splits"], default="all_splits",
         help=("Fenêtre temporelle : "
-              "train=2024-01..2025-03, "
-              "val=2025-04..2025-06, "
-              "test=2025-07..2025-09, "
+              "train=2024-01..2025-04, "
+              "val=2025-05..2025-07, "
+              "test=2025-08..2025-10, "
               "all=sans contrainte, "
               "all_splits=tous les trois d'un coup")
     )
 
-    # === Options AWS / S3
     p.add_argument("--s3-region", default="ap-northeast-1",
                    help="Région AWS ex: ap-northeast-1")
     p.add_argument("--s3-anon", action="store_true",
                    help="Accès anonyme (lecture publique seulement)")
 
-    # === Divers
     p.add_argument("--debug", action="store_true", help="Verbose debug logging")
     p.add_argument("--default-fees-bps", type=float, default=6.0,
                    help="Frais en bps si 'fees_bps' manque dans le CSV (ex: 6.0)")
     
-    # === Timeframes
     p.add_argument("--tfs", nargs="+", default=DEFAULT_TFS,
                    help="TF autorisés (défaut: 5m 15m 30m 1h 2h 4h)")
 
@@ -1453,10 +1399,9 @@ def parse_args():
 # ------------------------------
 def main():
     args = parse_args()
-    print(f"[boot] stage2 starting | debug={args.debug} | symbols={args.symbols} | years={args.years}", flush=True)
+    print(f"[boot] stage2 v46 starting | debug={args.debug} | symbols={args.symbols} | years={args.years}", flush=True)
     so = _so(args.s3_region, args.s3_anon)
 
-    # Charger good_months.csv (S3)
     gm = pd.read_csv(_normalize_url(args.good_months), storage_options=so)
     gm = gm.rename(columns=str.lower)
     if "symbol" not in gm.columns or "ym" not in gm.columns:
@@ -1464,7 +1409,6 @@ def main():
     gm["symbol"] = gm["symbol"].astype(str)
     gm["ym"] = gm["ym"].astype(str)
 
-    # Déduire les années disponibles à partir de good_months.csv si --years est omis
     if args.years is None:
         gm_sel = gm[gm["symbol"].isin(args.symbols)]
         years_in_gm = (
@@ -1474,19 +1418,15 @@ def main():
         args.years = sorted(years_in_gm)
         print(f"[auto-years] années déduites de good_months.csv: {args.years}", flush=True)
 
-    # TFS autorisés: forcer minuscules/trim (évite 4H/4h)
     args.tfs = [str(tf).strip().lower() for tf in (args.tfs or [])]
 
-    # Map global des mois "bons" PAR SYMBOLE (toutes années)
     allowed_by_symbol: Dict[str, Set[str]] = {
         sym: set(gm.loc[gm["symbol"] == sym, "ym"].astype(str))
         for sym in args.symbols
     }
 
-    # Gestion des splits
     splits = [args.split] if args.split != "all_splits" else ["train","val","test"]
 
-    # utilitaire mois+1
     def _next_ym(ym: str) -> str:
         y, m = map(int, ym.split("-"))
         y2 = y + (1 if m == 12 else 0)
@@ -1497,7 +1437,6 @@ def main():
         s0, s1 = _split_bounds(split_name)
         print(f"[split] {split_name} | {s0} .. {s1}", flush=True)
 
-        # Mois du split (avec un tampon: le mois suivant la borne sup)
         if (s0 is not None) and (s1 is not None):
             split_months = _months_touched(s0, s1)
             if split_months:
@@ -1513,7 +1452,6 @@ def main():
                 trades_glob = f"{args.trades_root.rstrip('/').replace('<SYMBOL>', sym).replace('<YEAR>', str(year))}"
                 out_path    = f"{args.out_root.rstrip('/')}/{split_name}/{sym}/{year}/data.parquet"
 
-                # Intersecter mois autorisés (par symbole) avec la fenêtre du split
                 allowed_for_pair = allowed_by_symbol.get(sym, set()) & split_months
 
                 if not allowed_for_pair:
