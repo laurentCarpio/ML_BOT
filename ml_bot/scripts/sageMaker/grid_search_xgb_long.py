@@ -20,8 +20,10 @@ REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
 # ✅ nouveau dataset v44, long-only
-DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v44-longonly"
-MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v44-longonly"
+DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v45-longonly"
+MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v45-longonly"
+
+#######   python ml_bot/scripts/sageMaker/grid_search_xgb_long.py
 
 INSTANCE_TYPE   = "ml.c5.xlarge"
 SPOT            = True
@@ -446,6 +448,7 @@ def main():
     _s3_put_bytes(s3c, summary_uri, _json_dumps_safe(final_out))
     print("\nRésumé écrit:", summary_uri)
 
+    # === TOP COMBOS ===
     if ok_rows:
         show = pd.DataFrame(ok_rows)[["AUPRC","F1","hps","model_uri"]].sort_values("AUPRC", ascending=False).head(10)
         with pd.option_context("display.max_colwidth", 200):
@@ -453,7 +456,90 @@ def main():
             print(show.to_string(index=False))
     else:
         print("\nAucun combo valide (tous en échec). Consulte les JSON de run pour diagnostiquer.")
-                
+        return  # rien à faire de plus si tout a échoué
+
+    # === NEW: génération automatique du manifest pour le best modèle ===
+    try:
+        fs = s3fs.S3FileSystem()
+
+        # 1) lire un sample du train pour connaitre la largeur (Y + side_num + features)
+        sample_df = _load_csv_dir(fs, TRN_DIR)
+        ncols = sample_df.shape[1]
+        expected_feat = max(ncols - 2, 0)  # on suppose [Y, side_num, f0..]
+
+        # 2) essayer de récupérer les noms de features depuis columns.json
+        features = []
+        cols_meta = {}
+        cols_path = f"{META_DIR}/columns.json"
+        try:
+            with fs.open(cols_path, "rb") as f:
+                cols_meta = json.load(f)
+            features = (
+                cols_meta.get("features")
+                or cols_meta.get("feature_cols")
+                or []
+            )
+        except Exception as e:
+            print(f"[manifest] warn: impossible de lire {cols_path}: {e}")
+
+        if (not features) or (len(features) != expected_feat):
+            print(f"[manifest] warn: features meta manquantes ou taille != {expected_feat}, "
+                  "on utilise des noms génériques f0..fN")
+            features = [f"f{i}" for i in range(expected_feat)]
+
+        # 3) construire l'URI de release et du manifest
+        #    ex: s3://tradebot-config-tokyo/models/xgb/releases/long-20251120-v45/manifest.json
+        RELEASE_BASE = "s3://tradebot-config-tokyo/models/xgb/releases"
+        release_name = f"long-{stamp}-v45"
+        manifest_uri = f"{RELEASE_BASE}/{release_name}/manifest.json"
+
+        scaler_stats_uri = f"{META_DIR}/scaler_stats.json"
+
+        manifest = {
+            "model_uri": best["model_uri"],
+            "version": "v45-longonly",
+            "timestamp": stamp,
+            "side": "long",
+            "data_root": DATA_ROOT,
+
+            "metrics": {
+                "AUPRC_val": best.get("AUPRC"),
+                "F1_val": best.get("F1"),
+                "best_threshold_val": best.get("best_threshold"),
+                "precision_val": best.get("precision"),
+                "recall_val": best.get("recall"),
+                "n_val": best.get("n"),
+                "pos_rate_val": best.get("pos_rate"),
+            },
+
+            "inference": {
+                # seuil F1-max trouvé sur la validation
+                "decision_threshold": float(best.get("best_threshold", 0.5)),
+                # on a entraîné avec objective="binary:logistic" donc sortie = P(Y=1)
+                "proba_semantics": "p = P(Y=1)",
+                # pas d’inversion ni d’autoflip en prod : on garde le sens "naturel"
+                "invert_output": False,
+                "autoflip_allowed": False,
+            },
+
+            "data_contract": {
+                # contrat attendu par infer_xgb.py
+                "label_col": "Y",
+                "drop_cols": ["side_num"],
+                "features": features,
+                # pour v45: stage3 a déjà fait la normalisation -> on n’en refait pas
+                "scaler_stats_uri": scaler_stats_uri,
+                "normalize_at_infer": False
+            },
+        }
+
+        _s3_put_bytes(s3c, manifest_uri, _json_dumps_safe(manifest))
+        print(f"[manifest] manifest.json écrit: {manifest_uri}")
+        print("[manifest] Tu peux maintenant lancer infer_xgb.py avec ce manifest.")
+    except Exception as e:
+        print(f"[manifest] WARN: impossible de générer le manifest automatiquement: {e}", file=sys.stderr)
+
+
 if __name__ == "__main__":
     main()
 
@@ -469,17 +555,27 @@ def evaluate_split(model_uri, prefix_features, prefix_weights):
 
 def _make_thr_json_from_reports(rpt_df: pd.DataFrame, thr_df: pd.DataFrame,
                                 auprc_floor: float = 0.10):
-    """Construit le mapping seuils par poche et filtre les poches faibles."""
-    ok_keys = set(
-        rpt_df.loc[rpt_df["AUPRC"] >= auprc_floor, ["tf", "side_num"]]
-              .apply(lambda s: f"{s['tf']}|{int(s['side_num'])}", axis=1)
-              .tolist()
-    )
-    thr_map = {
-        f"{row['tf']}|{int(row['side_num'])}": float(row["thr_f1"])
-        for _, row in thr_df.iterrows()
-        if f"{row['tf']}|{int(row['side_num'])}" in ok_keys
-    }
+    """
+    Construit le mapping seuils par poche et filtre les poches faibles.
+
+    - rpt_df : colonnes au moins ["tf", "side_num", "AUPRC"]
+    - thr_df : colonnes au moins ["tf", "side_num", "thr_f1"]
+    """
+    # 1) filtrer les poches avec AUPRC >= floor
+    mask = rpt_df["AUPRC"] >= auprc_floor
+    sub = rpt_df.loc[mask, ["tf", "side_num"]].copy()
+
+    # 2) construire explicitement une Series de clés "tf|side"
+    sub["key"] = sub["tf"].astype(str) + "|" + sub["side_num"].astype(int).astype(str)
+    ok_keys = set(sub["key"].to_list())
+
+    # 3) construire la map { "tf|side" : thr_f1 }
+    thr_map = {}
+    for _, row in thr_df.iterrows():
+        key = f"{row['tf']}|{int(row['side_num'])}"
+        if key in ok_keys:
+            thr_map[key] = float(row["thr_f1"])
+
     return thr_map, ok_keys
 
 def eval_test_and_breakdown(best_model_uri: str):

@@ -19,9 +19,11 @@ from sagemaker.estimator import Estimator
 REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
-# ✅ nouveau dataset v44, short-only
-DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v44-shortonly"
-MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v44-shortonly"
+# ✅ nouveau dataset v45, short-only
+DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v45-shortonly"
+MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v45-shortonly"
+
+#######   python ml_bot/scripts/sageMaker/grid_search_xgb_short.py
 
 INSTANCE_TYPE   = "ml.c5.xlarge"
 SPOT            = True
@@ -446,6 +448,7 @@ def main():
     _s3_put_bytes(s3c, summary_uri, _json_dumps_safe(final_out))
     print("\nRésumé écrit:", summary_uri)
 
+    # === TOP COMBOS ===
     if ok_rows:
         show = pd.DataFrame(ok_rows)[["AUPRC","F1","hps","model_uri"]].sort_values("AUPRC", ascending=False).head(10)
         with pd.option_context("display.max_colwidth", 200):
@@ -453,6 +456,88 @@ def main():
             print(show.to_string(index=False))
     else:
         print("\nAucun combo valide (tous en échec). Consulte les JSON de run pour diagnostiquer.")
+        return  # rien à faire de plus si tout a échoué
+
+    # === NEW: génération automatique du manifest pour le best modèle ===
+    try:
+        fs = s3fs.S3FileSystem()
+
+        # 1) lire un sample du train pour connaitre la largeur (Y + side_num + features)
+        sample_df = _load_csv_dir(fs, TRN_DIR)
+        ncols = sample_df.shape[1]
+        expected_feat = max(ncols - 2, 0)  # on suppose [Y, side_num, f0..]
+
+        # 2) essayer de récupérer les noms de features depuis columns.json
+        features = []
+        cols_meta = {}
+        cols_path = f"{META_DIR}/columns.json"
+        try:
+            with fs.open(cols_path, "rb") as f:
+                cols_meta = json.load(f)
+            features = (
+                cols_meta.get("features")
+                or cols_meta.get("feature_cols")
+                or []
+            )
+        except Exception as e:
+            print(f"[manifest] warn: impossible de lire {cols_path}: {e}")
+
+        if (not features) or (len(features) != expected_feat):
+            print(f"[manifest] warn: features meta manquantes ou taille != {expected_feat}, "
+                  "on utilise des noms génériques f0..fN")
+            features = [f"f{i}" for i in range(expected_feat)]
+
+        # 3) construire l'URI de release et du manifest
+        #    ex: s3://tradebot-config-tokyo/models/xgb/releases/short-20251120-v45/manifest.json
+        RELEASE_BASE = "s3://tradebot-config-tokyo/models/xgb/releases"
+        release_name = f"short-{stamp}-v45"
+        manifest_uri = f"{RELEASE_BASE}/{release_name}/manifest.json"
+
+        scaler_stats_uri = f"{META_DIR}/scaler_stats.json"
+
+        manifest = {
+            "model_uri": best["model_uri"],
+            "version": "v45-shortonly",
+            "timestamp": stamp,
+            "side": "short",
+            "data_root": DATA_ROOT,
+
+            "metrics": {
+                "AUPRC_val": best.get("AUPRC"),
+                "F1_val": best.get("F1"),
+                "best_threshold_val": best.get("best_threshold"),
+                "precision_val": best.get("precision"),
+                "recall_val": best.get("recall"),
+                "n_val": best.get("n"),
+                "pos_rate_val": best.get("pos_rate"),
+            },
+
+            "inference": {
+                # seuil F1-max trouvé sur la validation
+                "decision_threshold": float(best.get("best_threshold", 0.5)),
+                # on a entraîné avec objective="binary:logistic" donc sortie = P(Y=1)
+                "proba_semantics": "p = P(Y=1)",
+                # pas d’inversion ni d’autoflip en prod : on garde le sens "naturel"
+                "invert_output": False,
+                "autoflip_allowed": False,
+            },
+
+            "data_contract": {
+                # contrat attendu par infer_xgb.py
+                "label_col": "Y",
+                "drop_cols": ["side_num"],
+                "features": features,
+                # pour v45: stage3 a déjà fait la normalisation -> on n’en refait pas
+                "scaler_stats_uri": scaler_stats_uri,
+                "normalize_at_infer": False
+            },
+        }
+
+        _s3_put_bytes(s3c, manifest_uri, _json_dumps_safe(manifest))
+        print(f"[manifest] manifest.json écrit: {manifest_uri}")
+        print("[manifest] Tu peux maintenant lancer infer_xgb.py avec ce manifest.")
+    except Exception as e:
+        print(f"[manifest] WARN: impossible de générer le manifest automatiquement: {e}", file=sys.stderr)
                 
 if __name__ == "__main__":
     main()
@@ -469,17 +554,27 @@ def evaluate_split(model_uri, prefix_features, prefix_weights):
 
 def _make_thr_json_from_reports(rpt_df: pd.DataFrame, thr_df: pd.DataFrame,
                                 auprc_floor: float = 0.10):
-    """Construit le mapping seuils par poche et filtre les poches faibles."""
-    ok_keys = set(
-        rpt_df.loc[rpt_df["AUPRC"] >= auprc_floor, ["tf", "side_num"]]
-              .apply(lambda s: f"{s['tf']}|{int(s['side_num'])}", axis=1)
-              .tolist()
-    )
-    thr_map = {
-        f"{row['tf']}|{int(row['side_num'])}": float(row["thr_f1"])
-        for _, row in thr_df.iterrows()
-        if f"{row['tf']}|{int(row['side_num'])}" in ok_keys
-    }
+    """
+    Construit le mapping seuils par poche et filtre les poches faibles.
+
+    - rpt_df : colonnes au moins ["tf", "side_num", "AUPRC"]
+    - thr_df : colonnes au moins ["tf", "side_num", "thr_f1"]
+    """
+    # 1) filtrer les poches avec AUPRC >= floor
+    mask = rpt_df["AUPRC"] >= auprc_floor
+    sub = rpt_df.loc[mask, ["tf", "side_num"]].copy()
+
+    # 2) construire explicitement une Series de clés "tf|side"
+    sub["key"] = sub["tf"].astype(str) + "|" + sub["side_num"].astype(int).astype(str)
+    ok_keys = set(sub["key"].to_list())
+
+    # 3) construire la map { "tf|side" : thr_f1 }
+    thr_map = {}
+    for _, row in thr_df.iterrows():
+        key = f"{row['tf']}|{int(row['side_num'])}"
+        if key in ok_keys:
+            thr_map[key] = float(row["thr_f1"])
+
     return thr_map, ok_keys
 
 def eval_test_and_breakdown(best_model_uri: str):
@@ -557,111 +652,3 @@ def eval_test_and_breakdown(best_model_uri: str):
     out_uri = f"{MODEL_BASE_S3}/deploy/thresholds_{int(time.time())}.json"
     _s3_put_bytes(_boto3_client("s3", REGION), out_uri, _json_dumps_safe(payload))
     print(f"[deploy] thresholds map écrit: {out_uri}")
-
-# === NEW: seuils par poche -> JSON de déploiement ============================
-def _per_pocket_reports(model_uri: str):
-    """
-    Recalcule le breakdown TEST (AUPRC par (tf, side)) + seuil F1 par poche.
-    On réutilise les chemins globaux DATA_ROOT et META parquet.
-    """
-    import pyarrow.parquet as pq
-    import s3fs
-
-    fs = s3fs.S3FileSystem()
-
-    # 1) Charger TEST (features+poids) et prédire
-    TEST_DIR = f"{DATA_ROOT}/test"
-    TSTW_DIR = f"{DATA_ROOT}/test_weight"
-    y, yhat, w = evaluate_split(model_uri, TEST_DIR, TSTW_DIR)
-
-    # 2) Lire le meta parquet TEST pour récupérer tf/side_num alignés
-    meta_tf = f"{DATA_ROOT}/_meta/splits_parquet/test"
-    tables = []
-    for p in fs.glob(meta_tf.replace("s3://","") + "/*.parquet"):
-        with fs.open(f"s3://{p}", "rb") as f:
-            tables.append(pq.read_table(f))
-    mdf = pd.concat([t.to_pandas() for t in tables], ignore_index=True)
-
-    # 3) Assembler y/yhat et calculer AUPRC par poche
-    mdf = mdf.assign(y=y, yhat=yhat)
-    from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve
-
-    def _summ(g: pd.DataFrame) -> pd.Series:
-        # AUPRC
-        auprc = float(average_precision_score(g["y"], g["yhat"]))
-        # seuil F1-max
-        P, R, thr = precision_recall_curve(g["y"].to_numpy(), g["yhat"].to_numpy())
-        f1s = 2 * P * R / np.maximum(P + R, 1e-12)
-        if np.all(~np.isfinite(f1s)):
-            thr_f1 = 0.5
-            f1_best = 0.0
-        else:
-            k = int(np.nanargmax(f1s))
-            if k == 0:
-                thr_f1 = float(thr[0]) if len(thr) > 0 else 0.5
-            elif k >= len(thr):
-                thr_f1 = float(thr[-1]) if len(thr) > 0 else 0.5
-            else:
-                thr_f1 = float(thr[k - 1])
-            ybin = (g["yhat"].to_numpy() >= thr_f1).astype(int)
-            f1_best = float(f1_score(g["y"].to_numpy(), ybin))
-        return pd.Series({
-            "n": int(len(g)),
-            "pos": int(g["y"].sum()),
-            "pos_rate": float(g["y"].mean()),
-            "AUPRC": auprc,
-            "thr_f1": thr_f1,
-            "F1": f1_best,
-        })
-
-    # ⚠️ évite le FutureWarning: sélectionne explicitement les colonnes
-    grp = (mdf[["tf", "side_num", "y", "yhat"]]
-           .groupby(["tf", "side_num"], as_index=False)
-           .apply(_summ, include_groups=False))
-    rpt_df = grp.reset_index(drop=True)  # colonnes: tf, side_num, n,pos,pos_rate,AUPRC,thr_f1,F1
-
-    # thr_df = uniquement les colonnes nécessaires au mapping de seuils
-    thr_df = rpt_df[["tf","side_num","thr_f1"]].copy()
-    return rpt_df, thr_df
-
-def make_thresholds_json_from_breakdown(
-    model_uri: str,
-    auprc_floor: float = 0.12,
-    policy: str = "thr_f1",       # "thr_f1" ou "prec_floor" (à ajouter plus tard)
-    prec_floor: float | None = None
-) -> str:
-    """
-    Calcule les rapports TEST par poche, filtre les poches faibles (AUPRC < floor),
-    puis écrit un JSON de déploiement {enabled_pockets, thresholds{tf|side: thr}} sous:
-      {MODEL_BASE_S3}/deploy/thresholds_{unix}.json
-
-    Retourne l’URI S3 créé.
-    """
-    import time
-    s3c = _boto3_client("s3", REGION)
-
-    rpt_df, thr_df = _per_pocket_reports(model_uri)
-    thr_map, ok_keys = _make_thr_json_from_reports(rpt_df, thr_df, auprc_floor=auprc_floor)
-
-    now = int(time.time())
-    payload = {
-        "model_uri": model_uri,
-        "created_at": now,
-        "policy": {
-            "auprc_floor": auprc_floor,
-            "criterion": policy,
-            **({"prec_floor": float(prec_floor)} if (policy == "prec_floor" and prec_floor is not None) else {})
-        },
-        "enabled_pockets": sorted(list(ok_keys)),
-        "thresholds": {k: float(v) for k, v in sorted(thr_map.items())},
-    }
-
-    out_uri = f"{MODEL_BASE_S3}/deploy/thresholds_{now}.json"
-    _s3_put_bytes(s3c, out_uri, _json_dumps_safe(payload))
-    print(f"[deploy] thresholds écrit: {out_uri}")
-    # petit aperçu
-    if payload["enabled_pockets"]:
-        print("[deploy] enabled_pockets:", ", ".join(payload["enabled_pockets"]))
-    else:
-        print("[deploy] ⚠️ aucune poche activée (AUPRC < floor partout).")
-    return out_uri

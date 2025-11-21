@@ -753,6 +753,10 @@ def _process_symbol_year(
 
             def SA(x: float) -> float:
                 return float(sgn * x) if np.isfinite(x) else np.nan
+            
+            # --- helper side-map (pour sign flip buy/sell)
+            def _side_map(x: float) -> float:
+                return float((1 if side == "buy" else -1) * x) if np.isfinite(x) else 0.0
 
             t_feat0 = _ensure_utc(t - pd.Timedelta(seconds=20))
             t_feat1 = _ensure_utc(t + pd.Timedelta(seconds=15))
@@ -822,6 +826,36 @@ def _process_symbol_year(
             b3,  s3  = _sum_buy_sell(tr3)
             b10, s10 = _sum_buy_sell(tr10)
 
+                        # --- Buyer-taker dominance windows 3s / 5s / 10s ---
+            w5 = slice(t - pd.Timedelta(seconds=5), t)
+            tr5 = tr1.loc[w5] if not tr1.empty else pd.DataFrame()
+
+            b5, s5 = _sum_buy_sell(tr5)
+
+            def _bt_dom_raw(b: float, s: float) -> float:
+                """
+                Buyer-taker dominance brute = buy_qty / (buy_qty + sell_qty)
+                - 0.5 = neutre
+                - >0.5 = acheteurs agressifs dominants
+                - <0.5 = vendeurs agressifs dominants
+                """
+                den = b + s
+                return float(b / den) if den > 0 else np.nan
+
+            bt_dom_3s_raw  = _bt_dom_raw(b3,  s3)
+            bt_dom_5s_raw  = _bt_dom_raw(b5,  s5)
+            bt_dom_10s_raw = _bt_dom_raw(b10, s10)
+
+            # fallback neutre à 0.5 si pas de trades
+            bt_dom_3s  = bt_dom_3s_raw  if np.isfinite(bt_dom_3s_raw)  else 0.5
+            bt_dom_5s  = bt_dom_5s_raw  if np.isfinite(bt_dom_5s_raw)  else 0.5
+            bt_dom_10s = bt_dom_10s_raw if np.isfinite(bt_dom_10s_raw) else 0.5
+
+            # version "side" centrée en 0 : 2*p - 1 ∈ [-1,1], puis signée par le sens du trade
+            bt_dom_3s_side  = _side_map(2.0 * bt_dom_3s  - 1.0)
+            bt_dom_5s_side  = _side_map(2.0 * bt_dom_5s  - 1.0)
+            bt_dom_10s_side = _side_map(2.0 * bt_dom_10s - 1.0)
+
             def _imbl_raw(s: float, b: float) -> float:
                 den = s + b
                 return float(s/den) if den > 0 else np.nan
@@ -853,8 +887,6 @@ def _process_symbol_year(
             agr15 = float(aggr_ratio_15s) if np.isfinite(aggr_ratio_15s) else 0.5
             nd15  = float(net_delta_15s)  if np.isfinite(net_delta_15s)  else 0.0
 
-            def _side_map(x: float) -> float:
-                return float((1 if side=="buy" else -1) * x) if np.isfinite(x) else 0.0
             agr10_side = _side_map(2*agr10 - 1.0)
             agr15_side = _side_map(2*agr15 - 1.0)
             nd15_side  = _side_map(nd15)
@@ -1098,6 +1130,42 @@ def _process_symbol_year(
             if len(bb_hist) >= 20:
                 bb_width_pctl = float(bb_hist.rank(pct=True).iloc[-1])
 
+            # --- Pullback position vs swing low (fenêtre ~30 minutes) ---
+            pullback_pos_swing_low = np.nan
+            pullback_pos_swing_low_side = np.nan
+
+            try:
+                # fenêtre temporelle rétro de référence pour le swing
+                win_start = t - pd.Timedelta(minutes=30)
+                swing_win = octx_full.loc[win_start:t]
+
+                if not swing_win.empty and np.isfinite(entry):
+                    swing_low = float(np.nanmin(swing_win["low"].values))
+                    swing_high = float(np.nanmax(swing_win["high"].values))
+
+                    if np.isfinite(swing_low) and np.isfinite(swing_high) and swing_high > swing_low:
+                        # position relative de l'entry dans le range [swing_low, swing_high]
+                        # 0.0 -> proche du swing low
+                        # 1.0 -> proche du swing high
+                        raw_pos = float((entry - swing_low) / (swing_high - swing_low))
+                        raw_pos = float(np.clip(raw_pos, 0.0, 1.0))
+                        pullback_pos_swing_low = raw_pos
+
+                        # version signée:
+                        # - centrée à 0.5 (milieu de range)
+                        # - puis signée de sorte que:
+                        #   * LONG: proche du swing low => >0 (bon)
+                        #   * SHORT: proche du swing high => >0 (bon)
+                        pullback_pos_swing_low_side = float(-sgn * (raw_pos - 0.5))
+            except Exception:
+                # on laisse les features à NaN si quelque chose cloche
+                pass
+            
+            
+            
+            
+            
+            
             # LONG-friendly helpers (lf_*)
             w3 = slice(t - pd.Timedelta(seconds=3), t)
             tob_3s = tob.loc[w3] if not tob.loc[w3].empty else tob.tail(1)
@@ -1247,6 +1315,12 @@ def _process_symbol_year(
                 "slope_bid_15": slope_bid_15, "slope_ask_15": slope_ask_15,
                 "aggr_ratio_10s": agr10, "aggr_ratio_15s": agr15,
                 "net_delta_15s": nd15,   
+
+                # NEW: buyer-taker dominance (3s / 5s / 10s)
+                "bt_dom_3s": bt_dom_3s,
+                "bt_dom_5s": bt_dom_5s,
+                "bt_dom_10s": bt_dom_10s,
+
                 "ret_stdev_1s_10s_bps": ret_stdev_1s_10s_bps,
                 "mid_jump_bps_3s": mid_jump_bps_3s,
                 "bb_width": bb_width, "adx": adx, "atr_percentile": atr_percentile,
@@ -1274,6 +1348,10 @@ def _process_symbol_year(
                 "mid_minus_vwap_3s": mid_minus_vwap_3s,
                 "atr_pct_rank_30m": atr_pct_rank_30m,
                 "bb_width_pctl": bb_width_pctl,
+
+                # NEW: pullback vs swing low (0 = au fond du range, 1 = haut du range)
+                "pullback_pos_swing_low": pullback_pos_swing_low,
+
                 "ask_wall_decay_3s": ask_wall_decay_3s,
                 "wall_persistence_score_5s": wall_persistence_score_5s,
                 "best_bid_refill_rate_isnan": best_bid_refill_rate_isnan,
@@ -1299,6 +1377,12 @@ def _process_symbol_year(
                 "aggr_ratio_10s_side": agr10_side,
                 "aggr_ratio_15s_side": agr15_side,
                 "net_delta_15s_side": nd15_side,
+
+                # NEW: buyer-taker dominance side-sym
+                "bt_dom_3s_side": bt_dom_3s_side,
+                "bt_dom_5s_side": bt_dom_5s_side,
+                "bt_dom_10s_side": bt_dom_10s_side,
+
                 "mid_jump_bps_3s_side": SA(mid_jump_bps_3s) if np.isfinite(mid_jump_bps_3s) else np.nan,
                 "imbl_aggr_3s_side": imbl_aggr_3s_side,
                 "imbl_aggr_10s_side": imbl_aggr_10s_side,
@@ -1307,6 +1391,8 @@ def _process_symbol_year(
                 "microprice_shift_1s_side": SA(microprice_shift_1s) if np.isfinite(microprice_shift_1s) else np.nan,
                 "mid_minus_vwap_3s_side": SA(mid_minus_vwap_3s) if np.isfinite(mid_minus_vwap_3s) else np.nan,
                 "wall_persistence_score_5s_side": SA(wall_persistence_score_5s - 0.5) if np.isfinite(wall_persistence_score_5s) else np.nan,
+                # NEW:
+                "pullback_pos_swing_low_side": pullback_pos_swing_low_side,
             })
 
             batch.append(row); total += 1

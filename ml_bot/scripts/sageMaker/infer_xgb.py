@@ -3,11 +3,19 @@
 Inference validator for a frozen XGBoost model release.
 
 Usage examples:
-  python infer_xgb.py \
-    --manifest-s3 s3://tradebot-config-tokyo/models/xgb/releases/go-20251107-v1/manifest.json \
-    --batch s3://tradebot-config-tokyo/data/stage3-xgb/v1-go/validation \
-    --out s3://tradebot-config-tokyo/models/xgb/infer_runs/go-20251107-v1/val_2025-11-10
 
+  python ml_bot/scripts/sageMaker/infer_xgb.py \
+    --manifest-s3 s3://tradebot-config-tokyo/models/xgb/releases/long-20251120-140313-v45/manifest.json \
+    --batch s3://tradebot-config-tokyo/data/stage3/v45-longonly/validation \
+    --out s3://tradebot-config-tokyo/models/xgb/infer_runs/long-20251120-140313-v45/val_2025-11-20
+
+   python ml_bot/scripts/sageMaker/infer_xgb.py \
+    --manifest-s3 s3://tradebot-config-tokyo/models/xgb/releases/short-20251120-140340-v45/manifest.json \
+    --batch s3://tradebot-config-tokyo/data/stage3/v45-shortonly/validation \
+    --out s3://tradebot-config-tokyo/models/xgb/infer_runs/short-20251120-140340-v45/val_2025-11-20 
+    
+
+    
   python infer_xgb.py \
     --manifest-s3 s3://.../manifest.json \
     --batch ./local_batch_dir_with_csv_parts \

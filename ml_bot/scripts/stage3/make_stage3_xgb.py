@@ -57,10 +57,21 @@ ZSCORE_FEATURES = [
     "executed_vs_added_ratio",
     "lf_bid_absorb_ratio_3s",
     "lf_bid_refill_ticks_3s",
-    "lf_mid_minus_vwap_3s_bps",
+    # "lf_mid_minus_vwap_3s_bps",   <-- RETIRÉ TEMPORAIREMENT
     "lf_bb_width_pct",
     "lf_atr_rank_30m",
     "lf_ask_wall_decay_3s",
+
+    # --- ajouter pour v47 ---
+    "bt_dom_3s",
+    "bt_dom_5s",
+    "bt_dom_10s",
+    "bt_dom_3s_side",
+    "bt_dom_5s_side",
+    "bt_dom_10s_side",
+    "pullback_pos_vs_swing_low",
+    "pullback_pos_vs_swing_low_side",
+
     # versions *_side
     "obi_5_side", "obi_15_side",
     "microprice_bias_side",
@@ -1026,6 +1037,12 @@ def main():
                     w_uncert = pd.Series(1.0, index=df.index)
 
                 w = 0.7 * w_tf + 0.3 * w_uncert
+
+                # 🟩 BOOST LONGS POSITIFS (au lieu d’oversampling physique)
+                if args.side == "longonly":
+                    BOOST = 1.5         # valeur initiale, on pourra tuner
+                    ybin = df["Y"].to_numpy()
+                    w = np.where(ybin == 1, w * BOOST, w)
 
                 m = float(w.mean()) if np.isfinite(w.mean()) and w.mean() > 0 else 1.0
                 df["weight"] = (w / m).astype("float32")
