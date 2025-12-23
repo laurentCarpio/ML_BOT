@@ -35,63 +35,139 @@ LOG1P_FEATURES = [
     "entry",
     "cum_depth_within_5bps_opp",
     "cum_depth_within_10bps_opp",
+    "executed_vs_added_ratio",
+    "lf_bid_absorb_ratio_3s",
 ]
 
-ZSCORE_FEATURES = [
+# ==========================================================
+# ZSCORE_FEATURES : on ne garde que *_side quand doublon
+# Deux listes séparées : LONG / SHORT
+# ==========================================================
+
+ZSCORE_FEATURES_LONG = [
+    # Core microstructure / spread / vol (neutres)
     "spread_bps_entry",
     "quote_churn_10s",
     "wall_opp_share_5",
     "wall_opp_share_15",
-    "obi_5", "obi_15",
-    "microprice_bias",
-    "slope_bid_5", "slope_ask_5",
-    "slope_bid_15", "slope_ask_15",
-    "aggr_ratio_10s",
-    "net_delta_15s",
     "ret_stdev_1s_10s_bps",
-    "mid_jump_bps_3s",
     "bb_width",
     "adx",
     "atr_percentile",
     "atr_bps",
     "executed_vs_added_ratio",
-    "lf_bid_absorb_ratio_3s",
-    "lf_bid_refill_ticks_3s",
-    # "lf_mid_minus_vwap_3s_bps",   <-- RETIRÉ TEMPORAIREMENT
-    "lf_bb_width_pct",
+
+    # VWAP / regime
+    "lf_mid_minus_vwap_3s_bps",   # (sera drop si vraiment constant sur un symbole)
+    "bb_width_pctl",
     "lf_atr_rank_30m",
-    "lf_ask_wall_decay_3s",
+    "atr_pct_rank_30m",           # version “low freq” du rank 30m (présente en Stage2 v49)
+    "delta_spread_3s",
 
-    # --- ajouter pour v47 ---
-    "bt_dom_3s",
-    "bt_dom_5s",
-    "bt_dom_10s",
-    "bt_dom_3s_side",
-    "bt_dom_5s_side",
-    "bt_dom_10s_side",
-    "pullback_pos_vs_swing_low",
-    "pullback_pos_vs_swing_low_side",
-
-    # versions *_side
-    "obi_5_side", "obi_15_side",
+    # Directionnels côté trade (toujours *_side)
+    "obi_5_side",
+    "obi_15_side",
     "microprice_bias_side",
     "slope_bid_5_side", "slope_ask_5_side",
     "slope_bid_15_side", "slope_ask_15_side",
     "aggr_ratio_10s_side",
+    "aggr_ratio_15s_side",
     "net_delta_15s_side",
     "mid_jump_bps_3s_side",
+
+    # Dominance & pullback / persistence (v49)
+    "pullback_pos_swing_low_side",
+    "imbalance_persistence",
+    "imbl_aggr_3s_side",
+    "imbl_aggr_10s_side",
+    "wall_persistence_score_5s_side",
+
+    # Absorption / refill & walls (long-friendly)
+    "ask_wall_decay_3s",
+    "lf_ask_wall_decay_3s",
+    "bid_absorb_ratio_3s",
+    "bid_absorb_ratio_10s",
+    "best_bid_refill_rate",
+    "bid_refill_persistence_ticks",
+    "lf_bid_absorb_ratio_3s",
+    "lf_bid_refill_ticks_3s",
+
+    # Buyer-Taker dominance côté trade (si présents dans Stage2 v49)
+    "bt_dom_3s_side",
+    "bt_dom_5s_side",
+    "bt_dom_10s_side",
+
+    # LONG-only “regime enrichi”
+    "lf_bb_width_pct",
 ]
+
+ZSCORE_FEATURES_SHORT = [
+    # Même base que LONG (sans lf_bb_width_pct éventuellement)
+    "spread_bps_entry",
+    "quote_churn_10s",
+    "wall_opp_share_5",
+    "wall_opp_share_15",
+    "ret_stdev_1s_10s_bps",
+    "bb_width",
+    "adx",
+    "atr_percentile",
+    "atr_bps",
+    "executed_vs_added_ratio",
+
+    "lf_mid_minus_vwap_3s_bps",
+    "bb_width_pctl",
+    "lf_atr_rank_30m",
+    "atr_pct_rank_30m",
+    "delta_spread_3s",
+
+    "obi_5_side",
+    "obi_15_side",
+    "microprice_bias_side",
+    "slope_bid_5_side", "slope_ask_5_side",
+    "slope_bid_15_side", "slope_ask_15_side",
+    "aggr_ratio_10s_side",
+    "aggr_ratio_15s_side",
+    "net_delta_15s_side",
+    "mid_jump_bps_3s_side",
+
+    "pullback_pos_swing_low_side",
+    "imbalance_persistence",
+    "imbl_aggr_3s_side",
+    "imbl_aggr_10s_side",
+    "wall_persistence_score_5s_side",
+
+    "ask_wall_decay_3s",
+    "lf_ask_wall_decay_3s",
+    "bid_absorb_ratio_3s",
+    "bid_absorb_ratio_10s",
+    "best_bid_refill_rate",
+    "bid_refill_persistence_ticks",
+    "lf_bid_absorb_ratio_3s",
+    "lf_bid_refill_ticks_3s",
+
+    "bt_dom_3s_side",
+    "bt_dom_5s_side",
+    "bt_dom_10s_side",
+]
+
+# Global courant : sera écrasé dans main() selon --side
+ZSCORE_FEATURES = ZSCORE_FEATURES_LONG
 
 LATENCY_FEATURES = ["exchange_latency_ms"]
 
 ALWAYS_KEEP = ["t", "symbol", "tf", "side", "Y"]
 
 # Colonnes à lire pour calculer des poids, mais jamais utilisées comme features (anti-fuite)
-WEIGHT_ONLY_COLS = {"THRESH_BPS", "pnl_net_max_bps"}
+WEIGHT_ONLY_COLS = {"THRESH_BPS", "pnl_net_max_bps", "pnl_net_min_bps"}
 
-# Toute colonne listée ici sera drop avant feature encoding (anti-fuite)
-EXCLUDE_COLS = {"THRESH_BPS"}  # pnl_net_max_bps n'est pas dans les features de toute façon
-
+# Colonnes à exclure des features (anti-fuite)
+EXCLUDE_COLS = {
+    "THRESH_BPS",
+    "pnl_net_max_bps",
+    "pnl_net_min_bps",
+    "thresh_bps",     # parfois lowercase
+    "rr_nominal",
+}
 # === Robust normalization (par (symbol, TF)) ===
 ROBUST_EPS = 1e-9
 ROBUST_SCALE_FLOOR = 0.25  # plancher d’échelle pour éviter des std déraisonnables par groupe
@@ -114,21 +190,34 @@ HEAVY_TAIL_COLS = {
 
 # Imputation neutre + masques
 IMPUTE_NEUTRAL = {
+    # Sans side
     "aggr_ratio_10s": 0.5,
     "aggr_ratio_15s": 0.5,
     "net_delta_15s":  0.0,
+
+    # Versions side (qu’on utilise effectivement)
     "aggr_ratio_10s_side": 0.0,
     "aggr_ratio_15s_side": 0.0,
     "net_delta_15s_side":  0.0,
+
+    # nouveaux : buyer-taker dominance côté trade (centré 0)
+    "bt_dom_3s_side": 0.0,
+    "bt_dom_5s_side": 0.0,
+    "bt_dom_10s_side": 0.0,
 }
 
 # --- PATCH: features signées avec queues lourdes → asinh (log symétrique)
 ASINH_FEATURES = [
-    "slope_bid_5","slope_ask_5","slope_bid_15","slope_ask_15",
-    "slope_bid_5_side","slope_ask_5_side","slope_bid_15_side","slope_ask_15_side",
+    "slope_bid_5","slope_ask_5",
+    "slope_bid_15","slope_ask_15",
+    "slope_bid_5_side","slope_ask_5_side",
+    "slope_bid_15_side","slope_ask_15_side",
     "mid_jump_bps_3s","mid_jump_bps_3s_side",
-    # optionnel si trop skew chez toi :
-    # "microprice_bias","microprice_bias_side",
+    "lf_ask_wall_decay_3s",          # TRES heavy-tail
+
+    # nouveaux signaux signés heavy-tail
+    "mid_minus_vwap_3s",
+    "delta_spread_3s",
 ]
 
 def _apply_asinh_inplace(df: pd.DataFrame):
@@ -166,6 +255,8 @@ def _append_meta_parquet(fs: pafs.S3FileSystem, base_meta_root: str, split: str,
     if df_meta.empty:
         return
     table = pa.Table.from_pandas(df_meta, preserve_index=False)
+    path = f"{base_meta_root.rstrip('/')}/{split}/part-{uuid4().hex}.parquet"
+    # Correction du path (pas d'accolade fermante)
     path = f"{base_meta_root.rstrip('/')}/{split}/part-{uuid4().hex}.parquet"
     with fs.open_output_stream(_strip_s3(path)) as out:
         pq.write_table(table, out)
@@ -328,18 +419,17 @@ def _optional_filter(schema: pa.Schema, symbols: Optional[List[str]], tfs: Optio
         expr = tf_expr if expr is None else (expr & tf_expr)
     return expr
 
-def _apply_side_choice(expr: ds.Expression | None, schema: pa.Schema, side_choice: str):
+def _apply_side_choice(expr: ds.Expression | None, schema: pa.Schema, side_choice: str | None):
     """
     Retourne une expression de filtre combinant l'existant (expr) et le side:
-      - 'shortonly' => side == 'sell'
-      - 'longonly'  => side == 'buy'
-    Si la colonne 'side' n'existe pas en Stage2, on lève une erreur en mode filtré.
+      - 'short' => side == 'sell'
+      - 'long'  => side == 'buy'
     """
-    if side_choice == "both":
+    if not side_choice:
         return expr
     if "side" not in schema.names:
         raise ValueError("Colonne 'side' absente en Stage2: impossible d'appliquer --side.")
-    want = "sell" if side_choice == "shortonly" else "buy"
+    want = "sell" if side_choice == "short" else "buy"
     side_expr = (ds.field("side") == want)
     return side_expr if expr is None else (expr & side_expr)
 
@@ -416,7 +506,7 @@ def _fit_robust_params_train(dataset: ds.Dataset,
             "Robust-stats scan found no feature data. "
             f"Schema had {len(avail)} cols, example: {sorted(list(avail))[:20]}. "
             "Check that Stage2 has the expected feature columns "
-            "(e.g., 'spread_bps_entry','obi_5','microprice_bias', etc.)."
+            "(e.g., 'spread_bps_entry','obi_5_side','microprice_bias_side', etc.)."
         )
 
     return pd.DataFrame(rows, columns=["tf","feature","q1","q99","median","scale"])
@@ -457,7 +547,7 @@ def _apply_norm(df: pd.DataFrame,
             s[mask] = neutral
             df[f] = s
 
-    # Robust z-score par (symbol, TF)
+    # Robust z-score par TF
     groups = df.groupby("tf", sort=False).groups
     for tf_key, idx in groups.items():
         pm = params_map.get(_tf_key(tf_key))
@@ -658,11 +748,11 @@ def parse_args():
     ap.add_argument("--rows-per-shard", type=int, default=1_000_000)
     ap.add_argument("--save-mappings", default=True,
                     help="Écrit _meta/mappings.json & _meta/columns.json basés sur TRAIN")
-    ap.add_argument("--side", choices=["both","shortonly","longonly"], default="both",
-                    help="Filtre du flux Stage2 par side (sell→shortonly, buy→longonly). "
-                         "Le split est appliqué avant tout fit/normalisation.")
+    ap.add_argument("--side", choices=["short","long"], default="long",
+                    help="Choix du flux: 'long' => buy only, 'short' => sell only. "
+                         "Le filtrage est appliqué avant tout fit/normalisation.")
     ap.add_argument("--auto_branch_suffix", action="store_true",
-                    help="Si activé et --side≠both, ajoute automatiquement -shortonly / -longonly à --dst-root.")
+                    help="Si activé, ajoute automatiquement -short / -long à --dst-root.")
     return ap.parse_args()
 
 def _make_wall_flag_names() -> List[str]:
@@ -734,6 +824,13 @@ def main():
     args = parse_args()
     fs = _fs(args.aws_region)
 
+    # Sélection des features Z-score selon le side (2 modèles séparés)
+    global ZSCORE_FEATURES
+    if args.side == "long":
+        ZSCORE_FEATURES = ZSCORE_FEATURES_LONG
+    else:
+        ZSCORE_FEATURES = ZSCORE_FEATURES_SHORT
+
     # Datasets
     ds_train = _dataset_from_split(fs, args.src_root, "train")
     schema = ds_train.schema
@@ -784,8 +881,8 @@ def main():
 
     # Suffixe automatique de la destination (pratique pour éviter les collisions)
     dst_root = args.dst_root
-    if args.auto_branch_suffix and args.side in ("shortonly","longonly"):
-        suf = "-shortonly" if args.side == "shortonly" else "-longonly"
+    if args.auto_branch_suffix and args.side in ("short","long"):
+        suf = "-short" if args.side == "short" else "-long"
         if not dst_root.rstrip("/").endswith(suf):
             dst_root = dst_root.rstrip("/") + suf
     print(f"[dst] output root: {dst_root}")
@@ -813,7 +910,7 @@ def main():
         }
 
     # --- Fallback de scaler pour features indispensables manquantes ---
-    NEED_ALWAYS = {"microprice_bias"}  # ajoute-en d’autres si besoin
+    NEED_ALWAYS = {"microprice_bias_side"}  # on veut au moins ça si dispo
     seen_feats = set(rob["feature"].astype(str).tolist())
     DEFAULT_SCALER = (0.0, 0.0, 0.0, 1.0)  # (q1, q99, median, scale)
 
@@ -832,9 +929,9 @@ def main():
         print(f"[scaler-fallback] Injected defaults for NEED_ALWAYS per TF (0/0/0/1). "
             f"Missing after inject (should be empty): {missing_by_tf}")
         
-    _has_mp = any(("microprice_bias" in pm) for pm in params_map.values())
+    _has_mp = any(("microprice_bias_side" in pm) for pm in params_map.values())
     if not _has_mp:
-        print("⚠️ WARN: aucun param trouvé pour 'microprice_bias' dans params_map "
+        print("⚠️ WARN: aucun param trouvé pour 'microprice_bias_side' dans params_map "
               "(il ne sera pas z-scoré). Vérifie _fit_robust_params_train → feat_for_stats / colonnes dispo.")
 
     # 2) ID mappings (TRAIN)
@@ -866,7 +963,8 @@ def main():
         ds_train, f_train, candidates, params_map, batch_size=args.batch_size, eps=1e-6
     ))
 
-    FORCE_KEEP = {"slope_bid_15"}
+    # pas de FORCE_KEEP spécifique ici, on laisse tomber les vraies constantes
+    FORCE_KEEP: set[str] = set()
     DROP_FEATURES = set(const_on_train) - FORCE_KEEP
     DROP_SUFFIXES = ("_missing",)
 
@@ -876,14 +974,6 @@ def main():
         and (c not in DROP_FEATURES)
         and not any(c.endswith(suf) for suf in DROP_SUFFIXES)
     ]
-
-    if args.side in ("shortonly","longonly"):
-        BASES_TO_DROP = {
-            "obi_5","obi_15","microprice_bias",
-            "slope_bid_5","slope_ask_5","slope_bid_15","slope_ask_15",
-            "aggr_ratio_10s","net_delta_15s","mid_jump_bps_3s",
-        }
-        feature_cols = [c for c in feature_cols if c not in BASES_TO_DROP]
 
     # étendre la grille avec _isconstant + flags murs
     CONST_MASK_COLS = [f"{f}_isconstant" for f in WINSOR_FEATURES if f in wanted]
@@ -913,23 +1003,22 @@ def main():
     print(f"[drop] constant features on TRAIN (tf-level): {sorted(const_on_train)}")
     print(f"[cols] CSV order: {len(out_order)} columns")
 
-    # --- FLAGS BINAIRES qui auront besoin d'un scaler "binaire" (0/1) ---
-    FLAG_COLS = []
-    # masques de NaN issus d'IMPUTE_NEUTRAL
-    FLAG_COLS += [f"{f}_isnan" for f in IMPUTE_NEUTRAL.keys() if f"{f}_isnan" in feature_cols]
-    # masques _isconstant issus des guards WINSOR_FEATURES
-    FLAG_COLS += [f"{f}_isconstant" for f in WINSOR_FEATURES if f"{f}_isconstant" in feature_cols]
-    # flags mur *_gt_*
-    FLAG_COLS += [c for c in feature_cols if "_gt_" in c]
-
-    FLAG_COLS = sorted(dict.fromkeys(FLAG_COLS))  # unique + stable order
-
     # Accumulateurs pour les médianes par tf (sur TRAIN uniquement)
     _tf_flag_sum: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))  # tf -> flag -> somme de 1
     _tf_count: dict[str, int] = defaultdict(int)                                     # tf -> nb de lignes
 
     # --- QA per-TF accumulateur (mean/std) sur un sous-ensemble clé ---
-    QA_KEYS = ["entry","spread_bps_entry","obi_5","obi_15","mid_jump_bps_3s","atr_bps","executed_vs_added_ratio"]
+    QA_KEYS = [
+        "entry",
+        "spread_bps_entry",
+        "obi_5_side","obi_15_side",
+        "mid_jump_bps_3s_side",
+        "atr_bps",
+        "executed_vs_added_ratio",
+        "pullback_pos_swing_low_side",
+        "bt_dom_10s_side",
+        "lf_bb_width_pct",
+    ]
     _per_tf_sum   = {}
     _per_tf_sumsq = {}
     _per_tf_cnt   = {}
@@ -954,7 +1043,7 @@ def main():
                 _per_tf_sumsq[tf][k] += float((v * v).sum())
 
     def _qa_finalize_and_print(dst_root: str, split_tag: str):
-        import math, json
+        import math, json as _json
         rows = []
         for tf, n in sorted(_per_tf_cnt.items()):
             for k in QA_KEYS:
@@ -971,7 +1060,6 @@ def main():
             df = pd.DataFrame(rows, columns=["tf","feature","n","mean","std"])
             print("\n[qa] per-TF mean/std (extraits):")
             with pd.option_context("display.max_columns", None, "display.width", 160):
-                # on limite l’affichage pour rester lisible
                 print(df.head(30).to_string(index=False))
             # on sauve une version complète pour audit
             path = f"{dst_root.rstrip('/')}/_meta/qa_per_tf_{split_tag}.json"
@@ -1007,16 +1095,17 @@ def main():
             if "side_num" not in df.columns:
                 df["side_num"] = df["side"].map({"buy": 1, "sell": -1}).fillna(0).astype("int8")
 
-            # === LABEL (GO/NO-GO) ===
-            if "side_num" not in df.columns:
-                raise ValueError("side_num manquant (buy→+1, sell→-1).")
-
+            # === LABEL (GO/NO-GO) v50 ===
+            # Stage2 (compute_label_for_side) donne déjà un Y tri-class côté trade :
+            #   Y = +1 : le trade (long OU short) atteint pnl_net >= +THRESH dans le sens du side
+            #   Y =  0 : neutre / pas de move suffisant
+            #   Y = -1 : pnl_net <= -THRESH (échec)
+            #
+            # Pour Stage3 XGBoost, on veut un label binaire :
+            #   1 = "trade aurait été un vrai GO gagnant"
+            #   0 = tout le reste (neutre OU échec)
             y_tri = pd.to_numeric(df["Y"], errors="coerce").fillna(0).astype("int8")
-            sgn   = df["side_num"].astype("int8")
-
-            # GO = (direction * side == +1), i.e. "dans le sens du trade"
-            y_dir  = (y_tri * sgn).astype("int8")
-            df["Y"] = (y_dir == 1).astype("int8")
+            df["Y"] = (y_tri == 1).astype("int8")
 
             # === Pondérations par-ligne ===
             if split == "train":
@@ -1039,7 +1128,7 @@ def main():
                 w = 0.7 * w_tf + 0.3 * w_uncert
 
                 # 🟩 BOOST LONGS POSITIFS (au lieu d’oversampling physique)
-                if args.side == "longonly":
+                if args.side == "long":
                     BOOST = 1.5         # valeur initiale, on pourra tuner
                     ybin = df["Y"].to_numpy()
                     w = np.where(ybin == 1, w * BOOST, w)
@@ -1061,11 +1150,46 @@ def main():
                             s = pd.to_numeric(sub[c], errors="coerce").fillna(0.0)
                             _tf_flag_sum[tf_str][c] += int((s > 0).sum())
 
-            # --- META ROWS (avant drop des colonnes)
-            # row_id stable: symbol|tf|t
+            # --- META ROWS (avec infos EV pour calibrage seuils) ---
             df["row_id"] = df[["symbol","tf","t"]].astype(str).agg("|".join, axis=1)
-            meta_keep = df[["row_id","symbol","tf","t","Y","side_num","weight"]].copy()
-            _append_meta_parquet(fs, f"{dst_root.rstrip('/')}/_meta/splits_parquet", split, meta_keep)
+
+            # SAFE extraction en lisant les colonnes si présentes (sinon np.nan)
+            def _safe_col(df, col):
+                return pd.to_numeric(df[col], errors="coerce") if col in df.columns else np.nan
+
+            pnl_max  = _safe_col(df, "pnl_net_max_bps")
+            pnl_min  = _safe_col(df, "pnl_net_min_bps")
+            thresh   = _safe_col(df, "THRESH_BPS")
+
+            # rr_nominal = pnl_max / abs(pnl_min)
+            rr_nominal = np.where(
+                (np.isfinite(pnl_max)) & (np.isfinite(pnl_min)) & (pnl_min < 0),
+                pnl_max / np.abs(pnl_min),
+                np.nan
+            )
+
+            meta_keep = pd.DataFrame({
+                "row_id": df["row_id"],
+                "symbol": df["symbol"],
+                "tf": df["tf"],
+                "t": df["t"],
+                "Y": df["Y"],
+                "side_num": df["side_num"],
+                "weight": df["weight"],
+
+                # Ajouts EV
+                "pnl_net_max_bps": pnl_max,
+                "pnl_net_min_bps": pnl_min,
+                "thresh_bps": thresh,
+                "rr_nominal": rr_nominal,
+            })
+
+            _append_meta_parquet(
+                fs,
+                f"{dst_root.rstrip('/')}/_meta/splits_parquet",
+                split,
+                meta_keep
+            )
 
             # Nettoyage anti-fuite & RAM: on peut dropper les colonnes poids-only
             df.drop(columns=list(WEIGHT_ONLY_COLS & set(df.columns)), inplace=True, errors="ignore")

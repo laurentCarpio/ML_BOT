@@ -19,9 +19,12 @@ from sagemaker.estimator import Estimator
 REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
-# ✅ nouveau dataset v45, short-only
-DATA_ROOT       = "s3://tradebot-config-tokyo/data/stage3/v45-shortonly"
-MODEL_BASE_S3   = "s3://tradebot-config-tokyo/models/xgb-v45-shortonly"
+# ✅ version de dataset (changeable en un seul endroit)
+VERSION = "v51"
+
+# ✅ dataset v50, short-only
+DATA_ROOT       = f"s3://tradebot-config-tokyo/data/stage3/{VERSION}-short"
+MODEL_BASE_S3   = f"s3://tradebot-config-tokyo/models/xgb-{VERSION}-short"
 
 #######   python ml_bot/scripts/sageMaker/grid_search_xgb_short.py
 
@@ -286,7 +289,6 @@ def main():
     s3c  = _boto3_client("s3", REGION)
 
     # === meta pos_weight ===
-
     SPW0 = float(read_scale_pos_weight_from_meta() or 24.0)
     spw_grid = sorted({round(SPW0 * r, 1) for r in (0.9, 1.0, 1.1)})
     print(f"[meta] scale_pos_weight par défaut: {SPW0} | grille: {spw_grid}")
@@ -458,7 +460,7 @@ def main():
         print("\nAucun combo valide (tous en échec). Consulte les JSON de run pour diagnostiquer.")
         return  # rien à faire de plus si tout a échoué
 
-    # === NEW: génération automatique du manifest pour le best modèle ===
+    # === génération automatique du manifest pour le best modèle ===
     try:
         fs = s3fs.S3FileSystem()
 
@@ -490,14 +492,14 @@ def main():
         # 3) construire l'URI de release et du manifest
         #    ex: s3://tradebot-config-tokyo/models/xgb/releases/short-20251120-v45/manifest.json
         RELEASE_BASE = "s3://tradebot-config-tokyo/models/xgb/releases"
-        release_name = f"short-{stamp}-v45"
+        release_name = f"short-{stamp}-{VERSION}"
         manifest_uri = f"{RELEASE_BASE}/{release_name}/manifest.json"
 
         scaler_stats_uri = f"{META_DIR}/scaler_stats.json"
 
         manifest = {
             "model_uri": best["model_uri"],
-            "version": "v45-shortonly",
+            "version": f"{VERSION}-short",
             "timestamp": stamp,
             "side": "short",
             "data_root": DATA_ROOT,
@@ -527,7 +529,7 @@ def main():
                 "label_col": "Y",
                 "drop_cols": ["side_num"],
                 "features": features,
-                # pour v45: stage3 a déjà fait la normalisation -> on n’en refait pas
+                # stage3 a déjà fait la normalisation -> on n’en refait pas
                 "scaler_stats_uri": scaler_stats_uri,
                 "normalize_at_infer": False
             },
@@ -639,16 +641,20 @@ def eval_test_and_breakdown(best_model_uri: str):
     print(thr_df.sort_values("F1", ascending=False).to_string(index=False))
 
     # 4️⃣ — Construire le JSON de seuils et le pousser sur S3
-    thr_map, ok_keys = _make_thr_json_from_reports(rpt, thr_df, auprc_floor=0.10)
+    thr_map, ok_keys = _make_thr_json_from_reports(
+        rpt, thr_df, auprc_floor=0.10
+    )
 
     payload = {
         "model_uri": best_model_uri,
         "created_at": int(time.time()),
         "policy": {"auprc_floor": 0.10, "criterion": "thr_f1"},
         "enabled_pockets": sorted(list(ok_keys)),
-        "thresholds": thr_map
+        "thresholds": thr_map,
     }
 
-    out_uri = f"{MODEL_BASE_S3}/deploy/thresholds_{int(time.time())}.json"
+    out_uri = (
+        f"{MODEL_BASE_S3}/deploy/thresholds_{int(time.time())}.json"
+    )
     _s3_put_bytes(_boto3_client("s3", REGION), out_uri, _json_dumps_safe(payload))
     print(f"[deploy] thresholds map écrit: {out_uri}")

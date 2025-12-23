@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-# validate_stage3_csv.py — Sanity-check des CSV (no header) pour SageMaker XGBoost (format v2)
+# validate_stage3_v50.py — Validation "institut" des CSV Stage3 XGBoost (v50)
+#
+# - Unique validateur post-make_stage3_xgb.py
+# - Vérifie :
+#   * columns.json / scaler_stats.json
+#   * normalisation (Z-MODE pooled) + heavy-tail RELAXED
+#   * cohérence side-aware (feat_side ≈ side_num * feat)
+#   * poids (shards *_weight)
+#   * meta _meta/splits_parquet (Y/poids par tf/side)
+#
+# - Options :
+#   * --split {all,train,validation,test}
+#   * --side {both,short,long}
+#   * --fail-on-strong (fait échouer sur anomalies STRICT en TRAIN)
+#
 from __future__ import annotations
 import argparse, json, io, sys, math
 from typing import Optional, Dict, List, Tuple
@@ -26,21 +40,40 @@ SIDE_THRESHOLDS = {
 # Colonnes non-features dans les CSV v2
 NON_FEATURE_COLS = {"Y", "side_num", "weight"}
 
-# --- helper: side-projection attendu selon la feature
+# Certaines features sont centrées à 0.5 avant projection *side*
 SIDE_NEUTRAL_05 = {"aggr_ratio_10s", "aggr_ratio_15s"}  # étends si besoin
 
-# --- Patch cohérence Stage3 / make_stage3_xgb.py ---
+# =============================
+# 2) Z-score: listes de contrôle
+# =============================
 
-# Colonnes transformées mais qui NE sont PAS destinées à respecter strictement un Z-score global
-# (log1p-only, binaires, percentiles, etc.)
+# Colonnes transformées mais qui NE sont PAS censées respecter un Z-score global strict
+# (log1p-only, binaires, percentiles, side_num, etc.).
 Z_IGNORE_EXACT = {
     # LOG1P_ONLY dans make_stage3_xgb.py
     "entry",
     "cum_depth_within_5bps_opp",
     "cum_depth_within_10bps_opp",
-    # binaires / percentiles
-    "bb_width_pctl",
+
+    # binaires (pas z-score)
+    "wall_opp_share_5_gt_0p08",    # si présent selon WALL_THRESHOLDS
+    "wall_opp_share_15_gt_0p05",
     "wall_opp_share_15_gt_0p12",
+
+    # flags _isnan et _isconstant (tjrs binaires)
+    "aggr_ratio_10s_isnan",
+    "aggr_ratio_15s_isnan",
+    "net_delta_15s_isnan",
+    "aggr_ratio_10s_side_isnan",
+    "aggr_ratio_15s_side_isnan",
+    "net_delta_15s_side_isnan",
+
+    # percentiles / ranks (pas z-score)
+    "bb_width_pctl",
+    "lf_atr_rank_30m",
+
+    # side_num → non z-score
+    "side_num",
 }
 
 def _is_mask_col(name: str) -> bool:
@@ -57,12 +90,12 @@ def _is_mask_col(name: str) -> bool:
 # Features pour lesquelles on accepte des stats Z plus "relax"
 # (queues lourdes même après log/asinh, structure très skewée ou bornée).
 HEAVY_TAIL_RELAXED = {
-    # queues lourdes "naturelles"
+    # --- microstructure naturellement heavy-tail ---
     "ret_stdev_1s_10s_bps",
     "quote_churn_10s",
     "executed_vs_added_ratio",
 
-    # bornées / très skew
+    # --- variables bornées mais très skew ---
     "spread_bps_entry",
     "wall_opp_share_5",
     "wall_opp_share_15",
@@ -71,26 +104,50 @@ HEAVY_TAIL_RELAXED = {
     "atr_percentile",
     "atr_bps",
 
-    # side-aware fortement asymétriques
+    # --- variantes side (fortement asymétriques) ---
     "microprice_bias_side",
     "slope_bid_5_side",
     "slope_ask_5_side",
     "slope_bid_15_side",
     "slope_ask_15_side",
     "mid_jump_bps_3s_side",
+
+    # --- dominance & pullback (communs aux 2 sides) ---
+    "bt_dom_3s",
+    "bt_dom_5s",
+    "bt_dom_10s",
+    "bt_dom_3s_side",
+    "bt_dom_5s_side",
+    "bt_dom_10s_side",
+
+    # ⚠️ ici : uniquement celle qui existe vraiment
+    "pullback_pos_swing_low_side",
+
+    # --- heavy-tail supplémentaires vus dans v48 (logs validate_stage3) ---
+    "lf_bid_absorb_ratio_3s",
+    "delta_spread_3s",
+    "imbalance_persistence",
+    "wall_persistence_score_5s_side",
+    "lf_bb_width_pct",
 }
 
 def _expected_side_projection(base_name: str, base: np.ndarray, side: np.ndarray) -> np.ndarray:
+    """
+    Projection attendue:
+      - par défaut: feat_side ≈ side_num * feat
+      - pour certaines features (SIDE_NEUTRAL_05): feat_side ≈ side_num * (feat - 0.5)
+    """
     x = base.astype(np.float64)
     s = side.astype(np.float64)
     if base_name in SIDE_NEUTRAL_05:
         return s * (x - 0.5)      # neutre à 0.5
     else:
         return s * x              # neutre à 0.0
-    
+
 # =============================
 # Helpers classes (online stats)
 # =============================
+
 def _detect_constant_flags(feat_stats: pd.DataFrame) -> list[str]:
     const = []
     for _, r in feat_stats.iterrows():
@@ -149,8 +206,9 @@ class PairStats:
         return (rmse, corr)
 
 # =============================
-# S3
+# S3 helpers
 # =============================
+
 def _fs(region: Optional[str]) -> pafs.S3FileSystem:
     return pafs.S3FileSystem(region=region) if region else pafs.S3FileSystem()
 
@@ -192,6 +250,7 @@ def _maybe_list_dir(fs: pafs.S3FileSystem, dir_s3: str) -> Optional[list[str]]:
 # =============================
 # Meta loader (v2)
 # =============================
+
 def _load_meta(fs, root: str):
     """
     columns.json (v2) :
@@ -236,42 +295,42 @@ def _check_scaler_stats(fs, root: str, features: list[str]) -> int:
         print(f"⚠️ scaler_stats.json introuvable ou illisible: {e}")
         return 0
 
-    # stats: liste de dicts {"tf": "...", "feature": "...", "q1":..., "q99":..., "median":..., "scale":...}
     df = pd.DataFrame(stats)
     if df.empty or not {"tf","feature"}.issubset(df.columns):
         print("⚠️ scaler_stats.json mal formé (pas de colonnes tf/feature).")
         return 0
 
-    # TF présents dans les CSV (on peut les inférer plus tard dans _validate_one_split si besoin)
-    # Ici, on accepte un check "global": chaque feature doit exister pour au moins un TF.
     missing_any = [f for f in features if f not in set(df["feature"].unique())]
     if missing_any:
         print(f"⛔ features sans stats de scaling: {missing_any}")
         return 2
 
-    # Option (plus strict) : quand on scanne un split, on détecte les TF vus
-    # et on vérifie qu'il existe une entrée (tf, feature) pour chacun.
-    # On fera ce check *dans* _validate_one_split (voir patch d ci-dessous).
     print("[meta] scaler_stats.json: OK (présence globale par feature).")
     return 0
 
 def _probe_align(fs, path):
+    """
+    Alignement diagnostic sur predictions.csv (y, p_pred, symbol, tf, side_num)
+    → best_lag, AUC par (symbol,tf,side_num)
+    """
     with fs.open_input_stream(_strip_s3(path)) as f:
         df = pd.read_csv(f)
     need = {"y","p_pred","symbol","tf","side_num"}
     if not need.issubset(df.columns):
-        print("⚠️ predictions.csv: colonnes manquantes pour align (requis y,p_pred,symbol,tf,side_num)"); return
-    from sklearn.metrics import roc_auc_score
-    def best_lag(y, p, kmax=10):
-        from sklearn.metrics import roc_auc_score
-        def safe_auc(a, b):
-            if a.size < 2 or b.size < 2: 
-                return float("nan")
-            u = np.unique(a)
-            if u.size < 2:
-                return float("nan")
-            return roc_auc_score(a, b)
+        print("⚠️ predictions.csv: colonnes manquantes pour align (requis y,p_pred,symbol,tf,side_num)")
+        return
 
+    from sklearn.metrics import roc_auc_score
+
+    def safe_auc(a, b):
+        if a.size < 2 or b.size < 2:
+            return float("nan")
+        u = np.unique(a)
+        if u.size < 2:
+            return float("nan")
+        return roc_auc_score(a, b)
+
+    def best_lag(y, p, kmax=10):
         base = safe_auc(y, p)
         best = (0, base if np.isfinite(base) else -1.0)
         n = min(len(y), len(p))
@@ -283,6 +342,7 @@ def _probe_align(fs, path):
             if np.isfinite(auc_b) and auc_b > best[1]:
                 best = (-k, auc_b)
         return best
+
     rows=[]
     for (sym, tf, side), sd in df.groupby(["symbol","tf","side_num"]):
         y = sd["y"].astype(int).to_numpy()
@@ -300,10 +360,14 @@ def _probe_align(fs, path):
 # =============================
 # CLI
 # =============================
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Validate Stage3 XGBoost CSV shards (no header) — format v2.")
-    ap.add_argument("--root", required=True, help="s3://…/data/stage3-xgb/vX-…")
-    ap.add_argument("--split", default="all", choices=["all","train","validation","test"], help="Par défaut: all")
+    ap = argparse.ArgumentParser(
+        description="Validate Stage3 XGBoost CSV shards (no header) — v50 ultra-strict."
+    )
+    ap.add_argument("--root", required=True, help="s3://…/data/stage3/v50-short ou v50-long")
+    ap.add_argument("--split", default="all", choices=["all","train","validation","test"],
+                    help="Par défaut: all")
     ap.add_argument("--aws-region", default="ap-northeast-1")
     ap.add_argument("--max-files", type=int, default=50)
     ap.add_argument("--chunksize", type=int, default=500_000)
@@ -318,22 +382,30 @@ def parse_args():
                     help="Vérifie les shards de poids parallèles (*/_weight).")
 
     # Fait échouer le run s’il y a des anomalies fortes sur TRAIN
-    ap.add_argument("--fail-on-strong", action="store_true")
+    ap.add_argument("--fail-on-strong", action="store_true",
+                    help="Si présent: échec sur anomalies STRICT (TRAIN). Recommandé en prod.")
 
     # Meta parquet: résumé TF/side/weights si présent
     ap.add_argument("--check-meta-parquet", action="store_true",
                     help="Si _meta/splits_parquet existe, résume Y/poids par tf/side.")
     
-    ap.add_argument("--predictions-csv", help="s3://…/predictions.csv (colonnes y,p_pred,symbol,tf,side_num)")
+    # Alignement diag sur predictions.csv
+    ap.add_argument("--predictions-csv",
+                    help="s3://…/predictions.csv (colonnes y,p_pred,symbol,tf,side_num)")
+
+    # Nouveau : validation par side
+    ap.add_argument("--side", choices=["both","short","long"], default="both",
+                    help="Filtre facultatif sur side_num: -1=short, +1=long (both par défaut).")
 
     return ap.parse_args()
 
 # =============================
 # Split runner
 # =============================
+
 def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, features: List[str]):
     print("\n" + "="*80)
-    print(f"🔎 Split: {split}")
+    print(f"🔎 Split: {split} (side={args.side})")
     print("="*80)
 
     name_to_idx = {c:i for i,c in enumerate(col_names)}
@@ -370,10 +442,22 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
     # Scan
     for path in files:
-        # Sécurité : ignorer tout shard sous *_weight/
         if ("/train_weight/" in path) or ("/validation_weight/" in path) or ("/test_weight/" in path):
             continue
+
         for chunk in _read_csv_chunks(fs, path, chunksize=args.chunksize):
+            # Filtre par side si demandé
+            if args.side != "both":
+                side_target = -1 if args.side == "short" else 1
+                side_col = pd.to_numeric(chunk.iloc[:,1], errors="coerce")
+                mask_side = (side_col == side_target)
+                if not mask_side.any():
+                    continue
+                chunk = chunk.loc[mask_side]
+
+            if chunk.shape[0] == 0:
+                continue
+
             if ncols_seen is None:
                 ncols_seen = chunk.shape[1]
                 if ncols_seen != len(col_names):
@@ -400,8 +484,11 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
             # Stats globales par colonne
             for j in range(chunk.shape[1]):
-                if j not in col_stats: col_stats[j] = ColStats()
-                col_stats[j].update(pd.to_numeric(chunk.iloc[:,j], errors="coerce").to_numpy(dtype=np.float64))
+                if j not in col_stats:
+                    col_stats[j] = ColStats()
+                col_stats[j].update(
+                    pd.to_numeric(chunk.iloc[:,j], errors="coerce").to_numpy(dtype=np.float64)
+                )
 
             # Side-aware: base_side ≈ side_num * base
             if pair_indices:
@@ -416,7 +503,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     # Reporting pooled
     print(f"\n[rows] total scanned: {total_rows}")
     if total_rows == 0:
-        print("⛔ Aucun enregistrement lu.")
+        print("⛔ Aucun enregistrement lu (après filtrage side).")
         return 2
 
     print("\nℹ️ Label balance:")
@@ -428,27 +515,29 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     if side_anomalies > 0:
         print(f"\n⚠️ anomalies side_num détectées (NaN ou valeurs ≠ -1/1): ~{side_anomalies}")
     
+    # pos_weight par split TRAIN + side
     if split == "train":
         pos = int(label_counts.get(1, 0))
         neg = int(label_counts.get(0, 0))
         if pos > 0:
             spw = float(neg) / float(pos)
-            print(f"[meta] scale_pos_weight (train) ≈ {spw:.4f}")
+            print(f"[meta] scale_pos_weight (train, side={args.side}) ≈ {spw:.4f}")
             try:
                 path = f"{root.rstrip('/')}/_meta/train_pos_weight.json"
                 with fs.open_output_stream(_strip_s3(path)) as out:
                     out.write(json.dumps({
                         "pos_weight": spw,
                         "pos_count": pos,
-                        "neg_count": neg
+                        "neg_count": neg,
+                        "side": args.side,
                     }, indent=2).encode("utf-8"))
                 print(f"[meta] Écrit {path}")
             except Exception as e:
                 print(f"[meta] Écriture pos_weight skip ({e})")
         else:
-            print("[meta] Impossible de calculer scale_pos_weight: aucun positif en TRAIN.")
+            print("[meta] Impossible de calculer scale_pos_weight: aucun positif en TRAIN (pour ce side).")
     
-    # stats features (indices >=2), en excluant poids, masques et quelques colonnes log1p/bool
+    # stats features (indices >=2), en excluant poids, masques et colonnes log1p/bool
     def _ignore_for_zscore(name: str) -> bool:
         if name in NON_FEATURE_COLS:
             return True
@@ -478,7 +567,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     const_flags = _detect_constant_flags(feat_stats)
     if const_flags:
         print("\n[flags] Colonnes constantes à ignorer pour l’entraînement :", const_flags)
-        # (facultatif) Sauvegarde sous _meta/constant_flags.json
         try:
             meta_dir = f"{root.rstrip('/')}/_meta"
             path = f"{meta_dir}/constant_flags.json"
@@ -488,8 +576,8 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         except Exception as e:
             print(f"[flags] Écriture skip ({e})")
 
-    print("\nGLOBAL feature stats (%s): z-scored → |mean|<=%.2f, std∈[%.2f, %.2f]."
-      % (split, args.mean_tol, args.std_low, args.std_high))
+    print("\nGLOBAL feature stats (%s, side=%s): z-scored → |mean|<=%.2f, std∈[%.2f, %.2f]."
+          % (split, args.side, args.mean_tol, args.std_low, args.std_high))
     print(feat_stats.head(80).to_string(index=False))
 
     # ===== Auto-détection du mode de scaling (Z-MODE vs WIDE-MODE) =====
@@ -497,7 +585,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     stds  = feat_stats["std"].to_numpy()
     n     = max(len(stds), 1)
 
-    # heuristique : si ≥60% des features ont std dans [0.6,1.5] ET |mean|≤0.5 → on considère “z-scored pooled”
     ok_mask = (stds >= 0.6) & (stds <= 1.5) & (means <= 0.5)
     ratio_ok = float(ok_mask.sum()) / n
     is_z_mode = (ratio_ok >= 0.60)
@@ -505,7 +592,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     print(f"\n[scaling] auto-detect → {'Z-MODE (pooled)' if is_z_mode else 'WIDE-MODE (no strict z)'} "
           f"(ok_ratio={ratio_ok:.2f})")
 
-    # Prépare le conteneur pour anomalies STRICT (utilisé plus bas avec fail-on-strong)
     strict_bad = pd.DataFrame()
 
     if is_z_mode:
@@ -517,7 +603,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             mean = float(row["mean"])
             std  = float(row["std"])
 
-            # Sécurité : on ne re-check pas ce qu'on a explicitement décidé d'ignorer
             if col in NON_FEATURE_COLS or col in Z_IGNORE_EXACT or _is_mask_col(col):
                 continue
 
@@ -602,7 +687,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                   f"min={w_stats.minv:.4f} max={w_stats.maxv:.4f} "
                   f"nan={w_stats.nan_count} +inf={w_stats.posinf} -inf={w_stats.neginf}")
 
-            # tolérances simples
             if split == "train":
                 if not (0.95 <= w_mean <= 1.05):
                     print("⚠️ TRAIN: mean(weight) attendu ≈1 (±5%).")
@@ -614,7 +698,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                 if not (w_stats.minv >= 0.0):
                     print("⚠️ OOS: weight doit être ≥ 0.")
 
-            # parité lignes (approx. sur l’échantillon scanné)
             if total_rows and total_w_rows:
                 delta = abs(total_rows - total_w_rows)
                 if delta == 0:
@@ -632,18 +715,15 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             if not infos:
                 print(f"\n[meta] {split}: pas de fichiers dans {meta_dir} — skip")
             else:
-                # lecture rapide (concat all; meta est petit vs CSV)
                 tables = []
                 for inf in infos:
-                    with fs.open_input_file(inf.path) as f:  # seekable
+                    with fs.open_input_file(inf.path) as f:
                         tables.append(pq.read_table(f))
                 meta_df = pd.concat([t.to_pandas() for t in tables], ignore_index=True)
 
-                # en fin de _validate_one_split, si args.check_meta_parquet est activé et meta parquet dispo:
-                # après avoir lu meta_df
-                if args.check_meta_parquet and "tf" in meta_df.columns:
+                # Check scaler_stats coverage pour TF vus
+                if "tf" in meta_df.columns:
                     tf_seen = sorted(set(meta_df["tf"].astype(str).unique()))
-                    # charger scaler_stats.json une seule fois
                     try:
                         with fs.open_input_stream(_strip_s3(f"{root.rstrip('/')}/_meta/scaler_stats.json")) as f:
                             ss = pd.DataFrame(json.loads(f.read().decode("utf-8")))
@@ -663,8 +743,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                     except Exception as e:
                         print(f"[meta] Impossible de vérifier scaler_stats coverage: {e}")
 
-
-                # Attendu: row_id, symbol, tf, t, Y, side_num, weight
                 cols_ok = {"Y","side_num","weight"}
                 if not cols_ok.issubset(set(meta_df.columns)):
                     print(f"[meta] colonnes attendues manquantes dans {meta_dir} — trouvé: {list(meta_df.columns)}")
@@ -710,6 +788,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 # =============================
 # Main
 # =============================
+
 def main():
     args = parse_args()
     fs = _fs(args.aws_region)
@@ -725,6 +804,7 @@ def main():
     if pos_weight is not None:
         print(f"[meta] pos_weight (train) ≈ {pos_weight:.4f}")
 
+    # Features interdits (pnl, thresholds) dans columns.json → sécurité
     FORBID = {"THRESH_BPS","pnl_net_max_bps","pnl_net_min_bps"}
     forbid_found = sorted(FORBID & set(features))
     if forbid_found:
@@ -735,11 +815,11 @@ def main():
     if rc != 0:
         sys.exit(rc)
 
-    splits = ["train","validation","test"] if args.split == "all" else [args.split]
-    
     if args.predictions_csv:
         _probe_align(fs, args.predictions_csv)
 
+    splits = ["train","validation","test"] if args.split == "all" else [args.split]
+    
     rc_sum = 0
     for sp in splits:
         rc_sum += _validate_one_split(fs, args.root, sp, col_names, args, features)

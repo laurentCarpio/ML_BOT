@@ -66,7 +66,6 @@ def calculate_indicators(self, df: pd.DataFrame, frequency: str) -> pd.DataFrame
 
     return out
 
-
 # =========================
 # Retail A/B/C/D indicators
 # =========================
