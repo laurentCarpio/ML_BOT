@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# validate_stage3_v50.py — Validation "institut" des CSV Stage3 XGBoost (v50)
+# validate_stage3.py — Validation "institut" des CSV Stage3 XGBoost (v50)
 #
 # - Unique validateur post-make_stage3_xgb.py
 # - Vérifie :

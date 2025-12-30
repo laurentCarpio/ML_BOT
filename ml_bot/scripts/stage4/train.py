@@ -11,7 +11,7 @@ def _load_csv_matrix(dir_path, delim=","):
     xs, ys = [], []
     for p in parts:
         arr = np.loadtxt(p, delimiter=delim)
-        # colonnes: [Y, side_num, feat1, feat2, ...] (poids à part)
+        # colonnes GO stage3: [Y, feat1, feat2, ...]  (poids à part)
         y = arr[:, 0]
         X = arr[:, 1:]
         ys.append(y); xs.append(X)

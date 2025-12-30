@@ -263,6 +263,7 @@ class AggLabel:
 
 @dataclass
 class AggFile:
+    n_dup_row_id: int = 0
     n_rows: int = 0
     n_bad_ts: int = 0
     n_dup_ts: int = 0
@@ -282,9 +283,14 @@ class AggFile:
     n_checked_go_vs_rr: int = 0
     n_checked_dir_vs_rr: int = 0
 
+     # spread diagnostics
+    spread_min: float = float("inf")
+    spread_min_count: int = 0  # combien de lignes == min (approx, sur les chunks)
+    n_bad_spread_recalc_mismatch: int = 0
+    n_checked_spread_recalc: int = 0
+
     # monthly counts: (key, month, y) -> count
     monthly: Dict[Tuple[str, str, int], int] = field(default_factory=dict)
-
 
 # ============================
 # Helpers: robust exit_reason matching
@@ -343,7 +349,7 @@ def process_signals_file(
     cols = list(head.columns)
 
     # Must-have base cols (minimal)
-    base_required = ["t", "spread_bps_entry", "atr_bps"]
+    base_required = ["row_id", "t", "spread_bps_entry", "atr_bps"]
     miss = [c for c in base_required if c not in cols]
     if miss:
         issues.append(IntegrityIssue(path, symbol, year, "missing_base_cols", ",".join(miss)))
@@ -371,9 +377,12 @@ def process_signals_file(
 
     use_global_dup_set = False
     seen_ts = set()
+    seen_rid = set()
 
     with open_any(path, so) as f:
         reader = pd.read_csv(f, chunksize=chunksize)
+        
+        rid_to_t = {}  # row_id -> first seen t (string)
 
         for ci, df in enumerate(reader, 1):
             if df is None or df.empty:
@@ -395,6 +404,55 @@ def process_signals_file(
             if df.empty:
                 continue
 
+            # row_id checks (primary key)
+            rid = df["row_id"]
+
+            # 1) NaN / empty row_id => issue (grave)
+            rid_str = rid.astype("string")  # garde <NA>
+            bad_rid = int(rid_str.isna().sum() + (rid_str.str.len().fillna(0) == 0).sum())
+            if bad_rid:
+                issues.append(IntegrityIssue(path, symbol, year, "bad_row_id",
+                                            f"bad_row_id={bad_rid} in chunk={ci}"))
+
+            # 2) duplicates inside chunk
+            dup_rid_in_chunk = int(rid_str.duplicated().sum())
+            if dup_rid_in_chunk:
+                agg.n_dup_row_id += dup_rid_in_chunk
+                issues.append(IntegrityIssue(path, symbol, year, "duplicate_row_id_in_chunk",
+                                            f"count={dup_rid_in_chunk} chunk={ci}"))
+
+            # 3) duplicates across chunks (always check, don't gate on a flag)
+            #    count duplicates of already-seen ids
+            for vv in rid_str.dropna().astype(str).values:
+                if vv in seen_rid:
+                    agg.n_dup_row_id += 1
+                else:
+                    seen_rid.add(vv)
+
+            # row_id -> t should be 1-1 (detect collision across chunks)
+            t_str = df["t"].astype("string")
+
+            # chunk-level quick detection (optional but cheap)
+            tmp = pd.DataFrame({"row_id": rid_str, "t": t_str})
+            bad_map = tmp.dropna().groupby("row_id")["t"].nunique()
+            bad_map = bad_map[bad_map > 1]
+            if not bad_map.empty:
+                issues.append(IntegrityIssue(path, symbol, year, "row_id_maps_to_multiple_t",
+                                            f"n={len(bad_map)} in chunk={ci}"))
+
+            # cross-chunk detection (source of truth)
+            for ridv, tv in zip(rid_str.to_list(), t_str.to_list()):
+                if ridv is None or pd.isna(ridv) or tv is None or pd.isna(tv):
+                    continue
+                rkey = str(ridv)
+                tkey = str(tv)
+                prev = rid_to_t.get(rkey)
+                if prev is None:
+                    rid_to_t[rkey] = tkey
+                elif prev != tkey:
+                    issues.append(IntegrityIssue(path, symbol, year, "row_id_maps_to_multiple_t_cross_chunk",
+                                                f"row_id={rkey} prev_t={prev} new_t={tkey}"))
+                                
             # dup/monotonic checks
             dup_in_chunk = int(dt.duplicated().sum())
             if dup_in_chunk:
@@ -437,6 +495,38 @@ def process_signals_file(
             atr = pd.to_numeric(df["atr_bps"], errors="coerce")
             agg.n_bad_spread_lt0 += int((spr < 0).sum(skipna=True))
             agg.n_bad_atr_lt0 += int((atr < 0).sum(skipna=True))
+
+            # --- spread_bps_entry: min + sanity check ---
+            sprv = spr.to_numpy(dtype=np.float64, copy=False)
+            ok_spr = np.isfinite(sprv)
+            if ok_spr.any():
+                smin = float(np.min(sprv[ok_spr]))
+                if smin < agg.spread_min:
+                    agg.spread_min = smin
+                    # approx count in this chunk for that min
+                    agg.spread_min_count = int(np.sum(sprv[ok_spr] == smin))
+                elif smin == agg.spread_min:
+                    agg.spread_min_count += int(np.sum(sprv[ok_spr] == smin))
+
+            # --- validate spread_bps_entry against bid/ask entry (best validation of your Stage1 fix)
+            if has_bidask:
+                bid = pd.to_numeric(df["bid_entry"], errors="coerce").to_numpy(dtype=np.float64)
+                ask = pd.to_numeric(df["ask_entry"], errors="coerce").to_numpy(dtype=np.float64)
+                mid = 0.5 * (bid + ask)
+
+                spr_recalc = np.where(np.isfinite(mid) & (mid > 0),
+                                      1e4 * (ask - bid) / mid,
+                                      np.nan)
+
+                ok = np.isfinite(spr_recalc) & np.isfinite(sprv)
+                if ok.any():
+                    agg.n_checked_spread_recalc += int(ok.sum())
+
+                    # tol permissive pour float32 + arrondis + CSV
+                    diff = np.abs(sprv[ok] - spr_recalc[ok])
+                    tol = 1e-3 + 1e-3 * np.abs(spr_recalc[ok])
+
+                    agg.n_bad_spread_recalc_mismatch += int((diff > tol).sum())
 
             # ------------------------------------------------------------
             # Cross-consistency checks (if rr exists)
@@ -590,6 +680,8 @@ def process_signals_file(
                 logger.info(f"  chunk {ci}: rows_so_far={agg.n_rows:,}")
 
     # Post-file issues
+    if agg.n_dup_row_id:
+        issues.append(IntegrityIssue(path, symbol, year, "duplicate_row_id_total", f"count={agg.n_dup_row_id}"))
     if agg.n_dup_ts:
         issues.append(IntegrityIssue(path, symbol, year, "duplicate_t", f"count={agg.n_dup_ts}"))
     if agg.n_nonmonotonic_chunks:
@@ -610,6 +702,18 @@ def process_signals_file(
     if agg.n_checked_dir_vs_rr and agg.n_bad_dir_vs_rr:
         issues.append(IntegrityIssue(path, symbol, year, "dir_vs_rr_mismatch",
                                      f"bad={agg.n_bad_dir_vs_rr} / checked={agg.n_checked_dir_vs_rr}"))
+    
+    if math.isfinite(agg.spread_min) and agg.spread_min < 0:
+        issues.append(IntegrityIssue(
+            path, symbol, year, "spread_bps_entry_min_lt0",
+            f"min={agg.spread_min:.6f} (approx count={agg.spread_min_count})"
+        ))
+
+    if agg.n_checked_spread_recalc and agg.n_bad_spread_recalc_mismatch:
+        issues.append(IntegrityIssue(
+            path, symbol, year, "spread_bps_entry_recalc_mismatch",
+            f"bad={agg.n_bad_spread_recalc_mismatch} / checked={agg.n_checked_spread_recalc}"
+        ))
 
     # RR-only per-label issues
     for key, al in agg.by_label.items():
@@ -645,6 +749,7 @@ def summarize_file_metrics(symbol: str, year: int, agg: AggFile) -> Dict[str, ob
         "symbol": symbol,
         "year": year,
         "rows": agg.n_rows,
+        "dup_row_id": agg.n_dup_row_id,
         "bad_ts": agg.n_bad_ts,
         "dup_ts": agg.n_dup_ts,
         "non_monotonic_chunks": agg.n_nonmonotonic_chunks,
@@ -656,6 +761,10 @@ def summarize_file_metrics(symbol: str, year: int, agg: AggFile) -> Dict[str, ob
         "go_vs_rr_checked": agg.n_checked_go_vs_rr,
         "dir_vs_rr_bad": agg.n_bad_dir_vs_rr,
         "dir_vs_rr_checked": agg.n_checked_dir_vs_rr,
+        "spread_bps_entry_min": (agg.spread_min if math.isfinite(agg.spread_min) else float("nan")),
+        "spread_bps_entry_min_count": agg.spread_min_count,
+        "spread_recalc_bad": agg.n_bad_spread_recalc_mismatch,
+        "spread_recalc_checked": agg.n_checked_spread_recalc,
     }
 
 def summarize_label_metrics(symbol: str, year: int, key: str, al: AggLabel) -> Dict[str, object]:

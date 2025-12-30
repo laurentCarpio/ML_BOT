@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-build_stage2_dataset.py — Stage2 v3.3 (perf+logs fixed)
+build_stage2_dataset.py — Stage2 v4.1 (GO+DIR dual outputs, no Y) — GO wide + DIR wide
 
-Fixes / Improvements vs v3.2:
-- FIX: miss logs only printed on actual miss (no spam, no undefined vars).
-- PERF: default bucket = 1h (CLI --bucket), drastically fewer S3 reads.
-- PERF: book ret_stdev computed tick-based with rolling("10s") (no resample("1s")).
-- LOGS: month start/end + progress every N events + per-month ETA + timing breakdown.
-- Keeps same features and semantics as v3.1/v3.2 (go/dir + audit_* + task).
-
-v3.3.1 PATCH (this file):
-- FIX: trades parquet -> to_pandas() (avoid ArrowDtype timestamps issues).
-- FIX: staleness dt calc uses int64 ns (tz-safe) instead of datetime64[ns] casts.
-- CLEANUP: removed redundant book_df reset_index() line.
+- Stage2 unique, 2 sorties:
+  - out_root/.../go/<SYMBOL>/<YEAR>/parts/*.parquet
+  - out_root/.../dir/<SYMBOL>/<YEAR>/parts/*.parquet
+- PAS de colonne Y produite en stage2.
+- Labels conservés:
+  - y_go  (0/1)      : gate tradeable
+  - y_dir (-1/0/+1)  : direction (0 = neutre / pas de direction)
+- GO dataset = 1 ligne par (row_id,t,tf) avec features buy & sell en colonnes séparées.
+- DIR dataset = même format MAIS filtré sur y_dir in {-1,+1}.
+- NEW (bretelles):
+  - task ∈ {"go","dir"}
+  - event_id = f"{row_id}|{task}|{tf}"
+- Stage3 (go/dir) fabriquera Y juste avant stage4 + normalisation.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import gc
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -59,12 +61,23 @@ MAX_STALE_BY_TF = {
     "4h":  pd.Timedelta(seconds=10),
 }
 
-# cache sizes (buckets)
+CANDLE_LOOKBACK = pd.Timedelta(days=8)
+CANDLE_FORWARD  = pd.Timedelta(minutes=5)
+
+BB_N = 20
+BB_K = 2.0
+ATR_N = 14
+ADX_N = 14
+
 MAX_BOOK_CACHE = 128
 MAX_TRADES_CACHE = 256
+MAX_CANDLE_CACHE = 32
 
 BATCH_MAX = 10_000
-LOG_EVERY = 5_000
+
+LOG_NEG_SPREAD_MAX_EX = 5
+DEDUP_BOOK_TS = True
+RECALC_SPREAD_ENTRY = False
 
 
 # ------------------------------
@@ -135,6 +148,37 @@ def dataset_from_month_parquet(month_path_s3: str, pafs: pa_fs.FileSystem) -> ds
     p = s3_to_bucket_key(month_path_s3)
     return ds.dataset([p], format="parquet", filesystem=pafs)
 
+def candle_path_from_tpl(root_tpl: str, symbol: str, year: int) -> str:
+    return ensure_s3(root_tpl.replace("<SYMBOL>", symbol).replace("<YEAR>", str(year)))
+
+def read_candles_window(candle_path_s3: str, pafs: pa_fs.FileSystem,
+                        t0: pd.Timestamp, t1: pd.Timestamp) -> pd.DataFrame:
+    dset = ds.dataset([s3_to_bucket_key(candle_path_s3)], format="parquet", filesystem=pafs)
+
+    ts_field = "timestamp"
+    names = set(dset.schema.names)
+    if ts_field not in names:
+        raise ValueError("Candles parquet missing 'timestamp'")
+
+    cols = [c for c in ["timestamp","open","high","low","close","volume"] if c in names]
+    flt = arrow_time_filter(dset, ts_field, t0, t1)
+    tbl = dset.to_table(columns=cols, filter=flt)
+    if tbl.num_rows == 0:
+        return pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+
+    df = tbl.to_pandas()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
+    df.index.name = "timestamp"
+
+    for c in ["open","high","low","close","volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+
+    need = ["open","high","low","close"]
+    df = df.dropna(subset=[c for c in need if c in df.columns])
+    return df
+
 def read_book_window(dset: ds.Dataset, t0: pd.Timestamp, t1: pd.Timestamp, cols: List[str]) -> pd.DataFrame:
     ts_field = "timestamp"
     names = set(dset.schema.names)
@@ -147,9 +191,26 @@ def read_book_window(dset: ds.Dataset, t0: pd.Timestamp, t1: pd.Timestamp, cols:
     if tbl.num_rows == 0:
         return pd.DataFrame(index=pd.DatetimeIndex([], name="timestamp", tz="UTC"))
 
-    df = tbl.to_pandas()  # IMPORTANT: avoid ArrowDtype timestamps that break merge_asof
+    df = tbl.to_pandas()
     df[ts_field] = pd.to_datetime(df[ts_field], utc=True, errors="coerce")
-    df = df.dropna(subset=[ts_field]).sort_values(ts_field).set_index(ts_field)
+    df = df.dropna(subset=[ts_field])
+
+    sort_cols = [ts_field]
+    if "seq" in df.columns:
+        sort_cols.append("seq")
+    if "received_time" in df.columns:
+        try:
+            df["received_time"] = pd.to_datetime(df["received_time"], utc=True, errors="coerce")
+        except Exception:
+            pass
+        sort_cols.append("received_time")
+
+    df = df.sort_values(sort_cols, kind="mergesort")
+
+    if DEDUP_BOOK_TS:
+        df = df.drop_duplicates(subset=[ts_field], keep="last")
+
+    df = df.set_index(ts_field)
     df.index.name = "timestamp"
     return df
 
@@ -167,7 +228,6 @@ def read_trades_window(dset: ds.Dataset, t0: pd.Timestamp, t1: pd.Timestamp) -> 
     if tbl.num_rows == 0:
         return pd.DataFrame(index=pd.DatetimeIndex([], name="timestamp", tz="UTC"))
 
-    # FIX v3.3.1: to_pandas() to avoid ArrowDtype timestamp quirks
     df = tbl.to_pandas()
     df[ts_field] = pd.to_datetime(df[ts_field], utc=True, errors="coerce")
     df = df.dropna(subset=[ts_field]).sort_values(ts_field).set_index(ts_field)
@@ -182,104 +242,184 @@ def read_trades_window(dset: ds.Dataset, t0: pd.Timestamp, t1: pd.Timestamp) -> 
 
 
 # ------------------------------
-# Feature helpers (book)
+# Candle feature helpers
 # ------------------------------
-def obi_row(row: pd.Series, K: int) -> float:
-    sb = 0.0
-    sa = 0.0
-    for i in range(K):
-        sb += float(row.get(f"bid_{i}_size", 0.0) or 0.0)
-        sa += float(row.get(f"ask_{i}_size", 0.0) or 0.0)
-    tot = sb + sa
-    return float((sb - sa) / tot) if tot > 0 else np.nan
+def _tf_to_pandas_freq(tf: str) -> str:
+    tf = (tf or "").lower().strip()
+    if tf.endswith("m") and tf[:-1].isdigit():
+        return f"{int(tf[:-1])}min"
+    if tf.endswith("h") and tf[:-1].isdigit():
+        return f"{int(tf[:-1])}h"
+    return tf
 
-def slope_from_levels(row: pd.Series, side: str, K: int) -> float:
-    prices, sizes = [], []
-    for i in range(K):
-        prices.append(float(row.get(f"{side}_{i}_price", np.nan)))
-        sizes.append(float(row.get(f"{side}_{i}_size", np.nan)))
-    p = np.asarray(prices, float)
-    q = np.asarray(sizes, float)
-    ok = np.isfinite(p) & np.isfinite(q) & (q > 0)
-    p = p[ok]; q = q[ok]
-    if p.size < 2:
-        return np.nan
-    x = np.cumsum(q)
-    xm, pm = x.mean(), p.mean()
-    den = ((x - xm) ** 2).sum()
-    if den <= 0:
-        return np.nan
-    return float(((x - xm) * (p - pm)).sum() / den)
+def _wilder_ewm(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(alpha=1.0/n, adjust=False, min_periods=n).mean()
 
-def wall_opp_share(row: pd.Series, side: str, K: int) -> float:
-    if side not in ("buy", "sell"):
-        return np.nan
-    opp = "ask" if side == "buy" else "bid"
-    sizes = [float(row.get(f"{opp}_{i}_size", 0.0) or 0.0) for i in range(K)]
-    tot = float(np.sum(sizes))
-    return float(np.max(sizes) / tot) if tot > 0 else np.nan
+def compute_bb_width(close: pd.Series, n: int = BB_N, k: float = BB_K) -> pd.Series:
+    ma = close.rolling(n, min_periods=n).mean()
+    sd = close.rolling(n, min_periods=n).std(ddof=0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return (upper - lower) / ma.replace(0, np.nan)
 
-def cum_depth_within_bps(row: pd.Series, side: str, mid: float, bps: float) -> float:
-    if side not in ("buy", "sell"):
-        return np.nan
-    if not np.isfinite(mid) or mid <= 0:
-        return np.nan
-    tol = (bps / 1e4) * mid
-    depth = 0.0
-    if side == "buy":
-        for i in range(BOOK_LEVELS):
-            ap = float(row.get(f"ask_{i}_price", np.nan))
-            aq = float(row.get(f"ask_{i}_size", 0.0) or 0.0)
-            if np.isfinite(ap) and abs(ap - mid) <= tol:
-                depth += aq
-    else:
-        for i in range(BOOK_LEVELS):
-            bp = float(row.get(f"bid_{i}_price", np.nan))
-            bq = float(row.get(f"bid_{i}_size", 0.0) or 0.0)
-            if np.isfinite(bp) and abs(bp - mid) <= tol:
-                depth += bq
-    return float(depth)
+def compute_tr_atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = ATR_N):
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = _wilder_ewm(tr, n)
+    return tr, atr
 
-def microprice_bias_from_top(row: pd.Series) -> float:
-    bid = float(row.get("bid_0_price", np.nan))
-    ask = float(row.get("ask_0_price", np.nan))
-    bsz = float(row.get("bid_0_size", np.nan))
-    asz = float(row.get("ask_0_size", np.nan))
-    if not (np.isfinite(bid) and np.isfinite(ask) and np.isfinite(bsz) and np.isfinite(asz)):
-        return np.nan
-    mid = (bid + ask) / 2.0
-    den = bsz + asz
-    if mid <= 0 or den <= 0:
-        return np.nan
-    w = asz / den
-    micro = w * ask + (1.0 - w) * bid
-    return float((micro - mid) / mid)
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = ADX_N) -> pd.Series:
+    up = high.diff()
+    dn = -low.diff()
 
-def side_adjust(x: float, side_num: int) -> float:
-    return float(side_num * x) if np.isfinite(x) else np.nan
+    plus_dm  = up.where((up > dn) & (up > 0), 0.0)
+    minus_dm = dn.where((dn > up) & (dn > 0), 0.0)
+
+    tr, _ = compute_tr_atr(high, low, close, n)
+    tr_s = _wilder_ewm(tr, n).replace(0, np.nan)
+
+    plus_di  = 100.0 * (_wilder_ewm(plus_dm, n)  / tr_s)
+    minus_di = 100.0 * (_wilder_ewm(minus_dm, n) / tr_s)
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = _wilder_ewm(dx, n).clip(lower=0.0, upper=100.0)
+    return adx
+
+def rolling_percentile_of_last(x: np.ndarray) -> float:
+    if x.size == 0 or not np.isfinite(x[-1]):
+        return np.nan
+    v = x[np.isfinite(x)]
+    if v.size == 0:
+        return np.nan
+    last = x[-1]
+    return float((v <= last).mean())
+
+def compute_candle_features_for_tfs(candles_1m: pd.DataFrame, tfs: list[str]) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    if candles_1m is None or candles_1m.empty:
+        return out
+
+    tfs_norm = sorted(set([str(x).lower().strip() for x in tfs if x]))
+
+    for tf in tfs_norm:
+        tf_freq = _tf_to_pandas_freq(tf)
+
+        ohlc = candles_1m[["open", "high", "low", "close", "volume"]].resample(
+            tf_freq, label="right", closed="right"
+        ).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }).dropna(subset=["open", "high", "low", "close"])
+        if ohlc.empty:
+            continue
+
+        close = ohlc["close"]
+        high = ohlc["high"]
+        low = ohlc["low"]
+
+        bb_width = compute_bb_width(close, BB_N, BB_K)
+        _, atr = compute_tr_atr(high, low, close, ATR_N)
+        adx = compute_adx(high, low, close, ADX_N)
+
+        try:
+            tf_delta = pd.Timedelta(tf_freq)
+        except Exception:
+            tf_delta = pd.Timedelta(hours=1)
+
+        win = int(pd.Timedelta(days=7) / tf_delta) if tf_delta > pd.Timedelta(0) else 168
+        win = max(win, 50)
+
+        bb_pctl = bb_width.rolling(win, min_periods=max(10, win // 10)).apply(rolling_percentile_of_last, raw=True)
+        atr_pctl = atr.rolling(win, min_periods=max(10, win // 10)).apply(rolling_percentile_of_last, raw=True)
+
+        df_feat = pd.DataFrame(index=ohlc.index)
+        df_feat["bb_width"] = bb_width
+        df_feat["bb_width_pctl"] = bb_pctl
+        df_feat["lf_bb_width_pct"] = bb_pctl
+        df_feat["atr_percentile"] = atr_pctl
+
+        if tf_freq == "30min":
+            df_feat["lf_atr_rank_30m"] = atr_pctl
+            df_feat["atr_pct_rank_30m"] = atr_pctl
+        else:
+            df_feat["lf_atr_rank_30m"] = np.nan
+            df_feat["atr_pct_rank_30m"] = np.nan
+
+        df_feat["adx"] = adx
+
+        key = "30m" if tf_freq == "30min" else tf
+        out[key] = df_feat
+
+    return out
+
+def attach_candle_features(merged_ev: pd.DataFrame, candles_1m: pd.DataFrame) -> pd.DataFrame:
+    if merged_ev is None or merged_ev.empty:
+        return merged_ev
+
+    merged_ev = merged_ev.copy()
+    merged_ev["t"] = pd.to_datetime(merged_ev["t"], utc=True, errors="coerce")
+    merged_ev = merged_ev.dropna(subset=["t"])
+    if merged_ev.empty:
+        return merged_ev
+
+    merged_ev["tf"] = merged_ev["tf"].astype(str).str.lower().str.strip()
+    tfs = merged_ev["tf"].dropna().unique().tolist()
+    feats_by_tf = compute_candle_features_for_tfs(candles_1m, tfs + ["30m"])
+    feat_30m = feats_by_tf.get("30m")
+
+    parts = []
+    for tf, g in merged_ev.groupby("tf", sort=False):
+        g = g.sort_values("t")
+        fdf = feats_by_tf.get(tf)
+
+        if fdf is None or fdf.empty:
+            for c in ["bb_width", "bb_width_pctl", "lf_bb_width_pct",
+                      "atr_percentile", "lf_atr_rank_30m", "atr_pct_rank_30m", "adx"]:
+                g[c] = np.nan
+            parts.append(g)
+            continue
+
+        f = fdf.reset_index().rename(columns={"timestamp": "c_ts"}).sort_values("c_ts")
+        g2 = pd.merge_asof(g, f, left_on="t", right_on="c_ts",
+                           direction="backward", allow_exact_matches=True).drop(columns=["c_ts"], errors="ignore")
+
+        if tf not in ("30m", "30min") and feat_30m is not None and not feat_30m.empty:
+            f30 = feat_30m[["lf_atr_rank_30m", "atr_pct_rank_30m"]].reset_index() \
+                .rename(columns={"timestamp": "c30_ts"}).sort_values("c30_ts")
+
+            g2 = pd.merge_asof(
+                g2, f30,
+                left_on="t", right_on="c30_ts",
+                direction="backward", allow_exact_matches=True,
+                suffixes=("", "_30m")
+            ).drop(columns=["c30_ts"], errors="ignore")
+
+            for c in ["lf_atr_rank_30m", "atr_pct_rank_30m"]:
+                c30 = c + "_30m"
+                if c30 in g2.columns:
+                    g2[c] = g2[c].where(g2[c].notna(), g2[c30])
+                    g2.drop(columns=[c30], inplace=True, errors="ignore")
+
+        parts.append(g2)
+
+    return pd.concat(parts, ignore_index=True)
 
 
 # ------------------------------
-# Fast asof helpers
+# Prepared caches
 # ------------------------------
-def _asof_get(series: pd.Series, t: pd.Timestamp) -> float:
-    if series is None or series.empty:
-        return np.nan
-    idx = series.index
-    j = idx.searchsorted(t, side="right") - 1
-    if j < 0:
-        return np.nan
-    v = series.iloc[j]
-    try:
-        return float(v)
-    except Exception:
-        return np.nan
-
 @dataclass
 class BookPrepared:
     df: pd.DataFrame
-    churn10: pd.Series           # rolling 10s quote churn
-    retstd10_bps: pd.Series      # rolling std of mid returns over 10s (tick-based)
+    churn10: pd.Series
+    retstd10_bps: pd.Series
 
 @dataclass
 class TradesPrepared:
@@ -289,15 +429,12 @@ class TradesPrepared:
     aggr10: pd.Series
     aggr15: pd.Series
 
-
 def prepare_book_features(book_full: pd.DataFrame) -> BookPrepared:
     if book_full is None or book_full.empty:
         empty = pd.Series(dtype=float)
         return BookPrepared(book_full, empty, empty)
 
-    df = book_full
-    if not df.index.is_monotonic_increasing:
-        df = df.sort_index()
+    df = book_full.sort_index() if not book_full.index.is_monotonic_increasing else book_full
 
     bsz = pd.to_numeric(df.get("bid_0_size"), errors="coerce").astype(float)
     asz = pd.to_numeric(df.get("ask_0_size"), errors="coerce").astype(float)
@@ -307,20 +444,37 @@ def prepare_book_features(book_full: pd.DataFrame) -> BookPrepared:
     bid0 = pd.to_numeric(df.get("bid_0_price"), errors="coerce").astype(float)
     ask0 = pd.to_numeric(df.get("ask_0_price"), errors="coerce").astype(float)
     mid = (bid0 + ask0) / 2.0
-
     ret = mid.pct_change()
     retstd10_bps = (ret.rolling("10s").std() * 1e4).astype(float)
 
     return BookPrepared(df=df, churn10=churn10.astype(float), retstd10_bps=retstd10_bps)
+
+def safe_div(num, den, default=np.nan):
+    """
+    Division robuste num/den.
+    - si den <= 0, NaN, inf -> retourne default
+    - conserve index/shape (Series in -> Series out)
+    """
+    n = pd.to_numeric(num, errors="coerce")
+    d = pd.to_numeric(den, errors="coerce")
+
+    out = n / d
+    bad = (~np.isfinite(out)) | (~np.isfinite(d)) | (d <= 0)
+    if isinstance(out, pd.Series):
+        out = out.astype(float)
+        out[bad] = default
+        return out
+    # fallback numpy
+    out = np.asarray(out, dtype=float)
+    out[bad] = default
+    return out
 
 def prepare_trades_features(trades_full: pd.DataFrame) -> TradesPrepared:
     if trades_full is None or trades_full.empty or "is_aggr_buy" not in trades_full.columns:
         empty = pd.Series(dtype=float)
         return TradesPrepared(trades_full, empty, empty, empty, empty)
 
-    df = trades_full
-    if not df.index.is_monotonic_increasing:
-        df = df.sort_index()
+    df = trades_full.sort_index() if not trades_full.index.is_monotonic_increasing else trades_full
 
     qty = pd.to_numeric(df.get("qty"), errors="coerce").astype(float).fillna(0.0)
     is_buy = df["is_aggr_buy"].astype("boolean")
@@ -329,16 +483,14 @@ def prepare_trades_features(trades_full: pd.DataFrame) -> TradesPrepared:
     def r(window: str) -> pd.Series:
         buyw = buy_qty.rolling(window).sum()
         totw = qty.rolling(window).sum()
-        out = (buyw / totw).replace([np.inf, -np.inf], np.nan)
-        return out.astype(float)
+
+        # safe_div: si totw==0 (aucun trade dans la fenêtre), ratio neutre 0.5
+        out = safe_div(buyw, totw, default=0.5).astype(float)
+        return out.clip(lower=0.0, upper=1.0)
 
     return TradesPrepared(df=df, aggr3=r("3s"), aggr5=r("5s"), aggr10=r("10s"), aggr15=r("15s"))
 
 def _asof_values(series: pd.Series, t: pd.Series) -> np.ndarray:
-    """
-    Vectorized asof: for each t, return last series value where series.index <= t.
-    Works with tz-aware (UTC) and avoids datetime64[ns] casts.
-    """
     if series is None or series.empty or t is None or len(t) == 0:
         return np.full(len(t) if t is not None else 0, np.nan, dtype=float)
 
@@ -353,7 +505,7 @@ def _asof_values(series: pd.Series, t: pd.Series) -> np.ndarray:
     tv = tt.astype("int64").to_numpy()
     ok_t = ~tt.isna().to_numpy()
 
-    idx = s.index.asi8  # int64 ns
+    idx = s.index.asi8
     pos = np.searchsorted(idx, tv, side="right") - 1
 
     out = np.full(len(t), np.nan, dtype=float)
@@ -367,23 +519,23 @@ def _slope_batch(prices: np.ndarray, sizes: np.ndarray) -> np.ndarray:
     N, K = prices.shape
     out = np.full(N, np.nan, dtype=float)
     for i in range(N):
-        p = prices[i]
-        q = sizes[i]
+        p = prices[i]; q = sizes[i]
         ok = np.isfinite(p) & np.isfinite(q) & (q > 0)
         if ok.sum() < 2:
             continue
-        p2 = p[ok]
-        q2 = q[ok]
+        p2 = p[ok]; q2 = q[ok]
         x = np.cumsum(q2)
-        xm = x.mean()
-        pm = p2.mean()
+        xm = x.mean(); pm = p2.mean()
         den = np.sum((x - xm) ** 2)
         if den <= 0:
             continue
         out[i] = np.sum((x - xm) * (p2 - pm)) / den
     return out
 
-def build_book_features_batch(df_snap: pd.DataFrame) -> pd.DataFrame:
+# ------------------------------
+# Feature builder (sym + buy/sell columns)
+# ------------------------------
+def build_book_features_sym(df_snap: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df_snap.index)
 
     bid0 = pd.to_numeric(df_snap.get("bid_0_price"), errors="coerce").astype(float)
@@ -393,7 +545,6 @@ def build_book_features_batch(df_snap: pd.DataFrame) -> pd.DataFrame:
 
     mid = (bid0 + ask0) / 2.0
     out["mid_t"] = mid
-
     out["spread_bps_top"] = np.where(mid > 0, 1e4 * (ask0 - bid0) / mid, np.nan)
 
     den = (bsz0 + asz0)
@@ -414,9 +565,89 @@ def build_book_features_batch(df_snap: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+def _mat(merged: pd.DataFrame, prefix: str, field: str, K: int) -> np.ndarray:
+    cols = [f"{prefix}_{i}_{field}" for i in range(K)]
+    return np.vstack([
+        pd.to_numeric(merged.get(c), errors="coerce").astype(float).fillna(0.0).values
+        for c in cols
+    ]).T
+
+def _depth_within_bps(px_mat: np.ndarray, sz_mat: np.ndarray, mid: np.ndarray, bps: float) -> np.ndarray:
+    tol = (bps / 1e4) * mid
+    ok = np.isfinite(px_mat) & np.isfinite(mid[:, None]) & (np.abs(px_mat - mid[:, None]) <= tol[:, None])
+    return np.sum(np.where(ok, sz_mat, 0.0), axis=1)
+
+def enrich_side_columns(merged: pd.DataFrame, bf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convention wide (Point 5):
+      - Colonnes "sym" sans suffixe: mid_t, spread_bps_top, obi_*, microprice_bias, slopes bid/ask.
+      - Colonnes side-specific suffixées:
+          *_buy / *_sell  (valeurs définies sur "côté action")
+      - Colonnes signées side:
+          *_side_buy / *_side_sell (ex: +obi pour buy, -obi pour sell)
+    """
+    out = bf.copy()
+    mid = out["mid_t"].values.astype(float)
+
+    ask_sz_5  = _mat(merged, "ask", "size", 5)
+    bid_sz_5  = _mat(merged, "bid", "size", 5)
+    ask_sz_15 = _mat(merged, "ask", "size", 15)
+    bid_sz_15 = _mat(merged, "bid", "size", 15)
+
+    ask_px_15 = np.vstack([pd.to_numeric(merged.get(f"ask_{i}_price"), errors="coerce").astype(float).values for i in range(15)]).T
+    bid_px_15 = np.vstack([pd.to_numeric(merged.get(f"bid_{i}_price"), errors="coerce").astype(float).values for i in range(15)]).T
+
+    def wall_share(sz_mat: np.ndarray) -> np.ndarray:
+        tot = np.sum(sz_mat, axis=1)
+        mx = np.max(sz_mat, axis=1)
+        return np.where(tot > 0, mx / tot, np.nan)
+
+    out["wall_opp_share_5_buy"]   = wall_share(ask_sz_5)
+    out["wall_opp_share_5_sell"]  = wall_share(bid_sz_5)
+    out["wall_opp_share_15_buy"]  = wall_share(ask_sz_15)
+    out["wall_opp_share_15_sell"] = wall_share(bid_sz_15)
+
+    depth_ask_5bps  = _depth_within_bps(ask_px_15, ask_sz_15, mid, 5.0)
+    depth_ask_10bps = _depth_within_bps(ask_px_15, ask_sz_15, mid, 10.0)
+    depth_bid_5bps  = _depth_within_bps(bid_px_15, bid_sz_15, mid, 5.0)
+    depth_bid_10bps = _depth_within_bps(bid_px_15, bid_sz_15, mid, 10.0)
+
+    out["cum_depth_within_5bps_opp_buy"]   = depth_ask_5bps
+    out["cum_depth_within_10bps_opp_buy"]  = depth_ask_10bps
+    out["cum_depth_within_5bps_opp_sell"]  = depth_bid_5bps
+    out["cum_depth_within_10bps_opp_sell"] = depth_bid_10bps
+
+    bid_px_5 = np.vstack([pd.to_numeric(merged.get(f"bid_{i}_price"), errors="coerce").astype(float).values for i in range(5)]).T
+    ask_px_5 = np.vstack([pd.to_numeric(merged.get(f"ask_{i}_price"), errors="coerce").astype(float).values for i in range(5)]).T
+
+    slope_bid_5  = _slope_batch(bid_px_5, bid_sz_5)
+    slope_ask_5  = _slope_batch(ask_px_5, ask_sz_5)
+    slope_bid_15 = _slope_batch(bid_px_15, bid_sz_15)
+    slope_ask_15 = _slope_batch(ask_px_15, ask_sz_15)
+
+    out["slope_bid_5"] = slope_bid_5
+    out["slope_ask_5"] = slope_ask_5
+    out["slope_bid_15"] = slope_bid_15
+    out["slope_ask_15"] = slope_ask_15
+
+    out["slope_opp_5_buy"]   = slope_ask_5
+    out["slope_opp_5_sell"]  = slope_bid_5
+    out["slope_opp_15_buy"]  = slope_ask_15
+    out["slope_opp_15_sell"] = slope_bid_15
+
+    out["obi_5_side_buy"] = out["obi_5"]
+    out["obi_5_side_sell"] = -out["obi_5"]
+    out["obi_15_side_buy"] = out["obi_15"]
+    out["obi_15_side_sell"] = -out["obi_15"]
+
+    out["microprice_bias_side_buy"] = out["microprice_bias"]
+    out["microprice_bias_side_sell"] = -out["microprice_bias"]
+
+    return out
+
 
 # ------------------------------
-# Output sink
+# Output sinks (GO / DIR)
 # ------------------------------
 @dataclass
 class PartsSink:
@@ -432,41 +663,40 @@ class PartsSink:
     def write_df(self, df: pd.DataFrame):
         if df is None or df.empty:
             return
-        if "Y" in df.columns:
-            df["Y"] = pd.array(pd.to_numeric(df["Y"], errors="coerce"), dtype="Int8")
         part_path = f"{self.parts}/part-{self.k:05d}.parquet"
         write_parquet_s3(part_path, df, self.storage_options)
         self.k += 1
 
 
 # ------------------------------
-# Signals -> events
+# Signals -> base events (NO side duplication)
 # ------------------------------
 def parse_tfs_from_signals_columns(cols: List[str]) -> List[str]:
-    tfs = []
+    tfs = set()
     for c in cols:
-        if not c.startswith("y_"):
-            continue
-        tail = c[2:]
-        if tail.startswith("go_") or tail.startswith("dir_"):
-            continue
-        tfs.append(tail)
-    return sorted(list(set(tfs)), key=TF_SORT_KEY)
+        c = str(c)
+        if c.startswith("y_go_"):
+            tfs.add(c[len("y_go_"):])
+        elif c.startswith("y_dir_"):
+            tfs.add(c[len("y_dir_"):])
+        elif c.startswith("y_"):
+            tail = c[2:]
+            if not (tail.startswith("go_") or tail.startswith("dir_")):
+                tfs.add(tail)
+    return sorted(list(tfs), key=TF_SORT_KEY)
 
 def _col_or_default(df: pd.DataFrame, col: str, default, n: int) -> pd.Series:
     if col in df.columns:
         return df[col]
     return pd.Series([default] * n, index=df.index)
 
-def make_events_long_with_label_type(
-    sig: pd.DataFrame,
-    tfs: List[str],
-    label_types: List[str],
-    dir_include_neutral: bool,
-    legacy_single_row: bool,
-    include_zero_legacy: bool,
-) -> pd.DataFrame:
-    base_req = ["t", "symbol", "year", "bid_entry", "ask_entry", "spread_bps_entry", "atr_bps"]
+def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
+    """
+    1 ligne par (row_id, t, tf) avec y_go/y_dir/audits/entries.
+    NOTE (Point 1-2): PAS de event_id ici.
+    event_id sera construit plus tard: row_id|task|tf
+    """
+    base_req = ["row_id", "t", "symbol", "year", "bid_entry", "ask_entry", "spread_bps_entry", "atr_bps"]
     for c in base_req:
         if c not in sig.columns:
             raise ValueError(f"Signals missing required column: {c}")
@@ -474,96 +704,63 @@ def make_events_long_with_label_type(
     sig = sig.copy()
     sig["t"] = pd.to_datetime(sig["t"], utc=True, errors="coerce")
     sig = sig.dropna(subset=["t"])
+    if sig.empty:
+        return pd.DataFrame()
 
     rows = []
     for tf in tfs:
-        ycol = f"y_{tf}"
-        if ycol not in sig.columns:
-            continue
-
-        tmp = sig[[
-            "t","symbol","year",
+        cols_keep = [
+            "row_id","t","symbol","year",
             "bid_entry","ask_entry",
             "mid_entry" if "mid_entry" in sig.columns else "bid_entry",
             "spread_bps_entry","atr_bps"
-        ]].copy()
-
+        ]
+        tmp = sig[cols_keep].copy()
         if "mid_entry" not in sig.columns:
             tmp = tmp.rename(columns={"bid_entry": "mid_entry"})
 
-        tmp["tf"] = tf
-        tmp["y_raw"] = pd.to_numeric(sig[ycol], errors="coerce").fillna(0).astype("int8")
+        tmp["tf"] = str(tf).lower().strip()
 
+        ydir_col = f"y_dir_{tf}"
+        yleg_col = f"y_{tf}"
+        if ydir_col in sig.columns:
+            tmp["y_dir"] = pd.to_numeric(sig[ydir_col], errors="coerce").fillna(0).astype("int8")
+        elif yleg_col in sig.columns:
+            tmp["y_dir"] = pd.to_numeric(sig[yleg_col], errors="coerce").fillna(0).astype("int8")
+        else:
+            tmp["y_dir"] = np.int8(0)
+
+        ygo_col = f"y_go_{tf}"
+        if ygo_col in sig.columns:
+            tmp["y_go"] = pd.to_numeric(sig[ygo_col], errors="coerce").fillna(0).astype("int8")
+        else:
+            tmp["y_go"] = (tmp["y_dir"] != 0).astype("int8")
+        
         opt_fields = ["pnl_net_bps","exit_reason","tp_bps","sl_bps","rr_min","risk_r_bps","fill_mode","fill_window_sec"]
         for opt in opt_fields:
             copt = f"{opt}_{tf}"
+            outc = f"audit_{opt}"
             if copt in sig.columns:
-                tmp[f"audit_{opt}"] = sig[copt]
+                tmp[outc] = sig[copt]
+            elif opt in sig.columns:
+                # fallback non-suffixé (ex: fill_window_sec)
+                tmp[outc] = sig[opt]
 
-        if legacy_single_row:
-            tmp["label_type"] = "legacy"
-            tmp["task"] = "legacy_" + tf
-            tmp["Y"] = tmp["y_raw"].astype("int8")
-            tmp["side"] = np.where(tmp["Y"] == 1, "buy", np.where(tmp["Y"] == -1, "sell", "none"))
-            tmp["side_num"] = np.where(tmp["Y"] == 1, 1, np.where(tmp["Y"] == -1, -1, 0)).astype("int8")
-            tmp["entry"] = np.where(tmp["side_num"] == 1,
-                                    pd.to_numeric(tmp["bid_entry"], errors="coerce"),
-                                    np.where(tmp["side_num"] == -1,
-                                             pd.to_numeric(tmp["ask_entry"], errors="coerce"),
-                                             np.nan)).astype(float)
-            if not include_zero_legacy:
-                tmp = tmp[tmp["Y"] != 0]
-            rows.append(tmp)
-            continue
+        rows.append(tmp)
 
-        for lt in label_types:
-            if lt not in ("go", "dir"):
-                continue
-            if lt == "dir" and (not dir_include_neutral):
-                sub = tmp[tmp["y_raw"] != 0].copy()
-            else:
-                sub = tmp.copy()
-            if sub.empty:
-                continue
+    ev = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if ev.empty:
+        return ev
 
-            sub["label_type"] = lt
-            sub["task"] = sub["label_type"] + "_" + sub["tf"]
-
-            buy = sub.copy()
-            buy["side"] = "buy"
-            buy["side_num"] = np.int8(1)
-            buy["entry"] = pd.to_numeric(buy["bid_entry"], errors="coerce").astype(float)
-
-            sell = sub.copy()
-            sell["side"] = "sell"
-            sell["side_num"] = np.int8(-1)
-            sell["entry"] = pd.to_numeric(sell["ask_entry"], errors="coerce").astype(float)
-
-            buy["Y"]  = (buy["y_raw"] == 1).astype("int8")
-            sell["Y"] = (sell["y_raw"] == -1).astype("int8")
-
-            if "audit_pnl_net_bps" in sub.columns:
-                buy.loc[buy["Y"] != 1, "audit_pnl_net_bps"] = np.nan
-                sell.loc[sell["Y"] != 1, "audit_pnl_net_bps"] = np.nan
-            if "audit_exit_reason" in sub.columns:
-                buy.loc[buy["Y"] != 1, "audit_exit_reason"] = "NA"
-                sell.loc[sell["Y"] != 1, "audit_exit_reason"] = "NA"
-
-            rows.append(buy)
-            rows.append(sell)
-
-    if not rows:
-        return pd.DataFrame()
-
-    ev = pd.concat(rows, ignore_index=True)
     ev["symbol"] = ev["symbol"].astype(str)
     ev["year"] = pd.to_numeric(ev["year"], errors="coerce").fillna(-1).astype(int)
     ev["ym"] = ev["t"].dt.strftime("%Y-%m")
-    return ev.sort_values(["t","tf","label_type","side"]).reset_index(drop=True)
+    ev = ev.sort_values(["t","tf"]).reset_index(drop=True)
+    return ev
 
 
 # ------------------------------
-# Core processing (ultra perf bucket)
+# Core processing
 # ------------------------------
 def month_dir_from_root_tpl(root_tpl: str, symbol: str, year: int) -> str:
     p = root_tpl.replace("<SYMBOL>", symbol).replace("<YEAR>", str(year)).rstrip("/")
@@ -575,14 +772,11 @@ def process_symbol_year(
     signals_root: str,
     book_root_tpl: str,
     trades_root_tpl: str,
+    candle_root_tpl: str,
     out_root: str,
     split: str,
     tfs_keep: List[str],
     storage_options: dict,
-    label_types: List[str],
-    dir_include_neutral: bool,
-    legacy_single_row: bool,
-    include_zero_legacy: bool,
     bucket_freq: str,
     debug: bool,
 ) -> int:
@@ -608,20 +802,16 @@ def process_symbol_year(
         log(f"[{symbol} {year}] no TF found after filter -> skip")
         return 0
 
-    ev = make_events_long_with_label_type(
-        sig=sig,
-        tfs=found_tfs,
-        label_types=label_types,
-        dir_include_neutral=dir_include_neutral,
-        legacy_single_row=legacy_single_row,
-        include_zero_legacy=include_zero_legacy,
-    )
+    ev = make_events_base(sig=sig, tfs=found_tfs)
     if ev is None or ev.empty:
         log(f"[{symbol} {year}] events empty -> skip")
         return 0
 
-    out_year_dir = f"{out_root.rstrip('/')}/{split}/{symbol}/{year}"
-    sink = PartsSink(out_year_dir=out_year_dir, storage_options=storage_options)
+    out_go_year_dir  = f"{out_root.rstrip('/')}/{split}/go/{symbol}/{year}"
+    out_dir_year_dir = f"{out_root.rstrip('/')}/{split}/dir/{symbol}/{year}"
+    
+    sink_go  = PartsSink(out_year_dir=out_go_year_dir,  storage_options=storage_options)
+    sink_dir = PartsSink(out_year_dir=out_dir_year_dir, storage_options=storage_options)
 
     pafs = pa_filesystem(storage_options)
     book_dir = month_dir_from_root_tpl(book_root_tpl, symbol, year)
@@ -635,15 +825,19 @@ def process_symbol_year(
         bucket_delta = pd.Timedelta(hours=1)
 
     LOOKBACK = pd.Timedelta(seconds=60)
-    FORWARD = pd.Timedelta(seconds=180)
+    FORWARD  = pd.Timedelta(seconds=180)
 
-    total_written = 0
-    df_batch_parts: List[pd.DataFrame] = []
-    batch_rows_acc = 0
+    total_go_written = 0
+    total_dir_written = 0
+
+    df_go_parts: List[pd.DataFrame] = []
+    df_dir_parts: List[pd.DataFrame] = []
+    go_rows_acc = 0
+    dir_rows_acc = 0
 
     t_read_book = t_read_trades = t_prep = t_feat = t_write = 0.0
 
-    log(f"[{symbol} {year}] events={len(ev):,} tfs={found_tfs} label_types={label_types} out={out_year_dir} bucket={bucket_freq}")
+    log(f"[{symbol} {year}] base_events={len(ev):,} tfs={found_tfs} out_go={out_go_year_dir} out_dir={out_dir_year_dir} bucket={bucket_freq}")
 
     for ym, evm in ev.groupby("ym"):
         t_month0 = time.time()
@@ -661,10 +855,7 @@ def process_symbol_year(
 
         book_cache: OrderedDict[pd.Timestamp, BookPrepared] = OrderedDict()
         trades_cache: OrderedDict[pd.Timestamp, TradesPrepared] = OrderedDict()
-
-        book_hit = book_miss = 0
-        tr_hit = tr_miss = 0
-        skipped = 0
+        candle_cache: OrderedDict[pd.Timestamp, pd.DataFrame] = OrderedDict()
 
         book_cols = ["received_time", "seq", "spread_top"]
         for i in range(BOOK_LEVELS):
@@ -679,20 +870,13 @@ def process_symbol_year(
         if n_month == 0:
             continue
 
-        wrote_before_month = total_written
         log(f"[{symbol} {year} {ym}] START month events={n_month:,} book={book_path} trades={trades_path}")
 
-        t_last_heartbeat = time.time()
-        n_done = 0
-
         for bucket, evb in evm.groupby("bucket", sort=True):
-            n_done += len(evb)
-
             # --- book prep ---
             if bucket in book_cache:
                 book_prep = book_cache[bucket]
                 book_cache.move_to_end(bucket)
-                book_hit += 1
             else:
                 t0 = bucket - LOOKBACK
                 t1 = bucket + bucket_delta + FORWARD
@@ -702,9 +886,9 @@ def process_symbol_year(
                     book_full = read_book_window(book_dset, t0, t1, book_cols)
                 except Exception:
                     book_full = pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC"))
-                t_rb = time.time() - t_rb0
-                t_read_book += t_rb
+                t_read_book += (time.time() - t_rb0)
 
+                # Point (3): timing prep correct
                 t_p0 = time.time()
                 book_prep = prepare_book_features(book_full)
                 t_prep += (time.time() - t_p0)
@@ -712,20 +896,14 @@ def process_symbol_year(
                 if len(book_cache) >= MAX_BOOK_CACHE:
                     book_cache.popitem(last=False)
                 book_cache[bucket] = book_prep
-                book_miss += 1
-
-                if book_miss <= 3:
-                    log(f"[{symbol} {year} {ym}] book_miss#{book_miss} bucket={bucket} read_book={t_rb:.3f}s rows={len(book_full):,}")
 
             if book_prep.df is None or book_prep.df.empty:
-                skipped += len(evb)
                 continue
 
             # --- trades prep ---
             if bucket in trades_cache:
                 trades_prep = trades_cache[bucket]
                 trades_cache.move_to_end(bucket)
-                tr_hit += 1
             else:
                 t0_tr = bucket - LOOKBACK
                 t1_tr = bucket + bucket_delta + FORWARD
@@ -735,9 +913,9 @@ def process_symbol_year(
                     trades_full = read_trades_window(trades_dset, t0_tr, t1_tr)
                 except Exception:
                     trades_full = pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC"))
-                t_rt = time.time() - t_rt0
-                t_read_trades += t_rt
+                t_read_trades += (time.time() - t_rt0)
 
+                # Point (3): timing prep correct
                 t_p0 = time.time()
                 trades_prep = prepare_trades_features(trades_full)
                 t_prep += (time.time() - t_p0)
@@ -745,10 +923,6 @@ def process_symbol_year(
                 if len(trades_cache) >= MAX_TRADES_CACHE:
                     trades_cache.popitem(last=False)
                 trades_cache[bucket] = trades_prep
-                tr_miss += 1
-
-                if tr_miss <= 3:
-                    log(f"[{symbol} {year} {ym}] trades_miss#{tr_miss} bucket={bucket} read_trades={t_rt:.3f}s rows={len(trades_full):,}")
 
             # --- vectorized build for this bucket ---
             t_f0 = time.time()
@@ -759,11 +933,20 @@ def process_symbol_year(
 
             book_df = book_prep.df.reset_index().rename(columns={"timestamp": "book_ts"})
             book_df["book_ts"] = pd.to_datetime(book_df["book_ts"], utc=True, errors="coerce")
-            book_df = book_df.dropna(subset=["book_ts"]).sort_values("book_ts")
-            evb2 = evb2.sort_values("t")
+            book_df = book_df.dropna(subset=["book_ts"])
+
+            sort_cols = ["book_ts"]
+            if "seq" in book_df.columns:
+                sort_cols.append("seq")
+            if "received_time" in book_df.columns:
+                sort_cols.append("received_time")
+            book_df = book_df.sort_values(sort_cols, kind="mergesort")
+
+            if DEDUP_BOOK_TS:
+                book_df = book_df.drop_duplicates(subset=["book_ts"], keep="last")
 
             merged = pd.merge_asof(
-                evb2,
+                evb2.sort_values("t"),
                 book_df,
                 left_on="t",
                 right_on="book_ts",
@@ -771,27 +954,66 @@ def process_symbol_year(
                 allow_exact_matches=True,
             )
 
-            # --- staleness per tf (FIX v3.3.1: int64 ns, tz-safe) ---
+            # staleness per tf
             tf = merged["tf"].astype(str).str.lower().str.strip()
             max_stale_ns = tf.map(lambda x: int(MAX_STALE_BY_TF.get(x, pd.Timedelta(seconds=5)).to_timedelta64())).to_numpy()
 
             t_ns = pd.to_datetime(merged["t"], utc=True, errors="coerce").astype("int64").to_numpy()
             b_ns = pd.to_datetime(merged["book_ts"], utc=True, errors="coerce").astype("int64").to_numpy()
             dt_ns = t_ns - b_ns
-
             ok_stale = dt_ns <= max_stale_ns
 
             bid0 = pd.to_numeric(merged.get("bid_0_price"), errors="coerce").astype(float)
             ask0 = pd.to_numeric(merged.get("ask_0_price"), errors="coerce").astype(float)
-            ok_px = np.isfinite(bid0) & np.isfinite(ask0) & (bid0 > 0) & (ask0 > 0)
+            ok_px = np.isfinite(bid0) & np.isfinite(ask0) & (bid0 > 0) & (ask0 > 0) & (ask0 >= bid0)
 
             merged = merged[ok_stale & ok_px].copy()
             if merged.empty:
-                skipped += len(evb2)
                 t_feat += (time.time() - t_f0)
                 continue
 
-            bf = build_book_features_batch(merged)
+            # entry spread diagnostics
+            be = pd.to_numeric(merged.get("bid_entry"), errors="coerce")
+            ae = pd.to_numeric(merged.get("ask_entry"), errors="coerce")
+            mid_e = (be + ae) / 2.0
+            spread_entry_recalc = np.where(mid_e > 0, 1e4 * (ae - be) / mid_e, np.nan)
+
+            if RECALC_SPREAD_ENTRY:
+                merged["spread_bps_entry"] = spread_entry_recalc
+
+            # Point (4): debug checks (neg spread + mismatch)
+            if debug:
+                neg = np.isfinite(spread_entry_recalc) & (spread_entry_recalc < -1e-9)
+                if neg.any():
+                    ex = merged.loc[neg, ["t","tf","bid_entry","ask_entry","spread_bps_entry"]].head(LOG_NEG_SPREAD_MAX_EX)
+                    log(f"[{symbol} {year} {ym}] NEG_SPREAD_ENTRY n={int(neg.sum())} examples=\n{ex}")
+
+                sbe = pd.to_numeric(merged.get("spread_bps_entry"), errors="coerce")
+                mis = np.isfinite(sbe) & np.isfinite(spread_entry_recalc) & (np.abs(sbe - spread_entry_recalc) > 1e-6)
+                if mis.any():
+                    ex = merged.loc[mis, ["t","tf","bid_entry","ask_entry","spread_bps_entry"]].head(LOG_NEG_SPREAD_MAX_EX)
+                    log(f"[{symbol} {year} {ym}] SPREAD_ENTRY_MISMATCH n={int(mis.sum())} examples=\n{ex}")
+
+            # candles
+            candle_path = candle_path_from_tpl(candle_root_tpl, symbol, year)
+            if bucket in candle_cache:
+                candles_1m = candle_cache[bucket]
+                candle_cache.move_to_end(bucket)
+            else:
+                t0_c = bucket - CANDLE_LOOKBACK
+                t1_c = bucket + bucket_delta + CANDLE_FORWARD
+                try:
+                    candles_1m = read_candles_window(candle_path, pafs, t0_c, t1_c)
+                except Exception:
+                    candles_1m = pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))
+                if len(candle_cache) >= MAX_CANDLE_CACHE:
+                    candle_cache.popitem(last=False)
+                candle_cache[bucket] = candles_1m
+
+            merged = attach_candle_features(merged, candles_1m)
+
+            # === features ===
+            bf = build_book_features_sym(merged)
 
             bf["quote_churn_10s"] = _asof_values(book_prep.churn10, merged["t"])
             bf["ret_stdev_1s_10s_bps"] = _asof_values(book_prep.retstd10_bps, merged["t"])
@@ -807,87 +1029,51 @@ def process_symbol_year(
             bf["bt_dom_5s"] = agr5
             bf["bt_dom_10s"] = agr10
 
-            side = merged["side"].astype(str).values
-            mid = bf["mid_t"].values.astype(float)
+            bf = enrich_side_columns(merged, bf)
 
-            def mat(prefix, field, K):
-                cols = [f"{prefix}_{i}_{field}" for i in range(K)]
-                return np.vstack([
-                    pd.to_numeric(merged.get(c), errors="coerce").astype(float).fillna(0.0).values
-                    for c in cols
-                ]).T
+            # signed aggr for buy/sell (neutre => 0)
+            bf["aggr_ratio_10s_side_buy"]  = 2.0 * agr10 - 1.0
+            bf["aggr_ratio_10s_side_sell"] = -bf["aggr_ratio_10s_side_buy"]
 
-            ask_sz_5 = mat("ask", "size", 5)
-            bid_sz_5 = mat("bid", "size", 5)
-            ask_sz_15 = mat("ask", "size", 15)
-            bid_sz_15 = mat("bid", "size", 15)
+            bf["aggr_ratio_15s_side_buy"]  = 2.0 * agr15 - 1.0
+            bf["aggr_ratio_15s_side_sell"] = -bf["aggr_ratio_15s_side_buy"]
 
-            ask_px_15 = np.vstack([pd.to_numeric(merged.get(f"ask_{i}_price"), errors="coerce").astype(float).values for i in range(15)]).T
-            bid_px_15 = np.vstack([pd.to_numeric(merged.get(f"bid_{i}_price"), errors="coerce").astype(float).values for i in range(15)]).T
+            bf["bt_dom_3s_side_buy"]  = 2.0 * agr3 - 1.0
+            bf["bt_dom_3s_side_sell"] = -bf["bt_dom_3s_side_buy"]
 
-            def wall_share(sz_mat):
-                tot = np.sum(sz_mat, axis=1)
-                mx = np.max(sz_mat, axis=1)
-                return np.where(tot > 0, mx / tot, np.nan)
+            # ✅ AJOUT manquant (5s)
+            bf["bt_dom_5s_side_buy"]  = 2.0 * agr5 - 1.0
+            bf["bt_dom_5s_side_sell"] = -bf["bt_dom_5s_side_buy"]
 
-            is_buy = (side == "buy")
-            bf["wall_opp_share_5"] = np.where(is_buy, wall_share(ask_sz_5), wall_share(bid_sz_5))
-            bf["wall_opp_share_15"] = np.where(is_buy, wall_share(ask_sz_15), wall_share(bid_sz_15))
+            bf["bt_dom_10s_side_buy"]  = 2.0 * agr10 - 1.0
+            bf["bt_dom_10s_side_sell"] = -bf["bt_dom_10s_side_buy"]
 
-            def depth_within_bps(px_mat, sz_mat, mid, bps):
-                tol = (bps / 1e4) * mid
-                ok = np.isfinite(px_mat) & np.isfinite(mid[:, None]) & (np.abs(px_mat - mid[:, None]) <= tol[:, None])
-                return np.sum(np.where(ok, sz_mat, 0.0), axis=1)
-
-            depth_ask_5bps = depth_within_bps(ask_px_15, ask_sz_15, mid, 5.0)
-            depth_ask_10bps = depth_within_bps(ask_px_15, ask_sz_15, mid, 10.0)
-            depth_bid_5bps = depth_within_bps(bid_px_15, bid_sz_15, mid, 5.0)
-            depth_bid_10bps = depth_within_bps(bid_px_15, bid_sz_15, mid, 10.0)
-
-            bf["cum_depth_within_5bps_opp"] = np.where(is_buy, depth_ask_5bps, depth_bid_5bps)
-            bf["cum_depth_within_10bps_opp"] = np.where(is_buy, depth_ask_10bps, depth_bid_10bps)
-
-            bid_px_5 = np.vstack([pd.to_numeric(merged.get(f"bid_{i}_price"), errors="coerce").astype(float).values for i in range(5)]).T
-            ask_px_5 = np.vstack([pd.to_numeric(merged.get(f"ask_{i}_price"), errors="coerce").astype(float).values for i in range(5)]).T
-
-            bf["slope_bid_5"] = _slope_batch(bid_px_5, bid_sz_5)
-            bf["slope_ask_5"] = _slope_batch(ask_px_5, ask_sz_5)
-            bf["slope_bid_15"] = _slope_batch(bid_px_15, bid_sz_15)
-            bf["slope_ask_15"] = _slope_batch(ask_px_15, ask_sz_15)
-
-            side_num = pd.to_numeric(merged.get("side_num"), errors="coerce").fillna(0).astype(int).values
-            def SA(arr):
-                arr = arr.astype(float)
-                out = np.full_like(arr, np.nan, dtype=float)
-                ok = (side_num == 1) | (side_num == -1)
-                out[ok] = side_num[ok] * arr[ok]
-                return out
-
-            bf["obi_5_side"] = SA(bf["obi_5"].values.astype(float))
-            bf["obi_15_side"] = SA(bf["obi_15"].values.astype(float))
-            bf["microprice_bias_side"] = SA(bf["microprice_bias"].values.astype(float))
-            bf["aggr_ratio_10s_side"] = SA(np.where(np.isfinite(agr10), 2.0 * agr10 - 1.0, np.nan))
-            bf["aggr_ratio_15s_side"] = SA(np.where(np.isfinite(agr15), 2.0 * agr15 - 1.0, np.nan))
-            bf["bt_dom_3s_side"] = SA(np.where(np.isfinite(agr3), 2.0 * agr3 - 1.0, np.nan))
-            bf["bt_dom_10s_side"] = SA(np.where(np.isfinite(agr10), 2.0 * agr10 - 1.0, np.nan))
+            # candles cols
+            CANDLE_COLS = ["bb_width","bb_width_pctl","lf_bb_width_pct","atr_percentile","lf_atr_rank_30m","atr_pct_rank_30m","adx"]
+            for c in CANDLE_COLS:
+                bf[c] = pd.to_numeric(merged.get(c), errors="coerce").astype(float).values
 
             n = len(merged)
-            out_df = pd.DataFrame({
+
+            # Point (1-2): NO event_id from upstream; we build later with task/tf
+            base_out = pd.DataFrame({
                 "t": merged["t"].values,
                 "symbol": merged["symbol"].astype(str).values,
+                "row_id": merged["row_id"].astype(str).values,
                 "year": pd.to_numeric(merged["year"], errors="coerce").fillna(-1).astype(int).values,
-                "tf": merged["tf"].astype(str).values,
-                "label_type": merged["label_type"].astype(str).values,
-                "task": merged.get("task", "NA").astype(str).values,
-                "y_raw": pd.to_numeric(merged["y_raw"], errors="coerce").fillna(0).astype(int).values,
-                "side": merged["side"].astype(str).values,
-                "side_num": side_num,
-                "entry": pd.to_numeric(merged["entry"], errors="coerce").astype(float).values,
+                "tf": merged["tf"].astype(str).str.lower().str.strip().values,
+
+                # labels bruts (stage3 fera Y)
+                "y_go": pd.to_numeric(merged["y_go"], errors="coerce").fillna(0).astype(int).values,
+                "y_dir": pd.to_numeric(merged["y_dir"], errors="coerce").fillna(0).astype(int).values,
+
+                # core entry/meta
                 "bid_entry": pd.to_numeric(merged["bid_entry"], errors="coerce").astype(float).values,
                 "ask_entry": pd.to_numeric(merged["ask_entry"], errors="coerce").astype(float).values,
                 "spread_bps_entry": pd.to_numeric(merged["spread_bps_entry"], errors="coerce").astype(float).values,
-                "atr_bps": pd.to_numeric(merged["atr_bps"], errors="coerce").astype(float).values,
-                "Y": pd.to_numeric(merged["Y"], errors="coerce").fillna(0).astype(int).values,
+                "atr_bps": pd.to_numeric(merged["atr_bps"], errors="coerce").fillna(0.0).astype(float).values,
+
+                # audits (optional)
                 "audit_pnl_net_bps": pd.to_numeric(_col_or_default(merged, "audit_pnl_net_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_exit_reason": _col_or_default(merged, "audit_exit_reason", "NA", n).astype(str).values,
                 "audit_tp_bps": pd.to_numeric(_col_or_default(merged, "audit_tp_bps", np.nan, n), errors="coerce").astype(float).values,
@@ -898,69 +1084,105 @@ def process_symbol_year(
                 "audit_fill_window_sec": pd.to_numeric(_col_or_default(merged, "audit_fill_window_sec", np.nan, n), errors="coerce").astype(float).values,
             })
 
-            out_df = pd.concat([out_df, bf.reset_index(drop=True)], axis=1)
+            out_all = pd.concat([base_out.reset_index(drop=True), bf.reset_index(drop=True)], axis=1)
 
-            df_batch_parts.append(out_df)
-            batch_rows_acc += len(out_df)
-            total_written += len(out_df)
+            # Point (6): DIR drop neutral — keep only y_dir ∈ {-1,+1}
+            out_go = out_all.copy()
+            out_dir = out_all[out_all["y_dir"].isin([-1, 1])].copy()
+
+            # Point (1-2): set task + event_id = row_id|task|tf (bretelles)
+            if not out_go.empty:
+                out_go["task"] = "go"
+                out_go["event_id"] = out_go["row_id"].astype(str) + "|go|" + out_go["tf"].astype(str)
+
+            if not out_dir.empty:
+                out_dir["task"] = "dir"
+                out_dir["event_id"] = out_dir["row_id"].astype(str) + "|dir|" + out_dir["tf"].astype(str)
+
+            if debug and (not out_go.empty) and out_go["event_id"].duplicated().any():
+                raise ValueError(
+                    f"duplicate event_id in GO: "
+                    f"{out_go.loc[out_go['event_id'].duplicated(), 'event_id'].head(5).tolist()}"
+                )
+
+            if debug and (not out_dir.empty) and out_dir["event_id"].duplicated().any():
+                raise ValueError(
+                    f"duplicate event_id in DIR: "
+                    f"{out_dir.loc[out_dir['event_id'].duplicated(), 'event_id'].head(5).tolist()}"
+                )
+
+            # Point (5) guardrails: ensure no ambiguous columns like "..._side" without buy/sell
+            if debug:
+                bad_side_cols = [c for c in out_all.columns if c.endswith("_side")]
+                if bad_side_cols:
+                    log(f"[WARN] ambiguous *_side columns (expected *_side_buy/_side_sell): {bad_side_cols[:20]}")
+
+            if debug:
+                log(f"[{symbol} {year} {ym}] out_go rows={len(out_go):,} out_dir rows={len(out_dir):,} dir_rate={(len(out_dir)/max(1,len(out_go))):.2%}")
+
+            if not out_go.empty:
+                df_go_parts.append(out_go)
+                go_rows_acc += len(out_go)
+                total_go_written += len(out_go)
+
+            if not out_dir.empty:
+                df_dir_parts.append(out_dir)
+                dir_rows_acc += len(out_dir)
+                total_dir_written += len(out_dir)
 
             t_feat += (time.time() - t_f0)
 
-            if batch_rows_acc >= BATCH_MAX:
+            # flush batches
+            if go_rows_acc >= BATCH_MAX:
                 t_w0 = time.time()
-                sink.write_df(pd.concat(df_batch_parts, ignore_index=True))
+                sink_go.write_df(pd.concat(df_go_parts, ignore_index=True))
                 t_write += (time.time() - t_w0)
-                df_batch_parts.clear()
-                batch_rows_acc = 0
+                df_go_parts.clear()
+                go_rows_acc = 0
                 gc.collect()
 
-            now = time.time()
-            if now - t_last_heartbeat > 30:
-                log(
-                    f"[{symbol} {year} {ym}] heartbeat done={n_done:,}/{n_month:,} "
-                    f"wrote_month={(total_written - wrote_before_month):,} wrote_total={total_written:,} skipped={skipped:,} | "
-                    f"book hit/miss={book_hit}/{book_miss} trades hit/miss={tr_hit}/{tr_miss} | "
-                    f"timing(s): read_book={t_read_book:.1f} read_trades={t_read_trades:.1f} prep={t_prep:.1f} feat={t_feat:.1f} write={t_write:.1f}"
-                )
-                t_last_heartbeat = now
+            if dir_rows_acc >= BATCH_MAX:
+                t_w0 = time.time()
+                sink_dir.write_df(pd.concat(df_dir_parts, ignore_index=True))
+                t_write += (time.time() - t_w0)
+                df_dir_parts.clear()
+                dir_rows_acc = 0
+                gc.collect()
 
-        if df_batch_parts:
+        # end month: flush remainders
+        if df_go_parts:
             t_w0 = time.time()
-            sink.write_df(pd.concat(df_batch_parts, ignore_index=True))
+            sink_go.write_df(pd.concat(df_go_parts, ignore_index=True))
             t_write += (time.time() - t_w0)
-            df_batch_parts.clear()
-            batch_rows_acc = 0
+            df_go_parts.clear()
+            go_rows_acc = 0
+
+        if df_dir_parts:
+            t_w0 = time.time()
+            sink_dir.write_df(pd.concat(df_dir_parts, ignore_index=True))
+            t_write += (time.time() - t_w0)
+            df_dir_parts.clear()
+            dir_rows_acc = 0
 
         dtm = time.time() - t_month0
-        wrote_month = total_written - wrote_before_month
-        rate = (n_month / dtm) if dtm > 0 else 0.0
-        log(
-            f"[{symbol} {year} {ym}] DONE month events={n_month:,} wrote_month={wrote_month:,} "
-            f"wrote_total={total_written:,} skipped={skipped:,} time={dtm:.1f}s rate={rate:.1f} ev/s | "
-            f"book hit/miss={book_hit}/{book_miss} trades hit/miss={tr_hit}/{tr_miss}"
-        )
-
-    if df_batch_parts:
-        t_w0 = time.time()
-        sink.write_df(pd.concat(df_batch_parts, ignore_index=True))
-        t_write += (time.time() - t_w0)
-        df_batch_parts.clear()
+        log(f"[{symbol} {year} {ym}] DONE month time={dtm:.1f}s wrote_go={total_go_written:,} wrote_dir={total_dir_written:,}")
 
     dt = time.time() - t_global0
     log(
-        f"[{symbol} {year}] DONE rows_written={total_written:,} total_time={dt:.1f}s (~{(total_written/dt if dt>0 else 0):.1f} rows/s) | "
+        f"[{symbol} {year}] DONE wrote_go={total_go_written:,} wrote_dir={total_dir_written:,} total_time={dt:.1f}s | "
         f"timing_total(s): read_book={t_read_book:.1f} read_trades={t_read_trades:.1f} prep={t_prep:.1f} feat={t_feat:.1f} write={t_write:.1f}"
     )
-    return total_written
+    return int(total_go_written + total_dir_written)
 
 
 # ------------------------------
 # CLI
 # ------------------------------
 def parse_args():
-    p = argparse.ArgumentParser("Stage2 v3.3 — perf+logs fixed (v3.3.1 patched)")
+    p = argparse.ArgumentParser("Stage2 v4.1 — dual outputs (go/dir), no Y — GO wide + DIR wide")
 
     p.add_argument("--signals-root", default="s3://tradebot-config-tokyo/data/stage1")
+    p.add_argument("--candle-root", default="s3://tradebot-config-tokyo/data/bougie/<SYMBOL>/<SYMBOL>-1m-<YEAR>.parquet")
     p.add_argument("--book-root", default="s3://tradebot-config-tokyo/data/book/<SYMBOL>/<YEAR>-*.parquet")
     p.add_argument("--trades-root", default="s3://tradebot-config-tokyo/data/trade/<SYMBOL>/<YEAR>-*.parquet")
     p.add_argument("--out-root", default="s3://tradebot-config-tokyo/data/stage2")
@@ -974,12 +1196,6 @@ def parse_args():
     p.add_argument("--s3-region", default="ap-northeast-1")
     p.add_argument("--s3-anon", action="store_true")
 
-    p.add_argument("--label-types", nargs="+", default=["go","dir"], choices=["go","dir"])
-    p.add_argument("--dir-include-neutral", action="store_true")
-
-    p.add_argument("--legacy-single-row", action="store_true")
-    p.add_argument("--include-zero", action="store_true")
-
     p.add_argument("--bucket", default="1h", help="Cache bucket size, e.g. 1h (default), 30min, 15min, 5min")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
@@ -992,11 +1208,6 @@ def main():
     if args.tfs:
         tfs_keep = [str(x).strip().lower() for x in args.tfs if str(x).strip()]
 
-    label_types = [str(x).strip().lower() for x in (args.label_types or [])]
-    label_types = [x for x in label_types if x in ("go","dir")]
-    if not label_types and not args.legacy_single_row:
-        label_types = ["go","dir"]
-
     for sym in args.symbols:
         for year in args.years:
             n = process_symbol_year(
@@ -1005,18 +1216,15 @@ def main():
                 signals_root=args.signals_root,
                 book_root_tpl=args.book_root,
                 trades_root_tpl=args.trades_root,
+                candle_root_tpl=args.candle_root,
                 out_root=args.out_root,
                 split=args.split,
                 tfs_keep=tfs_keep,
                 storage_options=storage_options,
-                label_types=label_types,
-                dir_include_neutral=bool(args.dir_include_neutral),
-                legacy_single_row=bool(args.legacy_single_row),
-                include_zero_legacy=bool(args.include_zero),
                 bucket_freq=str(args.bucket),
-                debug=args.debug,
+                debug=bool(args.debug),
             )
-            log(f"[DONE] {sym} {year} rows_written={n} split={args.split}")
+            log(f"[DONE] {sym} {year} rows_written(go+dir)={n} split={args.split}")
 
 if __name__ == "__main__":
     main()

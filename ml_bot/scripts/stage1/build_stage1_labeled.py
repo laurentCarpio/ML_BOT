@@ -48,6 +48,7 @@ import platform
 import pyarrow.parquet as pq
 import pyarrow as pa
 import pyarrow.fs as pafs
+import hashlib
 
 
 # ============================================================
@@ -83,6 +84,15 @@ RR_MIN_MAP: Dict[str, float] = {
 # ============================================================
 # Logging / utils
 # ============================================================
+def _row_id(symbol: str, t_iso: str, side_key: str = "both") -> str:
+    """
+    ID stable (déterministe) pour aligner stage2/stage3/stage4 sans dépendre de l'ordre.
+    - symbol: ex "BTCUSDT"
+    - t_iso: ex "2025-01-01T00:00:00Z" (tu l'as déjà)
+    - side_key: doit rester IDENTIQUE pour GO+DIR. Par défaut "both".
+    """
+    key = f"{symbol}|{t_iso}|{side_key}".encode("utf-8")
+    return hashlib.blake2b(key, digest_size=16).hexdigest()  # 32 hex chars
 
 def _log(logger, msg: str):
     logger.info(msg)
@@ -301,6 +311,12 @@ def _read_book_l1_resampled_5s(
             df["ask0"] = pd.to_numeric(df["ask0"], errors="coerce")
             df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["bid0", "ask0"])
 
+            # Drop crossed / invalid quotes (ask < bid) BEFORE mid/spread
+            bad = (df["bid0"] <= 0) | (df["ask0"] <= 0) | (df["ask0"] < df["bid0"])
+            if bad.any():
+                # option: log a few counts occasionally (or per file)
+                # _log(logger, f"book[5s] dropped crossed/invalid: {int(bad.sum())}/{len(df)}")
+                df = df[~bad]
             if df.empty:
                 continue
 
@@ -550,6 +566,10 @@ def process_symbol_year(
 
     out["t"] = out.index.map(lambda x: pd.Timestamp(x).isoformat().replace("+00:00", "Z"))
     out["symbol"] = symbol
+
+    # row_id stable pour alignement cross-stages (GO + DIR)
+    out["row_id"] = [_row_id(symbol, t, side_key="both") for t in out["t"].tolist()]
+
     out["year"] = int(year)
     out["symbol_id"] = int(_symbol_id(symbol))
 
@@ -789,7 +809,7 @@ def process_symbol_year(
     # WRITE CSV
     # -------------------------
     base_cols = [
-        "t","symbol","year","symbol_id",
+        "row_id","t","symbol","year","symbol_id",
         "bid_entry","ask_entry","mid_entry",
         "spread_bps_entry","atr_bps",
         "fee_exit_bps","entry_spread_half_bps",

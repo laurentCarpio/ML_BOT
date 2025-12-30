@@ -1,4 +1,4 @@
-# ml_bot/scripts/sageMaker/grid_search_xgb_short.py
+# ml_bot/scripts/stage4/grid_search_xgb_short.py
 import os, json, time, tarfile, tempfile, io, sys, traceback
 from itertools import product
 from pathlib import Path
@@ -20,11 +20,20 @@ REGION    = "ap-northeast-1"
 ROLE_ARN  = "arn:aws:iam::174175447862:role/AmazonSageMaker-ExecutionRole"
 
 # ✅ version de dataset (changeable en un seul endroit)
-VERSION = "v51"
+VERSION = "go-v1"  # ou ce que tu veux
+DATA_ROOT     = "s3://tradebot-config-tokyo/data/stage3/go"
+MODEL_BASE_S3 = f"s3://tradebot-config-tokyo/models/xgb-{VERSION}"
 
-# ✅ dataset v50, short-only
-DATA_ROOT       = f"s3://tradebot-config-tokyo/data/stage3/{VERSION}-short"
-MODEL_BASE_S3   = f"s3://tradebot-config-tokyo/models/xgb-{VERSION}-short"
+# ========= PATHS =========
+TRN_DIR = f"{DATA_ROOT}/train"
+VAL_DIR = f"{DATA_ROOT}/val"
+TST_DIR = f"{DATA_ROOT}/test"
+
+TRW_DIR = f"{DATA_ROOT}/train_weight"
+VAW_DIR = f"{DATA_ROOT}/val_weight"
+TSW_DIR = f"{DATA_ROOT}/test_weight"
+
+META_DIR= f"{DATA_ROOT}/_meta"
 
 #######   python ml_bot/scripts/sageMaker/grid_search_xgb_short.py
 
@@ -50,14 +59,6 @@ HP_BASE.update(dict(
     gamma=0.0,
 ))
 
-
-# ========= PATHS =========
-TRN_DIR = f"{DATA_ROOT}/train"
-VAL_DIR = f"{DATA_ROOT}/validation"
-TRW_DIR = f"{DATA_ROOT}/train_weight"
-VAW_DIR = f"{DATA_ROOT}/validation_weight"
-META_DIR= f"{DATA_ROOT}/_meta"
-
 # ========= IMAGE =========
 XGB_IMAGE = image_uri_retrieve("xgboost", REGION, version="1.7-1")
 
@@ -71,7 +72,7 @@ def _grid_dicts(grid: dict):
         yield {k: v for k, v in zip(keys, vals)}
 
 def _hps_tag(hps: dict):
-    keys = ["scale_pos_weight","max_depth","min_child_weight","max_delta_step",
+    keys = ["max_depth","min_child_weight","max_delta_step",
             "reg_lambda","reg_alpha","gamma","subsample","colsample_bytree"]
     return ",".join([f"{k}={hps[k]}" for k in keys if k in hps])
 
@@ -79,7 +80,6 @@ def _merge_hps(base: dict, overlay: dict):
     h = base.copy()
     h.update(overlay)
     # cast sûrs pour l’estimator
-    h["scale_pos_weight"] = float(h["scale_pos_weight"])
     h["max_depth"]        = int(h["max_depth"])
     h["min_child_weight"] = int(h["min_child_weight"])
     h["max_delta_step"]   = int(h["max_delta_step"])
@@ -126,22 +126,13 @@ def _require_csv_prefix(fs: s3fs.S3FileSystem, prefix: str, label: str):
         raise FileNotFoundError(f"[DATA MISSING] Aucun CSV sous {prefix}/part-*.csv ({label})")
     return paths
 
-def read_scale_pos_weight_from_meta():
-    fs = s3fs.S3FileSystem()
-    meta_path = f"{META_DIR}/train_pos_weight.json"
-    try:
-        with fs.open(meta_path, "rb") as f:
-            return float(json.load(f)["pos_weight"])
-    except Exception:
-        return None
-
 def make_channels():
     return {
-        "train": TrainingInput(TRN_DIR, content_type="text/csv", input_mode="File"),
-        "train_weight": TrainingInput(TRW_DIR, content_type="text/csv", input_mode="File"),
-        "validation": TrainingInput(VAL_DIR, content_type="text/csv", input_mode="File"),
-        "validation_weight": TrainingInput(VAW_DIR, content_type="text/csv", input_mode="File"),
-        "meta": TrainingInput(META_DIR, content_type="application/x-directory", input_mode="File"),
+    "train": TrainingInput(TRN_DIR, content_type="text/csv", input_mode="File"),
+    "train_weight": TrainingInput(TRW_DIR, content_type="text/csv", input_mode="File"),
+    "validation": TrainingInput(VAL_DIR, content_type="text/csv", input_mode="File"),
+    "validation_weight": TrainingInput(VAW_DIR, content_type="text/csv", input_mode="File"),
+    "meta": TrainingInput(META_DIR, content_type="application/x-directory", input_mode="File"),
     }
 
 def submit_job(hps: dict, session: sagemaker.Session) -> Estimator:
@@ -164,14 +155,14 @@ def submit_job(hps: dict, session: sagemaker.Session) -> Estimator:
         max_wait=MAX_WAIT_SEC if SPOT else None,
         entry_point=ENTRY,
         source_dir=str(SRC_DIR),
-        base_job_name="xgb-short",
+        base_job_name="xgb-go",
         tags=[
             {"Key": "project", "Value": "ml_bot"},
-            {"Key": "stage",   "Value": "stage3-xgb-shortonly"},
-            {"Key": "side",    "Value": "short"},
+            {"Key": "stage",   "Value": "stage4-xgb-go"},
+            {"Key": "side",    "Value": "go"},
         ],
     )
-    job_name = f"xgb-short-{time.strftime('%Y%m%d-%H%M%S')}"
+    job_name = f"xgb-go-{time.strftime('%Y%m%d-%H%M%S')}"
     print("Submitting job:", job_name, "| hps:", hps)
     est.fit(make_channels(), job_name=job_name, logs=True)
     return est
@@ -287,39 +278,32 @@ def main():
     # === sessions ===
     sess = sagemaker.Session(boto3.Session(region_name=REGION))
     s3c  = _boto3_client("s3", REGION)
-
-    # === meta pos_weight ===
-    SPW0 = float(read_scale_pos_weight_from_meta() or 24.0)
-    spw_grid = sorted({round(SPW0 * r, 1) for r in (0.9, 1.0, 1.1)})
-    print(f"[meta] scale_pos_weight par défaut: {SPW0} | grille: {spw_grid}")
     
     # GRID pour passe structurelle
     GRID = {
-        "scale_pos_weight": spw_grid,        # lu depuis meta ou fallback
-        "max_depth":        [7],
-        "min_child_weight": [2],
-        "max_delta_step":   [2],             # <-- structurelle : 2
-        "reg_lambda":       [1.0, 2.0],
-        "reg_alpha":        [0.5],           # <-- structurelle : 0.5
-        "gamma":            [0.0],
+        "max_depth":        [4, 6],
+        "min_child_weight": [1, 3],
+        "gamma":            [0.0, 0.5],
         "subsample":        [0.8],
         "colsample_bytree": [0.8],
-    }
+        "reg_lambda":       [1.0, 2.0],
+        "reg_alpha":        [0.0, 0.2],
+        "max_delta_step":   [0, 1],   # GO: pas forcément 2
+        }
 
     # === Run prioritaire (ancre "structure anti-FP" pour short-only) ===
     PRIORITY_COMBOS = [
         dict(
-            scale_pos_weight=SPW0,  # lu depuis DATA_ROOT/_meta/train_pos_weight.json
-            max_depth=7,
-            min_child_weight=2,
-            max_delta_step=2,       # 👈 anti-FP
+            max_depth=6,
+            min_child_weight=3,
+            max_delta_step=1,
             reg_lambda=1.0,
-            reg_alpha=0.5,          # 👈 L1 pour sparsifier/discipliner
+            reg_alpha=0.2,
             gamma=0.0,
             subsample=0.8,
             colsample_bytree=0.8,
         ),
-    ]
+        ]
 
     # === combos ===
     all_grid_dicts = list(_grid_dicts(GRID))
@@ -467,7 +451,7 @@ def main():
         # 1) lire un sample du train pour connaitre la largeur (Y + side_num + features)
         sample_df = _load_csv_dir(fs, TRN_DIR)
         ncols = sample_df.shape[1]
-        expected_feat = max(ncols - 2, 0)  # on suppose [Y, side_num, f0..]
+        expected_feat = max(ncols - 1, 0)  # [Y, f0..]
 
         # 2) essayer de récupérer les noms de features depuis columns.json
         features = []
@@ -492,16 +476,16 @@ def main():
         # 3) construire l'URI de release et du manifest
         #    ex: s3://tradebot-config-tokyo/models/xgb/releases/short-20251120-v45/manifest.json
         RELEASE_BASE = "s3://tradebot-config-tokyo/models/xgb/releases"
-        release_name = f"short-{stamp}-{VERSION}"
+        release_name = f"go-{stamp}-{VERSION}"
         manifest_uri = f"{RELEASE_BASE}/{release_name}/manifest.json"
 
         scaler_stats_uri = f"{META_DIR}/scaler_stats.json"
 
         manifest = {
             "model_uri": best["model_uri"],
-            "version": f"{VERSION}-short",
+            "version": f"{VERSION}-go",
             "timestamp": stamp,
-            "side": "short",
+            "side": "go",
             "data_root": DATA_ROOT,
 
             "metrics": {
@@ -527,7 +511,7 @@ def main():
             "data_contract": {
                 # contrat attendu par infer_xgb.py
                 "label_col": "Y",
-                "drop_cols": ["side_num"],
+                "drop_cols": [],
                 "features": features,
                 # stage3 a déjà fait la normalisation -> on n’en refait pas
                 "scaler_stats_uri": scaler_stats_uri,
@@ -557,41 +541,32 @@ def evaluate_split(model_uri, prefix_features, prefix_weights):
 def _make_thr_json_from_reports(rpt_df: pd.DataFrame, thr_df: pd.DataFrame,
                                 auprc_floor: float = 0.10):
     """
-    Construit le mapping seuils par poche et filtre les poches faibles.
-
-    - rpt_df : colonnes au moins ["tf", "side_num", "AUPRC"]
-    - thr_df : colonnes au moins ["tf", "side_num", "thr_f1"]
+    GO: seuils par tf uniquement.
+    rpt_df : colonnes ["tf","AUPRC"]
+    thr_df : colonnes ["tf","thr_f1"]
     """
-    # 1) filtrer les poches avec AUPRC >= floor
-    mask = rpt_df["AUPRC"] >= auprc_floor
-    sub = rpt_df.loc[mask, ["tf", "side_num"]].copy()
+    ok_tfs = set(rpt_df.loc[rpt_df["AUPRC"] >= auprc_floor, "tf"].astype(str).tolist())
 
-    # 2) construire explicitement une Series de clés "tf|side"
-    sub["key"] = sub["tf"].astype(str) + "|" + sub["side_num"].astype(int).astype(str)
-    ok_keys = set(sub["key"].to_list())
-
-    # 3) construire la map { "tf|side" : thr_f1 }
     thr_map = {}
     for _, row in thr_df.iterrows():
-        key = f"{row['tf']}|{int(row['side_num'])}"
-        if key in ok_keys:
-            thr_map[key] = float(row["thr_f1"])
+        tf = str(row["tf"])
+        if tf in ok_tfs:
+            thr_map[tf] = float(row["thr_f1"])
 
-    return thr_map, ok_keys
+    return thr_map, ok_tfs
 
 def eval_test_and_breakdown(best_model_uri: str):
     fs = s3fs.S3FileSystem()
     TEST_DIR = f"{DATA_ROOT}/test"
     TSTW_DIR = f"{DATA_ROOT}/test_weight"
 
-    # 1️⃣ — Évalue globalement
+    # 1) Éval global
     y, yhat, w = evaluate_split(best_model_uri, TEST_DIR, TSTW_DIR)
-    from sklearn.metrics import average_precision_score
     auprc = float(average_precision_score(y, yhat, sample_weight=w)
                   if w is not None else average_precision_score(y, yhat))
     print(f"[TEST] AUPRC={auprc:.5f} (global)")
 
-    # 2️⃣ — Breakdown (AUPRC par tf × side)
+    # 2) Lire meta parquet test pour récupérer tf (pas de side_num)
     meta_tf = f"{DATA_ROOT}/_meta/splits_parquet/test"
     tables = []
     for p in fs.glob(meta_tf.replace("s3://", "") + "/*.parquet"):
@@ -599,10 +574,12 @@ def eval_test_and_breakdown(best_model_uri: str):
             import pyarrow.parquet as pq
             tables.append(pq.read_table(f))
     mdf = pd.concat([t.to_pandas() for t in tables], ignore_index=True)
+
+    # ⚠️ Assure-toi que mdf est dans le même ordre que les CSV stage3 test.
+    # (si ton pipeline garantit l’ordre, OK ; sinon il faut une clé d’alignement)
     mdf = mdf.assign(y=y, yhat=yhat)
 
     def _summ(g):
-        from sklearn.metrics import average_precision_score
         return pd.Series({
             "n": len(g),
             "pos": int(g["y"].sum()),
@@ -610,17 +587,16 @@ def eval_test_and_breakdown(best_model_uri: str):
             "AUPRC": float(average_precision_score(g["y"], g["yhat"]))
         })
 
-    rpt = (mdf.groupby(["tf", "side_num"], as_index=False)
+    rpt = (mdf.groupby(["tf"], as_index=False)
              .apply(_summ, include_groups=False)
              .reset_index(drop=True))
 
-    print("\n[TEST] breakdown par (tf, side_num):")
+    print("\n[TEST] breakdown par tf:")
     print(rpt.sort_values("AUPRC", ascending=False).to_string(index=False))
 
-    # 3️⃣ — Calcul des seuils F1 par poche
-    from sklearn.metrics import precision_recall_curve, f1_score
+    # 3) Seuil F1 par tf
     thr_rows = []
-    for (tf, side_num), g in mdf.groupby(["tf", "side_num"]):
+    for tf, g in mdf.groupby(["tf"]):
         P, R, thr = precision_recall_curve(g["y"], g["yhat"])
         f1s = 2 * P * R / np.maximum(P + R, 1e-12)
         if np.all(~np.isfinite(f1s)):
@@ -632,29 +608,23 @@ def eval_test_and_breakdown(best_model_uri: str):
             best_thr = float(thr[-1]) if len(thr) > 0 else 0.5
         else:
             best_thr = float(thr[best_idx - 1])
-        f1 = float(f1s[best_idx])
-        thr_rows.append(dict(tf=tf, side_num=int(side_num),
-                             thr_f1=best_thr, F1=f1))
+        thr_rows.append(dict(tf=str(tf), thr_f1=best_thr, F1=float(f1s[best_idx])))
 
     thr_df = pd.DataFrame(thr_rows)
-    print("\n[TEST] seuils par poche (F1-max):")
+    print("\n[TEST] seuils par tf (F1-max):")
     print(thr_df.sort_values("F1", ascending=False).to_string(index=False))
 
-    # 4️⃣ — Construire le JSON de seuils et le pousser sur S3
-    thr_map, ok_keys = _make_thr_json_from_reports(
-        rpt, thr_df, auprc_floor=0.10
-    )
+    # 4) JSON seuils
+    thr_map, ok_tfs = _make_thr_json_from_reports(rpt, thr_df, auprc_floor=0.10)
 
     payload = {
         "model_uri": best_model_uri,
         "created_at": int(time.time()),
         "policy": {"auprc_floor": 0.10, "criterion": "thr_f1"},
-        "enabled_pockets": sorted(list(ok_keys)),
-        "thresholds": thr_map,
+        "enabled_tfs": sorted(list(ok_tfs)),
+        "thresholds": thr_map,   # { "15m": 0.42, "30m": 0.37, ... }
     }
 
-    out_uri = (
-        f"{MODEL_BASE_S3}/deploy/thresholds_{int(time.time())}.json"
-    )
+    out_uri = f"{MODEL_BASE_S3}/deploy/thresholds_{int(time.time())}.json"
     _s3_put_bytes(_boto3_client("s3", REGION), out_uri, _json_dumps_safe(payload))
     print(f"[deploy] thresholds map écrit: {out_uri}")
