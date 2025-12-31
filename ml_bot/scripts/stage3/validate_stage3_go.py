@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-# validate_stage3_go.py — Validation des CSV Stage3_GO (no header)
+# validate_stage3_go.py — Validation des CSV Stage3_GO (no header) — streaming + parity checks
 #
 # Stage3_GO format:
-#   - X shards: [Y] + features (no side_num)
+#   - X shards: [is_tradeable] + features (no header)
 #   - splits: train / val / test
-#   - weights: train_weight / val_weight / test_weight
+#   - ids: train_ids / val_ids / test_ids  (row_id,event_id)
+#   - weights: train_weight / val_weight / test_weight (single col)
 # Meta:
 #   - _meta/columns.json (features + label)
 #   - _meta/scaler_stats.json (robust params per tf/feature)
 #   - _meta/train_class_balance.json (pos/neg + pos_weight_raw)
-#
+
 from __future__ import annotations
 
-import argparse, json, io, sys, math
+import argparse, json, io, sys, math, re
 from typing import Optional, Dict, List, Tuple
 
 import numpy as np
@@ -23,25 +24,18 @@ import pyarrow.fs as pafs
 # Z-score: listes de contrôle
 # =============================
 
-# Colonnes qu'on ne check PAS en z-score strict (si tu en ajoutes plus tard)
 Z_IGNORE_EXACT = {"microprice_bias"}
 
-# Si une feature a une variance trop faible, le check Z-score strict n’a pas de sens.
-LOW_VAR_STD_FLOOR = 0.05   # seuil sur std global (après scaling Stage3)
-LOW_VAR_FEATURES = {
-    "microprice_bias",
-}
+LOW_VAR_STD_FLOOR = 0.05
+LOW_VAR_FEATURES = {"microprice_bias"}
 
 def _is_mask_col(name: str) -> bool:
     return name.endswith("_isnan") or name.endswith("_mask") or name.endswith("_flag")
 
-# Features pour lesquelles on accepte des stats Z plus "relax"
 HEAVY_TAIL_RELAXED = {
     "ret_stdev_1s_10s_bps",
     "quote_churn_10s",
     "spread_bps_entry",
-    "wall_opp_share_5",
-    "wall_opp_share_15",
     "bb_width",
     "adx",
     "atr_percentile",
@@ -50,20 +44,26 @@ HEAVY_TAIL_RELAXED = {
     "bt_dom_5s",
     "bt_dom_10s",
     "lf_bb_width_pct",
-
-    # Ajouts: slopes (drift pooled fréquent) → RELAX
     "slope_bid_5",
     "slope_ask_5",
     "slope_bid_15",
     "slope_ask_15",
-
-    # Optionnel (vu dans tes logs OOS): OBI peut bouger un peu → RELAX
     "obi_5",
     "obi_15",
+    "wall_opp_share_5_buy",
+    "wall_opp_share_5_sell",
+    "wall_opp_share_15_buy",
+    "wall_opp_share_15_sell",
+    "slope_opp_5_buy",
+    "slope_opp_5_sell",
+    "slope_opp_15_buy",
+    "slope_opp_15_sell",
+    "bt_dom_3s_side_buy",
+    "bt_dom_3s_side_sell",
 }
 
 # =============================
-# Helpers classes (online stats)
+# Online stats
 # =============================
 
 class ColStats:
@@ -107,71 +107,53 @@ def _strip_s3(uri: str) -> str:
     assert uri.startswith("s3://"), "Only s3:// supported"
     return uri[len("s3://"):]
 
-def _list_csv_files(fs: pafs.S3FileSystem, dir_s3: str, max_files: int, exclude_weight: bool = True) -> List[str]:
-    sel = pafs.FileSelector(_strip_s3(dir_s3), recursive=True)
+_PART_RE = re.compile(r"part-(\d+)\.csv$", re.IGNORECASE)
+
+def _extract_part_num(path_s3: str) -> Optional[int]:
+    m = _PART_RE.search(path_s3)
+    return int(m.group(1)) if m else None
+
+def _list_all_csv_files_flat(fs: pafs.S3FileSystem, dir_s3: str) -> List[str]:
+    sel = pafs.FileSelector(_strip_s3(dir_s3), recursive=False)
     out = []
     for info in fs.get_file_info(sel):
-        if not info.is_file:
-            continue
-        if not info.path.lower().endswith(".csv"):
-            continue
-        path = "s3://" + info.path
-        if exclude_weight and (
-            "/train_weight/" in path or "/val_weight/" in path or "/test_weight/" in path
-            or "/train_ids/" in path or "/val_ids/" in path or "/test_ids/" in path
-        ):
-            continue
-        out.append(path)
-        if len(out) >= max_files:
-            break
+        if info.is_file and info.path.lower().endswith(".csv"):
+            out.append("s3://" + info.path)
     return sorted(out)
 
-def _read_csv_chunks(fs: pafs.S3FileSystem, path_s3: str, chunksize: int):
-    with fs.open_input_stream(_strip_s3(path_s3)) as f:
-        bio = io.BytesIO(f.read())
-    for chunk in pd.read_csv(bio, header=None, dtype=np.float64, chunksize=chunksize):
-        yield chunk
+def _read_csv_chunks_numeric(fs: pafs.S3FileSystem, path_s3: str, chunksize: int):
+    # streaming: no BytesIO(f.read())
+    with fs.open_input_stream(_strip_s3(path_s3)) as fbin:
+        ftxt = io.TextIOWrapper(fbin, encoding="utf-8", newline="")
+        for chunk in pd.read_csv(ftxt, header=None, dtype=np.float64, chunksize=chunksize):
+            yield chunk
 
-def _maybe_list_dir(fs: pafs.S3FileSystem, dir_s3: str) -> Optional[list[str]]:
-    try:
-        sel = pafs.FileSelector(_strip_s3(dir_s3), recursive=False)
-        files = ["s3://" + info.path for info in fs.get_file_info(sel)
-                 if info.is_file and info.path.lower().endswith(".csv")]
-        return sorted(files) if files else None
-    except Exception:
-        return None
+def _read_csv_chunks_str(fs: pafs.S3FileSystem, path_s3: str, chunksize: int):
+    with fs.open_input_stream(_strip_s3(path_s3)) as fbin:
+        ftxt = io.TextIOWrapper(fbin, encoding="utf-8", newline="")
+        for chunk in pd.read_csv(ftxt, header=None, dtype=str, chunksize=chunksize):
+            yield chunk
 
 # =============================
-# Meta loader (GO)
+# Meta loader
 # =============================
 
 def _load_meta(fs, root: str):
-    """
-    columns.json Stage3_GO:
-      {
-        "task": "go",
-        "label": "is_tradeable",
-        "features": [...],
-        ...
-      }
-    """
     columns_json_path = f"{root.rstrip('/')}/_meta/columns.json"
     with fs.open_input_stream(_strip_s3(columns_json_path)) as f:
         meta = json.loads(f.read().decode("utf-8"))
 
     features = meta.get("features")
-    label = meta.get("label", "Y")
+    label = meta.get("label", "is_tradeable")
 
     if not isinstance(features, list) or len(features) == 0:
         raise RuntimeError("columns.json invalide: 'features' doit être une liste non vide.")
 
-    # ✅ on accepte le nouveau label
     if label not in ("Y", "is_tradeable"):
         raise RuntimeError(f"columns.json invalide: label inattendu '{label}' (attendu 'Y' ou 'is_tradeable').")
 
     col_names = [label] + features
 
-    # train_class_balance.json (optionnel)
     bal_path = f"{root.rstrip('/')}/_meta/train_class_balance.json"
     balance = None
     try:
@@ -196,7 +178,6 @@ def _check_scaler_stats(fs, root: str, features: list[str]) -> int:
         print("⚠️ scaler_stats.json mal formé (pas de colonnes tf/feature).")
         return 0
 
-    # Ici Stage3_GO n'embarque pas tf dans les CSV, donc on vérifie la présence globale des features.
     missing_any = [f for f in features if f not in set(df["feature"].unique())]
     if missing_any:
         print(f"⛔ features sans stats de scaling: {missing_any}")
@@ -210,19 +191,24 @@ def _check_scaler_stats(fs, root: str, features: list[str]) -> int:
 # =============================
 
 def parse_args():
-    ap = argparse.ArgumentParser("Validate Stage3_GO CSV shards (no header) — aligned with Stage3_GO format.")
+    ap = argparse.ArgumentParser("Validate Stage3_GO CSV shards (no header) — streaming + shard parity.")
     ap.add_argument("--root", default="s3://tradebot-config-tokyo/data/stage3/go")
     ap.add_argument("--split", default="all", choices=["all","train","val","test"])
     ap.add_argument("--aws-region", default="ap-northeast-1")
-    ap.add_argument("--max-files", type=int, default=50)
+
+    ap.add_argument("--max-files", type=int, default=50, help="Nombre max de parts à scanner par split (pour vitesse).")
     ap.add_argument("--chunksize", type=int, default=500_000)
 
-    # Seuils pooled (si le scaling donne un mode ~Z)
     ap.add_argument("--mean-tol", type=float, default=0.12)
     ap.add_argument("--std-low", type=float, default=0.75)
     ap.add_argument("--std-high", type=float, default=1.30)
 
     ap.add_argument("--check-weights", action="store_true", default=True)
+    ap.add_argument("--check-ids", action="store_true", default=True)
+
+    ap.add_argument("--require-parity", action="store_true", default=True,
+                    help="Fail si mismatch parts/rows entre X / ids / weights (sur les fichiers scannés).")
+
     ap.add_argument("--fail-on-strong", action="store_true",
                     help="Échec si anomalies STRICT sur TRAIN en Z-MODE.")
     return ap.parse_args()
@@ -231,81 +217,168 @@ def parse_args():
 # Split runner
 # =============================
 
+def _ignore_for_zscore(name: str) -> bool:
+    if name in Z_IGNORE_EXACT:
+        return True
+    if _is_mask_col(name):
+        return True
+    return False
+
+def _drift_score(row, mean_tol: float, std_low: float, std_high: float) -> float:
+    """
+    Score simple pour trier les dérives OOS :
+    - pénalise mean trop loin
+    - pénalise std trop bas/haut
+    """
+    m = abs(float(row["mean"]))
+    s = float(row["std"])
+    score = 0.0
+    if m > mean_tol:
+        score += (m - mean_tol)
+    if s < std_low:
+        score += (std_low - s)
+    if s > std_high:
+        score += (s - std_high)
+    return score
+
+def _print_table(df: pd.DataFrame, title: str, top_k: int = 25):
+    if df.empty:
+        return
+    print(f"\n{title}")
+    if len(df) > top_k:
+        df = df.head(top_k)
+    print(df.to_string(index=False))
+
 def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, features: List[str]):
-    print("\n" + "="*80)
+    print("\n" + "="*90)
     print(f"🔎 Split: {split}")
-    print("="*80)
+    print("="*90)
 
     label_name = col_names[0]
+    n_expected_cols = len(col_names)
 
-    split_dir = f"{root.rstrip('/')}/{split}"
-    files = _list_csv_files(fs, split_dir, args.max_files, exclude_weight=True)
-    if not files:
-        print("⛔ Aucun fichier CSV trouvé sous", split_dir)
+    # ----- list X parts -----
+    x_dir = f"{root.rstrip('/')}/{split}"
+    x_files_all = _list_all_csv_files_flat(fs, x_dir)
+    if not x_files_all:
+        print("⛔ Aucun fichier CSV trouvé sous", x_dir)
         return 2
-    print(f"[scan] {len(files)} files under {split_dir}")
 
+    x_files = x_files_all[:args.max_files]
+    x_parts = { _extract_part_num(p): p for p in x_files if _extract_part_num(p) is not None }
+    print(f"[X] found {len(x_files_all)} file(s) total, scanning {len(x_files)}")
+    if len(x_parts) == 0:
+        print("⛔ Aucun fichier part-xxxxx.csv reconnu dans", x_dir)
+        return 2
+
+    # ----- list IDS/WEIGHTS parts -----
+    ids_parts = {}
+    w_parts = {}
+
+    if args.check_ids:
+        ids_dir = f"{root.rstrip('/')}/{split}_ids"
+        ids_files_all = _list_all_csv_files_flat(fs, ids_dir)
+        ids_files = ids_files_all[:args.max_files] if ids_files_all else []
+        ids_parts = { _extract_part_num(p): p for p in ids_files if _extract_part_num(p) is not None }
+        print(f"[IDS] found {len(ids_files_all)} file(s) total, scanning {len(ids_files)}")
+
+    if args.check_weights:
+        w_dir = f"{root.rstrip('/')}/{split}_weight"
+        w_files_all = _list_all_csv_files_flat(fs, w_dir)
+        w_files = w_files_all[:args.max_files] if w_files_all else []
+        w_parts = { _extract_part_num(p): p for p in w_files if _extract_part_num(p) is not None }
+        print(f"[W] found {len(w_files_all)} file(s) total, scanning {len(w_files)}")
+
+    # ----- parity on part numbers (scanned subset) -----
+    scanned_parts = sorted([p for p in x_parts.keys() if p is not None])
+
+    if args.require_parity:
+        if args.check_ids:
+            missing_ids = [p for p in scanned_parts if p not in ids_parts]
+            if missing_ids:
+                print(f"⛔ Missing IDS parts for: {missing_ids[:20]} ... (count={len(missing_ids)})")
+                return 2
+        if args.check_weights:
+            missing_w = [p for p in scanned_parts if p not in w_parts]
+            if missing_w:
+                print(f"⛔ Missing WEIGHT parts for: {missing_w[:20]} ... (count={len(missing_w)})")
+                return 2
+
+    # ----- scan X + compute stats -----
     total_rows = 0
     label_counts: Dict[int, int] = {}
     col_stats: Dict[int, ColStats] = {}
     ncols_seen = None
 
-    # Scan
-    for path in files:
-        for chunk in _read_csv_chunks(fs, path, chunksize=args.chunksize):
+    per_part_rows: Dict[int, int] = {}
+
+    for part in scanned_parts:
+        x_path = x_parts[part]
+        part_rows = 0
+
+        for chunk in _read_csv_chunks_numeric(fs, x_path, chunksize=args.chunksize):
             if chunk.shape[0] == 0:
                 continue
 
             if ncols_seen is None:
                 ncols_seen = chunk.shape[1]
-                if ncols_seen != len(col_names):
-                    print(f"⛔ nb colonnes CSV ({ncols_seen}) ≠ nb colonnes meta ({len(col_names)}).")
+                if ncols_seen != n_expected_cols:
+                    print(f"⛔ nb colonnes CSV ({ncols_seen}) ≠ nb colonnes meta ({n_expected_cols}).")
+                    print(f"   -> meta = [label]+features = {n_expected_cols} cols")
                     return 2
                 print(f"[shape] detected {ncols_seen} columns (matches meta)")
 
-            total_rows += len(chunk)
+            if chunk.shape[1] != n_expected_cols:
+                print(f"⛔ {x_path}: nb colonnes inattendu: {chunk.shape[1]} (attendu {n_expected_cols})")
+                return 2
 
-            # Label
-            y = pd.to_numeric(chunk.iloc[:,0], errors="coerce").fillna(-1).astype("int64").to_numpy()
-            vals, cnts = np.unique(y, return_counts=True)
+            total_rows += len(chunk)
+            part_rows += len(chunk)
+
+            # Label strict: only 0/1
+            y = pd.to_numeric(chunk.iloc[:,0], errors="coerce")
+            if y.isna().any():
+                print(f"⛔ {x_path}: label NaN détecté (chunk).")
+                return 2
+            yi = y.astype("int64").to_numpy()
+            bad = ~np.isin(yi, [0, 1])
+            if bad.any():
+                ex = yi[bad][:10]
+                print(f"⛔ {x_path}: label hors {{0,1}} détecté. Exemples: {ex.tolist()}")
+                return 2
+
+            vals, cnts = np.unique(yi, return_counts=True)
             for v, c in zip(vals, cnts):
                 label_counts[int(v)] = label_counts.get(int(v), 0) + int(c)
 
             # Stats globales par colonne
-            for j in range(chunk.shape[1]):
+            for j in range(n_expected_cols):
                 if j not in col_stats:
                     col_stats[j] = ColStats()
-                col_stats[j].update(
-                    pd.to_numeric(chunk.iloc[:,j], errors="coerce").to_numpy(dtype=np.float64)
-                )
+                col_stats[j].update(chunk.iloc[:,j].to_numpy(dtype=np.float64, copy=False))
+
+        per_part_rows[part] = part_rows
 
     print(f"\n[rows] total scanned: {total_rows:,}")
     if total_rows == 0:
         print("⛔ Aucun enregistrement lu.")
         return 2
 
+    # ----- label balance -----
     print(f"\nℹ️ Label balance ({label_name}):")
     total_lbl = sum(label_counts.values())
     for k in sorted(label_counts.keys()):
         r = label_counts[k] / max(total_lbl, 1)
-        print(f"label={k}: count={label_counts[k]:,} ratio={r:.4f}")
+        print(f"label={k}: count={label_counts[k]:,} ratio={r:.6f}")
 
-    # train class balance
     if split == "train":
         pos = int(label_counts.get(1, 0))
         neg = int(label_counts.get(0, 0))
         spw = (float(neg) / float(pos)) if pos > 0 else float("nan")
         print(f"[train] pos={pos:,} neg={neg:,} scale_pos_weight≈{spw:.6g}")
 
-    def _ignore_for_zscore(name: str) -> bool:
-        if name in Z_IGNORE_EXACT:
-            return True
-        if _is_mask_col(name):
-            return True
-        return False
-
-    ncols_seen = len(col_names)
-    feat_idx = [i for i in range(1, ncols_seen) if not _ignore_for_zscore(col_names[i])]
+    # ----- pooled feature stats -----
+    feat_idx = [i for i in range(1, n_expected_cols) if not _ignore_for_zscore(col_names[i])]
 
     def _finalize(indices: List[int]) -> pd.DataFrame:
         rows = []
@@ -320,10 +393,10 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
     feat_stats = _finalize(feat_idx)
 
-    print("\nGLOBAL feature stats (%s): pooled checks (auto Z-MODE detect)." % split)
-    print(feat_stats.head(120).to_string(index=False))
+    print("\nGLOBAL feature stats (pooled):")
+    print(feat_stats.head(140).to_string(index=False))
 
-    # ===== Auto-détection du mode de scaling (Z-MODE vs WIDE-MODE) =====
+    # ----- auto-detect z-mode vs wide-mode -----
     means = feat_stats["mean"].abs().to_numpy()
     stds  = feat_stats["std"].to_numpy()
     n     = max(len(stds), 1)
@@ -349,11 +422,20 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             if _ignore_for_zscore(col):
                 continue
 
-            # Low-variance: pas de check STRICT (ça n'a pas de sens en "z-mode")
+            # low-variance => pas de check strict
             if (col in LOW_VAR_FEATURES) or (std < LOW_VAR_STD_FLOOR):
-                # info-only: si mean est énorme malgré std tiny, on peut le signaler
                 continue
 
+            # side_* => drift fréquent => relax (warnings)
+            if col.endswith("_side_buy") or col.endswith("_side_sell"):
+                relax_mean_tol = max(args.mean_tol, 0.6)
+                relax_std_low  = min(args.std_low, 0.35)
+                relax_std_high = max(args.std_high, 3.5)
+                if (abs(mean) > relax_mean_tol) or (std < relax_std_low) or (std > relax_std_high):
+                    relaxed_rows.append(row)
+                continue
+
+            # heavy-tail/regime-sensitive => relax (warnings)
             if col in HEAVY_TAIL_RELAXED:
                 relax_mean_tol = max(args.mean_tol, 0.5)
                 relax_std_low  = min(args.std_low, 0.4)
@@ -362,18 +444,32 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                     relaxed_rows.append(row)
                 continue
 
+            # STRICT candidates
             if (abs(mean) > args.mean_tol) or (std < args.std_low) or (std > args.std_high):
                 strict_rows.append(row)
 
+        # --------------------------
+        # Split-aware reporting:
+        # - TRAIN: strict_rows => STRICT (can fail with --fail-on-strong)
+        # - VAL/TEST: strict_rows => DRIFT report only (never fail)
+        # --------------------------
         if strict_rows:
-            strict_bad = pd.DataFrame(strict_rows).reset_index(drop=True)
-            print("\n⚠️ anomalies STRICT (Z-MODE):")
-            print(strict_bad.to_string(index=False))
+            df_strict = pd.DataFrame(strict_rows).reset_index(drop=True)
+
+            if split == "train":
+                strict_bad = df_strict
+                _print_table(strict_bad, "\n⚠️ anomalies STRICT (TRAIN, Z-MODE):", top_k=200)
+            else:
+                df_drift = df_strict.copy()
+                df_drift["drift_score"] = df_drift.apply(
+                    lambda r: _drift_score(r, args.mean_tol, args.std_low, args.std_high), axis=1
+                )
+                df_drift = df_drift.sort_values("drift_score", ascending=False)
+                _print_table(df_drift, f"\nℹ️ DRIFT (OOS={split}, ex-STRICT Z-check):", top_k=35)
 
         if relaxed_rows:
             relaxed_bad = pd.DataFrame(relaxed_rows).reset_index(drop=True)
-            print("\nℹ️ anomalies RELAX (heavy-tail): warnings only")
-            print(relaxed_bad.to_string(index=False))
+            _print_table(relaxed_bad, "\nℹ️ anomalies RELAX (warnings only):", top_k=200)
 
     else:
         print("\nℹ️ WIDE-MODE: pas de checks Z stricts (informatif).")
@@ -383,86 +479,108 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         print(f"\n⚠️ low-variance features (std < {LOW_VAR_STD_FLOOR}):")
         print(qconst.to_string(index=False))
 
-    # ===== Weights validation =====
+    # =========================
+    # Weights validation (per-part parity)
+    # =========================
     if args.check_weights:
-        w_dir = f"{root.rstrip('/')}/{split}_weight"
-        w_files = _maybe_list_dir(fs, w_dir)
-        if not w_files:
-            print(f"\n[weights] {split}: aucun shard trouvé sous {w_dir} (OK si tu ne les as pas écrits).")
+        if not w_parts:
+            print(f"\n[weights] {split}: aucun shard trouvé (OK si tu ne les as pas écrits).")
         else:
-            print(f"\n[weights] {split}: {len(w_files)} fichiers détectés sous {w_dir}")
             w_stats = ColStats()
             total_w_rows = 0
-            for p in w_files[:args.max_files]:
-                for chunk in _read_csv_chunks(fs, p, chunksize=args.chunksize):
+            per_w_rows: Dict[int,int] = {}
+
+            for part in scanned_parts:
+                wp = w_parts.get(part)
+                if wp is None:
+                    continue
+                pr = 0
+                for chunk in _read_csv_chunks_numeric(fs, wp, chunksize=args.chunksize):
                     if chunk.shape[1] != 1:
-                        print(f"⚠️ {p} : attendu 1 colonne de poids, trouvé {chunk.shape[1]}")
-                    w = pd.to_numeric(chunk.iloc[:,0], errors="coerce").to_numpy(dtype=np.float64)
+                        print(f"⛔ {wp}: attendu 1 colonne de poids, trouvé {chunk.shape[1]}")
+                        return 2
+                    w = chunk.iloc[:,0].to_numpy(dtype=np.float64, copy=False)
                     w_stats.update(w)
+                    pr += len(w)
                     total_w_rows += len(w)
+                per_w_rows[part] = pr
 
             w_mean, w_std = w_stats.finalize()
-            print(f"[weights] rows={total_w_rows:,} | mean={w_mean:.4f} std={w_std:.4f} "
+            print(f"\n[weights] rows={total_w_rows:,} | mean={w_mean:.4f} std={w_std:.4f} "
                   f"min={w_stats.minv:.4f} max={w_stats.maxv:.4f} "
                   f"nan={w_stats.nan_count} +inf={w_stats.posinf} -inf={w_stats.neginf}")
+
+            if w_stats.minv < 0:
+                print("⛔ weights négatifs détectés.")
+                return 2
 
             if split == "train":
                 if not (0.95 <= w_mean <= 1.05):
                     print("⚠️ TRAIN: mean(weight) attendu ≈1 (±5%).")
-                if not (w_stats.minv >= 0.0):
-                    print("⚠️ TRAIN: weight doit être ≥ 0.")
             else:
-                # val/test -> weights sont ones => mean≈1
                 if not (0.95 <= w_mean <= 1.05):
                     print("⚠️ OOS: mean(weight) attendu ≈1 (val/test = ones).")
-                if not (w_stats.minv >= 0.0):
-                    print("⚠️ OOS: weight doit être ≥ 0.")
 
-            if total_rows and total_w_rows:
-                delta = abs(total_rows - total_w_rows)
-                if delta == 0:
-                    print(f"[weights] parité lignes OK (X={total_rows:,}, W={total_w_rows:,}).")
-                else:
-                    print(f"⚠️ mismatch lignes X({total_rows:,}) vs W({total_w_rows:,}) (max-files={args.max_files}).")
+            if args.require_parity:
+                bad = []
+                for part in scanned_parts:
+                    xr = per_part_rows.get(part, 0)
+                    wr = per_w_rows.get(part, 0)
+                    if xr != wr:
+                        bad.append((part, xr, wr))
+                if bad:
+                    print("\n⛔ Parité X vs W cassée sur parts (part, X_rows, W_rows):")
+                    print(bad[:20])
+                    return 2
+                print("[weights] parité X/W OK (par part).")
 
-    # ===== IDs validation =====
-    ids_dir = f"{root.rstrip('/')}/{split}_ids"
-    ids_files = _maybe_list_dir(fs, ids_dir)
-    if not ids_files:
-        print(f"\n[ids] {split}: aucun shard trouvé sous {ids_dir} (⛔ attendu si Stage3 écrit les ids).")
-    else:
-        print(f"\n[ids] {split}: {len(ids_files)} fichiers détectés sous {ids_dir}")
-        total_ids_rows = 0
-        bad_shape = 0
-        empty_id = 0
-
-        for p in ids_files[:args.max_files]:
-            with fs.open_input_stream(_strip_s3(p)) as f:
-                bio = io.BytesIO(f.read())
-
-            for chunk in pd.read_csv(bio, header=None, dtype=str, chunksize=args.chunksize):
-                if chunk.shape[1] != 2:
-                    bad_shape += 1
-                    continue
-                total_ids_rows += len(chunk)
-
-                # check non-empty (soft)
-                a = chunk.iloc[:,0].fillna("").astype(str)
-                b = chunk.iloc[:,1].fillna("").astype(str)
-                empty_id += int((a.str.len() == 0).sum() + (b.str.len() == 0).sum())
-
-        if bad_shape:
-            print(f"⛔ IDs: {bad_shape} chunk(s) avec shape != 2 colonnes.")
+    # =========================
+    # IDs validation (per-part parity)
+    # =========================
+    if args.check_ids:
+        if not ids_parts:
+            print(f"\n[ids] {split}: aucun shard trouvé (⛔ attendu si Stage3 écrit les ids).")
             return 2
+        else:
+            total_ids_rows = 0
+            per_ids_rows: Dict[int,int] = {}
+            empty_fields = 0
+            bad_shape = 0
 
-        print(f"[ids] rows={total_ids_rows:,} | empty_fields={empty_id:,}")
+            for part in scanned_parts:
+                ip = ids_parts.get(part)
+                if ip is None:
+                    continue
+                pr = 0
+                for chunk in _read_csv_chunks_str(fs, ip, chunksize=args.chunksize):
+                    if chunk.shape[1] != 2:
+                        bad_shape += 1
+                        continue
+                    a = chunk.iloc[:,0].fillna("").astype(str)
+                    b = chunk.iloc[:,1].fillna("").astype(str)
+                    empty_fields += int((a.str.len() == 0).sum() + (b.str.len() == 0).sum())
+                    pr += len(chunk)
+                    total_ids_rows += len(chunk)
+                per_ids_rows[part] = pr
 
-        if total_rows and total_ids_rows:
-            delta = abs(total_rows - total_ids_rows)
-            if delta == 0:
-                print(f"[ids] parité lignes OK (X={total_rows:,}, IDS={total_ids_rows:,}).")
-            else:
-                print(f"⚠️ mismatch lignes X({total_rows:,}) vs IDS({total_ids_rows:,}) (max-files={args.max_files}).")
+            if bad_shape:
+                print(f"⛔ IDs: {bad_shape} chunk(s) avec shape != 2 colonnes.")
+                return 2
+
+            print(f"\n[ids] rows={total_ids_rows:,} | empty_fields={empty_fields:,}")
+
+            if args.require_parity:
+                bad = []
+                for part in scanned_parts:
+                    xr = per_part_rows.get(part, 0)
+                    ir = per_ids_rows.get(part, 0)
+                    if xr != ir:
+                        bad.append((part, xr, ir))
+                if bad:
+                    print("\n⛔ Parité X vs IDS cassée sur parts (part, X_rows, IDS_rows):")
+                    print(bad[:20])
+                    return 2
+                print("[ids] parité X/IDS OK (par part).")
 
     if args.fail_on_strong and split == "train" and is_z_mode and (not strict_bad.empty):
         print("\n⛔ strong anomalies detected on STRICT Z-features, failing run:")
@@ -480,7 +598,6 @@ def main():
     args = parse_args()
     fs = _fs(args.aws_region)
 
-    # meta
     try:
         col_names, features, balance, label_name = _load_meta(fs, args.root)
     except Exception as e:
@@ -493,10 +610,9 @@ def main():
             print(f"[meta] train_class_balance: pos={balance.get('pos')} neg={balance.get('neg')} posw_raw={balance.get('scale_pos_weight_raw')}")
         except Exception:
             pass
-    
     print(f"[meta] label = {label_name}")
+    print(f"[meta] n_features = {len(features)} ; n_cols_expected = {len(col_names)}")
 
-    # sécurité: features interdites
     FORBID = {"THRESH_BPS","pnl_net_max_bps","pnl_net_min_bps"}
     forbid_found = sorted(FORBID & set(features))
     if forbid_found:

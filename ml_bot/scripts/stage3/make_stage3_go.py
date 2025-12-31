@@ -73,6 +73,8 @@ GO_FEATURES = [
     "aggr_ratio_15s_side_sell",
     "bt_dom_3s_side_buy",
     "bt_dom_3s_side_sell",
+    "bt_dom_5s_side_buy",
+    "bt_dom_5s_side_sell",
     "bt_dom_10s_side_buy",
     "bt_dom_10s_side_sell",
 
@@ -118,6 +120,7 @@ AGGR_BT_COLS = [
     "aggr_ratio_10s_side_buy","aggr_ratio_10s_side_sell",
     "aggr_ratio_15s_side_buy","aggr_ratio_15s_side_sell",
     "bt_dom_3s_side_buy","bt_dom_3s_side_sell",
+    "bt_dom_5s_side_buy","bt_dom_5s_side_sell",
     "bt_dom_10s_side_buy","bt_dom_10s_side_sell",
 ]
 
@@ -427,9 +430,8 @@ def _iter_x_ids_y_from_split(
     batch_size: int,
     stats: Optional[dict] = None,
 ):
-    # include audit + aggr/bt cols so we can drop warm-up and NaN rows BEFORE alignment
     needed = sorted(set([
-        "tf", "y_go", "row_id", "event_id", "task", "audit_fill_window_sec"
+        "tf", "y_go", "row_id", "event_id", "task"
     ]) | set(feats) | set(AGGR_BT_COLS))
 
     scanner = dset.scanner(columns=needed, filter=base_filt, batch_size=batch_size)
@@ -461,35 +463,22 @@ def _iter_x_ids_y_from_split(
             raise ValueError(f"event_id formula mismatch (expected row_id|go|tf). Examples:\n{bad}")
 
         # -----------------------
-        # Stage3 warm-up drop (LIVE policy) + NaN safety net
+        # Stage3 NaN safety net (aggr/bt)
         # -----------------------
-
-        # warm-up marker mask
-        if "audit_fill_window_sec" in df.columns:
-            afw = pd.to_numeric(df["audit_fill_window_sec"], errors="coerce")
-            warm_mask = (afw == float(WARMUP_AFW_VALUE))
-        else:
-            warm_mask = pd.Series(False, index=df.index)
-
-        # aggr/bt NaN mask (safety net)
         present = [c for c in AGGR_BT_COLS if c in df.columns]
         nan_mask = df[present].isna().any(axis=1) if present else pd.Series(False, index=df.index)
 
-        # update stats (count “in” before filtering)
         if stats is not None:
             stats["rows_in"] = stats.get("rows_in", 0) + int(len(df))
-            stats["dropped_warmup"] = stats.get("dropped_warmup", 0) + int(warm_mask.sum())
-            stats["dropped_nan_aggrbt"] = stats.get("dropped_nan_aggrbt", 0) + int((nan_mask & ~warm_mask).sum())
+            stats["dropped_nan_aggrbt"] = stats.get("dropped_nan_aggrbt", 0) + int(nan_mask.sum())
 
-        # drop rows
-        drop_mask = warm_mask | nan_mask
-        if drop_mask.any():
-            df = df.loc[~drop_mask].copy()
+        if nan_mask.any():
+            df = df.loc[~nan_mask].copy()
             if df.empty:
                 continue
 
-            # IMPORTANT: keep tf_norm aligned with df after row filtering
-            tf_norm = tf_norm.loc[df.index]
+        # keep tf_norm aligned with df after potential filtering
+        tf_norm = tf_norm.loc[df.index]
 
         # ids aligned with X
         ids2d = np.column_stack([
@@ -497,7 +486,7 @@ def _iter_x_ids_y_from_split(
             df["event_id"].astype(str).to_numpy(dtype=object, copy=False),
         ])
 
-        # label (labels should be non-null already, but keep safe)
+        # label
         ygo = pd.to_numeric(df["y_go"], errors="coerce").fillna(0).astype("int8")
         if not ygo.isin([0, 1]).all():
             bad = df.loc[~ygo.isin([0, 1]), ["row_id", "event_id", "y_go"]].head(5)
@@ -512,18 +501,17 @@ def _iter_x_ids_y_from_split(
             if c not in df.columns:
                 df[c] = 0.0
 
-        # Final NaN handling for features (Stage3 responsibility)
         Xf = df[feats].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype="float32")
-        y = ygo.to_numpy(dtype="float32").reshape(-1, 1)
-        X = np.hstack([y, Xf])
+        is_tradeable_col = ygo.to_numpy(dtype="float32").reshape(-1, 1)
+
+        X = np.hstack([is_tradeable_col, Xf])
         X = np.nan_to_num(X, copy=False, posinf=0.0, neginf=0.0)
 
-        # update stats (count “out” after filtering)
         if stats is not None:
             stats["rows_out"] = stats.get("rows_out", 0) + int(len(df))
 
-        yield X, ids2d, ygo  # ygo int8 for class counts/weights
-
+        yield X, ids2d, ygo
+        
 # =======================
 # CLI
 # =======================
@@ -618,7 +606,7 @@ def main():
             iter_x_ids_w(),
             args.rows_per_shard
         )
-        
+
         print(f"[{split_name}] warmup/NaN drop stats:", split_stats)
 
         return nx, nids, nw, pos_total, neg_total, split_stats
