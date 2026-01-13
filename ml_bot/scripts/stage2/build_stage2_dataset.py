@@ -52,6 +52,14 @@ def TF_SORT_KEY(tf: str):
         return int(tf[:-1]) * 60
     return 10**9
 
+TF_CFG = {
+  "15m": {"W": 0.18, "L": 0.60, "C": 0.80, "wA": 3.0, "lA": 0.70, "chopB": 0.85, "k_eps30": 1.0, "k_eps120": 1.5},
+  "30m": {"W": 0.20, "L": 0.60, "C": 0.80, "wA": 3.0, "lA": 0.70, "chopB": 0.85, "k_eps30": 1.0, "k_eps120": 1.5},
+  "1h":  {"W": 0.22, "L": 0.55, "C": 0.82, "wA": 3.0, "lA": 0.70, "chopB": 0.86, "k_eps30": 1.0, "k_eps120": 1.5},
+  "2h":  {"W": 0.25, "L": 0.55, "C": 0.84, "wA": 3.0, "lA": 0.70, "chopB": 0.87, "k_eps30": 1.0, "k_eps120": 1.6},
+  "4h":  {"W": 0.30, "L": 0.50, "C": 0.86, "wA": 3.0, "lA": 0.70, "chopB": 0.88, "k_eps30": 1.0, "k_eps120": 1.6},
+}
+
 MAX_STALE_BY_TF = {
     "5m":  pd.Timedelta(seconds=1),
     "15m": pd.Timedelta(seconds=2),
@@ -240,7 +248,6 @@ def read_trades_window(dset: ds.Dataset, t0: pd.Timestamp, t1: pd.Timestamp) -> 
 
     return df.dropna(subset=["price", "qty"]).sort_index()
 
-
 # ------------------------------
 # Candle feature helpers
 # ------------------------------
@@ -411,7 +418,6 @@ def attach_candle_features(merged_ev: pd.DataFrame, candles_1m: pd.DataFrame) ->
 
     return pd.concat(parts, ignore_index=True)
 
-
 # ------------------------------
 # Prepared caches
 # ------------------------------
@@ -513,6 +519,159 @@ def _asof_values(series: pd.Series, t: pd.Series) -> np.ndarray:
     if ok.any():
         vals = s.to_numpy(dtype=float, copy=False)
         out[ok] = vals[pos[ok]]
+    return out
+
+# ------------------------------
+# Supervision (POST-entry) — oracle-safe columns sup_*
+# ------------------------------
+
+SUP_HORIZONS_SEC = [5, 30, 120]  # horizons de supervision, ajuste si besoin
+SUP_EPS = 1e-12
+
+def _asof_forward_values(series: pd.Series, t: pd.Series) -> np.ndarray:
+    """
+    Lookup forward (first value at or after t).
+    series: index timestamp ascending.
+    t: event timestamps
+    Returns array aligned with t (NaN if no future point).
+    """
+    if series is None or series.empty or t is None or len(t) == 0:
+        return np.full(len(t) if t is not None else 0, np.nan, dtype=float)
+
+    s = series.dropna()
+    if s.empty:
+        return np.full(len(t), np.nan, dtype=float)
+
+    if not s.index.is_monotonic_increasing:
+        s = s.sort_index()
+
+    tt = pd.to_datetime(t, utc=True, errors="coerce")
+    tv = tt.astype("int64").to_numpy()
+    ok_t = ~tt.isna().to_numpy()
+
+    idx = s.index.asi8  # int64 ns
+    pos = np.searchsorted(idx, tv, side="left")  # forward
+
+    out = np.full(len(t), np.nan, dtype=float)
+    ok = ok_t & (pos >= 0) & (pos < len(idx))
+    if ok.any():
+        vals = s.to_numpy(dtype=float, copy=False)
+        out[ok] = vals[pos[ok]]
+    return out
+
+def compute_supervision_features_post_entry(
+    merged: pd.DataFrame,
+    book_prep: "BookPrepared",
+    horizons_sec: list[int] = None,
+) -> pd.DataFrame:
+    if horizons_sec is None:
+        horizons_sec = SUP_HORIZONS_SEC
+
+    out = pd.DataFrame(index=merged.index)
+    t = pd.to_datetime(merged["t"], utc=True, errors="coerce")
+
+    bdf = book_prep.df
+    if bdf is None or bdf.empty:
+        out["sup_mid_now"] = np.nan
+        out["sup_spread_bps_now"] = np.nan
+        out["sup_liq_top_sum_now"] = np.nan
+
+        for h in horizons_sec:
+            out[f"sup_mid_fwd_{h}s"] = np.nan
+            out[f"sup_spread_bps_fwd_{h}s"] = np.nan
+            out[f"sup_liq_top_sum_fwd_{h}s"] = np.nan
+            out[f"sup_ret_bps_fwd_{h}s"] = np.nan
+
+        out["sup_liq_drop_ratio_5s"] = np.nan
+        out["sup_spread_widen_bps_5s"] = np.nan
+        out["sup_chop_score_120s"] = np.nan
+        return out
+
+    # ---- book series (future-aware for forward lookups) ----
+    bid0 = pd.to_numeric(bdf.get("bid_0_price"), errors="coerce").astype("float64")
+    ask0 = pd.to_numeric(bdf.get("ask_0_price"), errors="coerce").astype("float64")
+    bsz0 = pd.to_numeric(bdf.get("bid_0_size"), errors="coerce").astype("float64")
+    asz0 = pd.to_numeric(bdf.get("ask_0_size"), errors="coerce").astype("float64")
+
+    mid_s = ((bid0 + ask0) / 2.0).replace([np.inf, -np.inf], np.nan)
+    spread_bps_s = (np.where(mid_s > 0, 1e4 * (ask0 - bid0) / mid_s, np.nan)).astype("float64")
+    liq_top_s = (bsz0.fillna(0.0) + asz0.fillna(0.0)).astype("float64")
+
+    # ---- NOW reference: prefer merged snapshot (same as model features) ----
+    have_merged_book = all(c in merged.columns for c in ["bid_0_price", "ask_0_price", "bid_0_size", "ask_0_size"])
+
+    if have_merged_book:
+        bid_now_s = pd.to_numeric(merged["bid_0_price"], errors="coerce").astype("float64")
+        ask_now_s = pd.to_numeric(merged["ask_0_price"], errors="coerce").astype("float64")
+        bsz_now_s = pd.to_numeric(merged["bid_0_size"], errors="coerce").astype("float64")
+        asz_now_s = pd.to_numeric(merged["ask_0_size"], errors="coerce").astype("float64")
+
+        mid_now = ((bid_now_s + ask_now_s) / 2.0).to_numpy(dtype="float64", copy=False)
+
+        spr_now = np.where(
+            np.isfinite(mid_now) & (mid_now > 0)
+            & np.isfinite(bid_now_s.to_numpy(dtype="float64", copy=False))
+            & np.isfinite(ask_now_s.to_numpy(dtype="float64", copy=False)),
+            1e4 * (ask_now_s.to_numpy(dtype="float64", copy=False) - bid_now_s.to_numpy(dtype="float64", copy=False)) / mid_now,
+            np.nan
+        ).astype("float64")
+
+        liq_now = (bsz_now_s.fillna(0.0) + asz_now_s.fillna(0.0)).to_numpy(dtype="float64", copy=False)
+    else:
+        # fallback: use backward-asof from book series at event time
+        mid_now = _asof_values(mid_s, t)
+        spr_now = _asof_values(pd.Series(spread_bps_s, index=bdf.index), t)
+        liq_now = _asof_values(liq_top_s, t)
+
+    out["sup_mid_now"] = mid_now
+    out["sup_spread_bps_now"] = spr_now
+    out["sup_liq_top_sum_now"] = liq_now
+
+    # ---- forward metrics ----
+    for h in horizons_sec:
+        th = t + pd.to_timedelta(int(h), unit="s")
+        mid_f = _asof_forward_values(mid_s, th)
+        spr_f = _asof_forward_values(pd.Series(spread_bps_s, index=bdf.index), th)
+        liq_f = _asof_forward_values(liq_top_s, th)
+
+        out[f"sup_mid_fwd_{h}s"] = mid_f
+        out[f"sup_spread_bps_fwd_{h}s"] = spr_f
+        out[f"sup_liq_top_sum_fwd_{h}s"] = liq_f
+
+        ret = 1e4 * (mid_f / np.maximum(mid_now, SUP_EPS) - 1.0)
+        ret[~np.isfinite(ret)] = np.nan
+        ret = np.clip(ret, -500, 500)  # garde-fou
+        out[f"sup_ret_bps_fwd_{h}s"] = ret
+
+    # ---- derived heuristics ----
+    if 5 in horizons_sec:
+        liq5 = out["sup_liq_top_sum_fwd_5s"].to_numpy(dtype="float64")
+        out["sup_liq_drop_ratio_5s"] = np.where(
+            np.isfinite(liq_now) & (liq_now > 0) & np.isfinite(liq5),
+            liq5 / np.maximum(liq_now, SUP_EPS),
+            np.nan
+        )
+        spr5 = out["sup_spread_bps_fwd_5s"].to_numpy(dtype="float64")
+        out["sup_spread_widen_bps_5s"] = np.where(
+            np.isfinite(spr_now) & np.isfinite(spr5),
+            spr5 - spr_now,
+            np.nan
+        )
+    else:
+        out["sup_liq_drop_ratio_5s"] = np.nan
+        out["sup_spread_widen_bps_5s"] = np.nan
+
+    if 30 in horizons_sec and 120 in horizons_sec:
+        r30 = out["sup_ret_bps_fwd_30s"].to_numpy(dtype=float)
+        r120 = out["sup_ret_bps_fwd_120s"].to_numpy(dtype=float)
+
+        chop = np.full(len(out), 1.0, dtype="float64")  # défaut: choppy => fail gate
+        ok = np.isfinite(r30) & np.isfinite(r120) & (np.abs(r30) > 0.0)
+        chop[ok] = (1.0 - (np.abs(r120[ok]) / np.maximum(np.abs(r30[ok]), SUP_EPS)))
+        out["sup_chop_score_120s"] = np.clip(chop, 0.0, 1.0)
+    else:
+        out["sup_chop_score_120s"] = 1.0
+
     return out
 
 def _slope_batch(prices: np.ndarray, sizes: np.ndarray) -> np.ndarray:
@@ -645,7 +804,6 @@ def enrich_side_columns(merged: pd.DataFrame, bf: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-
 # ------------------------------
 # Output sinks (GO / DIR)
 # ------------------------------
@@ -709,15 +867,13 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
 
     rows = []
     for tf in tfs:
-        cols_keep = [
-            "row_id","t","symbol","year",
-            "bid_entry","ask_entry",
-            "mid_entry" if "mid_entry" in sig.columns else "bid_entry",
-            "spread_bps_entry","atr_bps"
-        ]
+        cols_keep = ["row_id","t","symbol","year","bid_entry","ask_entry","spread_bps_entry","atr_bps"]
+        if "mid_entry" in sig.columns:
+            cols_keep.append("mid_entry")
         tmp = sig[cols_keep].copy()
-        if "mid_entry" not in sig.columns:
-            tmp = tmp.rename(columns={"bid_entry": "mid_entry"})
+        if "mid_entry" not in tmp.columns:
+            tmp["mid_entry"] = (pd.to_numeric(tmp["bid_entry"], errors="coerce") +
+                                pd.to_numeric(tmp["ask_entry"], errors="coerce")) / 2.0
 
         tmp["tf"] = str(tf).lower().strip()
 
@@ -758,13 +914,94 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
     ev = ev.sort_values(["t","tf"]).reset_index(drop=True)
     return ev
 
-
 # ------------------------------
 # Core processing
 # ------------------------------
+def _cfg_for_tf(tf: str) -> dict:
+    """Return TF config dict with safe default."""
+    tf = str(tf).lower().strip()
+    return TF_CFG.get(tf, TF_CFG.get("30m"))
+
 def month_dir_from_root_tpl(root_tpl: str, symbol: str, year: int) -> str:
     p = root_tpl.replace("<SYMBOL>", symbol).replace("<YEAR>", str(year)).rstrip("/")
     return p.rsplit("/", 1)[0]
+
+def build_audit_flags_from_sup(merged: pd.DataFrame, sup_df: pd.DataFrame, *, debug_cols: bool = False) -> pd.DataFrame:
+
+    """
+    Construit A/B/C à partir de sup_* + colonnes context (atr_bps, spread_bps_entry, ret_stdev_1s_10s_bps).
+    Retourne un DF avec audit_early_abort, audit_timeout, audit_market_toxic (+ debug cols).
+    """
+    out = pd.DataFrame(index=sup_df.index)
+    tf = merged["tf"].astype(str).str.lower().str.strip()
+    cfg_list = tf.map(_cfg_for_tf).tolist()
+    W = np.array([d["W"] for d in cfg_list], dtype="float64")
+    L = np.array([d["L"] for d in cfg_list], dtype="float64")
+    C = np.array([d["C"] for d in cfg_list], dtype="float64")
+    wA = np.array([d["wA"] for d in cfg_list], dtype="float64")
+    lA = np.array([d["lA"] for d in cfg_list], dtype="float64")
+    chopB = np.array([d["chopB"] for d in cfg_list], dtype="float64")
+    k30 = np.array([d["k_eps30"] for d in cfg_list], dtype="float64")
+    k120 = np.array([d["k_eps120"] for d in cfg_list], dtype="float64")
+
+    # base arrays
+    spread_entry = pd.to_numeric(merged.get("spread_bps_entry"), errors="coerce").astype("float64").to_numpy()
+    atr_bps = pd.to_numeric(merged.get("atr_bps"), errors="coerce").astype("float64").to_numpy()
+
+    widen_5s = pd.to_numeric(sup_df.get("sup_spread_widen_bps_5s"), errors="coerce").astype("float64").to_numpy()
+    liq_drop = pd.to_numeric(sup_df.get("sup_liq_drop_ratio_5s"), errors="coerce").astype("float64").to_numpy()
+    chop = pd.to_numeric(sup_df.get("sup_chop_score_120s"), errors="coerce").astype("float64").to_numpy()
+
+    ret5 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_5s"), errors="coerce").astype("float64").to_numpy()
+    ret30 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_30s"), errors="coerce").astype("float64").to_numpy()
+    ret120 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_120s"), errors="coerce").astype("float64").to_numpy()
+
+    if "ret_stdev_1s_10s_bps" in merged.columns:
+        noise = pd.to_numeric(merged["ret_stdev_1s_10s_bps"], errors="coerce").astype("float64").to_numpy()
+    else:
+        # fallback safe: treat missing noise as 0 (eps floors will handle min=2.0)
+        noise = np.zeros(len(merged), dtype="float64")
+
+    noise = np.where(np.isfinite(noise), noise, 0.0)
+
+    # ---- C: market toxic ----
+    widen_norm = widen_5s / np.maximum(spread_entry, 1e-6)
+    toxic = (
+        (~np.isfinite(widen_norm)) | (~np.isfinite(liq_drop)) | (~np.isfinite(chop)) |
+        (widen_norm >= W) | (liq_drop <= L) | (chop >= C)
+    )
+
+    # ---- A: early abort ----
+    X = np.clip(0.3 * atr_bps, 4.0, 10.0)
+    early_abort = (
+        (np.isfinite(ret5) & (ret5 <= -X)) |
+        ((np.isfinite(widen_5s) & (widen_5s >= wA)) & (np.isfinite(liq_drop) & (liq_drop <= lA)))
+
+    )
+
+    # ---- B: timeout ----
+    eps30 = np.maximum(2.0, k30 * noise)
+    eps120 = np.maximum(2.0, k120 * noise)
+
+    timeout = (
+        (np.isfinite(ret30) & (np.abs(ret30) < eps30)) &
+        (np.isfinite(ret120) & (np.abs(ret120) < eps120))
+    ) | (
+        (np.isfinite(ret30) & (np.abs(ret30) < eps30)) &
+        (np.isfinite(chop) & (chop >= chopB))
+    )
+
+    out["audit_market_toxic"] = toxic.astype("int8")
+    out["audit_early_abort"] = early_abort.astype("int8")
+    out["audit_timeout"] = timeout.astype("int8")
+
+    # debug / transparence (optionnel pour éviter de bloat Stage2)
+    if debug_cols:
+        out["audit_widen_norm_5s"] = widen_norm.astype("float64")
+        out["audit_eps30"] = eps30.astype("float64")
+        out["audit_eps120"] = eps120.astype("float64")
+        out["audit_X_abort"] = X.astype("float64")
+    return out
 
 def process_symbol_year(
     symbol: str,
@@ -1017,11 +1254,18 @@ def process_symbol_year(
 
             bf["quote_churn_10s"] = _asof_values(book_prep.churn10, merged["t"])
             bf["ret_stdev_1s_10s_bps"] = _asof_values(book_prep.retstd10_bps, merged["t"])
+            # Needed by build_audit_flags_from_sup (it reads from merged)
+            merged["ret_stdev_1s_10s_bps"] = bf["ret_stdev_1s_10s_bps"].values
 
-            agr3  = _asof_values(trades_prep.aggr3, merged["t"])
-            agr5  = _asof_values(trades_prep.aggr5, merged["t"])
-            agr10 = _asof_values(trades_prep.aggr10, merged["t"])
-            agr15 = _asof_values(trades_prep.aggr15, merged["t"])
+            def _fill_aggr_neutral(x: np.ndarray) -> np.ndarray:
+                x = x.astype("float64", copy=False)
+                x[~np.isfinite(x)] = 0.5
+                return np.clip(x, 0.0, 1.0)
+
+            agr3  = _fill_aggr_neutral(_asof_values(trades_prep.aggr3,  merged["t"]))
+            agr5  = _fill_aggr_neutral(_asof_values(trades_prep.aggr5,  merged["t"]))
+            agr10 = _fill_aggr_neutral(_asof_values(trades_prep.aggr10, merged["t"]))
+            agr15 = _fill_aggr_neutral(_asof_values(trades_prep.aggr15, merged["t"]))
 
             bf["aggr_ratio_10s"] = agr10
             bf["aggr_ratio_15s"] = agr15
@@ -1084,7 +1328,18 @@ def process_symbol_year(
                 "audit_fill_window_sec": pd.to_numeric(_col_or_default(merged, "audit_fill_window_sec", np.nan, n), errors="coerce").astype(float).values,
             })
 
-            out_all = pd.concat([base_out.reset_index(drop=True), bf.reset_index(drop=True)], axis=1)
+            # ✅ NEW: oracle-safe supervision (post-entry) — NEVER as model features
+            sup_df = compute_supervision_features_post_entry(
+                merged=merged,
+                book_prep=book_prep,
+                horizons_sec=SUP_HORIZONS_SEC,
+            )
+
+            audit_flags = build_audit_flags_from_sup(merged=merged, sup_df=sup_df, debug_cols=debug)
+            out_all = pd.concat([base_out.reset_index(drop=True),
+                     bf.reset_index(drop=True),
+                     sup_df.reset_index(drop=True),
+                     audit_flags.reset_index(drop=True)], axis=1)
 
             # Point (6): DIR drop neutral — keep only y_dir ∈ {-1,+1}
             out_go = out_all.copy()
@@ -1173,7 +1428,6 @@ def process_symbol_year(
         f"timing_total(s): read_book={t_read_book:.1f} read_trades={t_read_trades:.1f} prep={t_prep:.1f} feat={t_feat:.1f} write={t_write:.1f}"
     )
     return int(total_go_written + total_dir_written)
-
 
 # ------------------------------
 # CLI

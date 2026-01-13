@@ -400,43 +400,6 @@ def _maker_fill_ok_conservative(
     okS = (fill_step_S >= 0)
     return okL, okS, int(fill_step_L), int(fill_step_S)
 
-def _rr_label_for_segment_bidask(
-    seg_bid: np.ndarray,
-    seg_ask: np.ndarray,
-    entry_long: float,
-    entry_short: float,
-    tp_bps: float,
-    sl_bps: float,
-) -> Tuple[int, str, int]:
-    if seg_bid.size < 2 or seg_ask.size < 2:
-        return 0, "NONE", -1
-
-    # LONG exits on bid
-    tpL_px = entry_long * (1.0 + tp_bps / 1e4)
-    slL_px = entry_long * (1.0 - sl_bps / 1e4)
-    i_tpL = _first_true_idx(seg_bid >= tpL_px)
-    i_slL = _first_true_idx(seg_bid <= slL_px)
-
-    # SHORT exits on ask
-    tpS_px = entry_short * (1.0 - tp_bps / 1e4)
-    slS_px = entry_short * (1.0 + sl_bps / 1e4)
-    i_tpS = _first_true_idx(seg_ask <= tpS_px)
-    i_slS = _first_true_idx(seg_ask >= slS_px)
-
-    INF = 10**12
-    events = [
-        (i_tpL if i_tpL >= 0 else INF,  1, "TP_LONG"),
-        (i_slL if i_slL >= 0 else INF,  0, "SL_LONG"),
-        (i_tpS if i_tpS >= 0 else INF, -1, "TP_SHORT"),
-        (i_slS if i_slS >= 0 else INF,  0, "SL_SHORT"),
-    ]
-    events.sort(key=lambda x: x[0])
-    tmin, y, rsn = events[0]
-
-    if tmin >= INF:
-        return 0, "TIME", -1
-    return int(y), str(rsn), int(tmin)
-
 def _side_tp_sl_steps_after_fill(
     seg_bid: np.ndarray,
     seg_ask: np.ndarray,
