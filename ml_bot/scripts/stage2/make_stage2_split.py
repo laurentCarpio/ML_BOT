@@ -34,7 +34,6 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 
-
 # ----------------------------
 # S3 helpers
 # ----------------------------
@@ -64,6 +63,8 @@ def _write_parquet(fs: pafs.S3FileSystem, path_s3: str, df: pd.DataFrame):
     with fs.open_output_stream(_strip_s3(path_s3)) as out:
         pq.write_table(table, out, compression="zstd")
 
+def _h64(s: str) -> int:
+    return int.from_bytes(hashlib.blake2b(s.encode("utf-8","ignore"), digest_size=8).digest(), "big")
 
 # ----------------------------
 # Normalizers
@@ -75,7 +76,6 @@ def _norm_str(x) -> str:
 
 def _norm_tf(x) -> str:
     return _norm_str(x).strip().lower()
-
 
 # ----------------------------
 # Streaming validators
@@ -96,7 +96,7 @@ class UniqueEventIdChecks:
 
         ev = raw[~is_null].astype(str).values
         for s in ev:
-            h = hash(s)
+            h = _h64(s)
             if h in self.seen:
                 self.dup += 1
                 if len(self.sample_dups) < 10:
@@ -183,7 +183,7 @@ class TaskChecks:
     def process(self, df: pd.DataFrame):
         if "task" not in df.columns:
             raise ValueError("missing task column")
-        task = df["task"].astype(str).values
+        task = df["task"].astype(str).str.strip().str.lower().values
         self.total += len(task)
         bad_mask = (task != self.dataset_name)
         nb = int(bad_mask.sum())
@@ -198,7 +198,6 @@ class TaskChecks:
         if self.bad > 0:
             raise ValueError(f"[{tag}] task mismatch: n={self.bad}/{self.total} exemples={self.bad_examples}")
 
-
 # ----------------------------
 # Split policy
 # ----------------------------
@@ -207,7 +206,6 @@ class SplitPolicy:
     q_train_end: float = 0.70
     q_val_end: float = 0.85
     per_tf: bool = True
-
 
 def fit_time_cutoffs(
     ds_all: ds.Dataset,
@@ -289,14 +287,12 @@ def fit_time_cutoffs(
 
     return out
 
-
 def save_cutoffs_json(fs: pafs.S3FileSystem, dst_stage2_root: str, cutoffs: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]):
     meta_root = f"{dst_stage2_root.rstrip('/')}/_meta"
 
     payload = {k: {"train_end": str(v[0]), "val_end": str(v[1])} for k, v in cutoffs.items()}
     with fs.open_output_stream(_strip_s3(f"{meta_root}/split_cutoffs.json")) as f:
         f.write(json.dumps(payload, indent=2).encode("utf-8"))
-
 
 def assign_split(df: pd.DataFrame, cutoffs: dict) -> np.ndarray:
     t = pd.to_datetime(df["t"], utc=True, errors="coerce")
@@ -334,7 +330,6 @@ def assign_split(df: pd.DataFrame, cutoffs: dict) -> np.ndarray:
         out[idx[m_va]] = "val"
 
     return out
-
 
 # ----------------------------
 # Main split runner per dataset
@@ -466,7 +461,6 @@ def split_one_dataset(
     print(f"[done] {dataset_name} totals: {totals}")
     return totals
 
-
 # ----------------------------
 # CLI
 # ----------------------------
@@ -501,7 +495,6 @@ def parse_args():
                     help="Dataset utilisé pour fitter les cutoffs (recommandé: go).")
 
     return ap.parse_args()
-
 
 def main():
     args = parse_args()
@@ -545,7 +538,6 @@ def main():
 
     print("[done] totals:", totals)
     print("[done] shared cutoffs used for both go and dir: OK")
-
 
 if __name__ == "__main__":
     main()

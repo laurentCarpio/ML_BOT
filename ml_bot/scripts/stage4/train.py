@@ -5,6 +5,7 @@ import os
 import glob
 import json
 import argparse
+import multiprocessing
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -109,7 +110,6 @@ def parse_args():
     p.add_argument("--min_child_weight", type=float, default=1.0)
     p.add_argument("--subsample", type=float, default=0.8)
     p.add_argument("--colsample_bytree", type=float, default=0.8)
-    p.add_argument("--scale_pos_weight", type=float, default=1.0)
     p.add_argument("--num_round", type=int, default=800)
     p.add_argument("--early_stopping_rounds", type=int, default=100)
     p.add_argument("--max_delta_step", type=float, default=0.0)
@@ -119,8 +119,13 @@ def parse_args():
     p.add_argument("--reg_alpha", type=float, default=0.0)
     p.add_argument("--gamma", type=float, default=0.0)
 
-    # allow future extra args without crashing
-    args, _ = p.parse_known_args()
+    args, unknown = p.parse_known_args()
+
+    # refuse explicitement scale_pos_weight (évite le "silent ignore")
+    banned = {"--scale_pos_weight", "--scale-pos-weight"}
+    if any(u.split("=", 1)[0] in banned for u in unknown):
+        raise SystemExit("Argument interdit: --scale_pos_weight. Utiliser uniquement les sample weights (train_weight).")
+
     return args
 
 
@@ -170,12 +175,16 @@ if __name__ == "__main__":
         "min_child_weight": float(args.min_child_weight),
         "subsample": float(args.subsample),
         "colsample_bytree": float(args.colsample_bytree),
-        "scale_pos_weight": float(args.scale_pos_weight),
         "max_delta_step": float(args.max_delta_step),
         "reg_lambda": float(args.reg_lambda),
         "reg_alpha": float(args.reg_alpha),
         "gamma": float(args.gamma),
     }
+    
+    # Threads: SageMaker expose souvent OMP_NUM_THREADS
+    nthread = int(os.environ.get("OMP_NUM_THREADS", multiprocessing.cpu_count() or 4))
+    params["nthread"] = max(1, nthread)
+    print(f"[threads] nthread={params['nthread']} (OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')})")
 
     effective = dict(
         **params,

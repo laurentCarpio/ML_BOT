@@ -113,7 +113,12 @@ def list_signal_files(root: str, so: dict) -> List[str]:
 
 def open_any(path: str, so: dict):
     if is_s3(path):
-        return fsspec.open(path, "rb", **so).open()
+        return fsspec.open(
+            path, "rb",
+            block_size=64 * 1024 * 1024,
+            cache_type="none",
+            **so
+        ).open()
     return open(path, "rb")
 
 def write_text(path: str, text: str, so: dict):
@@ -261,6 +266,12 @@ class AggLabel:
     n_bad_pnl_sl_sign: int = 0
     n_bad_pnl_tp_sign: int = 0
 
+    # EV threshold checks (p_thr_ev0_<tf>)
+    n_bad_p_thr_ev0_range: int = 0
+    n_bad_p_thr_ev0_nan: int = 0
+    p_thr_ev0_samples: Reservoir = field(default_factory=lambda: Reservoir(120_000))
+    n_bad_p_thr_ev0_formula: int = 0
+
 @dataclass
 class AggFile:
     n_dup_row_id: int = 0
@@ -344,8 +355,19 @@ def process_signals_file(
     logger.info(f"READ {path} (symbol={symbol}, year={year})")
 
     # Peek header
-    with open_any(path, so) as f:
-        head = pd.read_csv(f, nrows=0)
+    t_peek0 = time.perf_counter()
+    logger.info(f"PEEK header start: {path}")
+    try:
+        if is_s3(path):
+            head = pd.read_csv(path, nrows=0, storage_options=so)
+        else:
+            with open_any(path, so) as f:
+                head = pd.read_csv(f, nrows=0)
+    except Exception as e:
+        issues.append(IntegrityIssue(path, symbol, year, "read_header_failed", f"{type(e).__name__}: {e}"))
+        logger.exception(f"FAILED header read: {path}")
+        return symbol, year, agg, issues
+    logger.info(f"PEEK header done in {time.perf_counter()-t_peek0:.2f}s cols={len(head.columns)}")
     cols = list(head.columns)
 
     # Must-have base cols (minimal)
@@ -379,12 +401,44 @@ def process_signals_file(
     seen_ts = set()
     seen_rid = set()
 
-    with open_any(path, so) as f:
-        reader = pd.read_csv(f, chunksize=chunksize)
-        
-        rid_to_t = {}  # row_id -> first seen t (string)
+    # ---------------------------
+    # Chunked read (visible timing + S3-safe)
+    # ---------------------------
+    logger.info(f"CHUNK read start: chunksize={chunksize} path={path}")
+    t_first_chunk0 = time.perf_counter()
+    
+    f = None 
+    try:
+        # IMPORTANT: pour S3, pandas lit mieux via le path + storage_options
+        if is_s3(path):
+            reader = pd.read_csv(path, chunksize=chunksize, storage_options=so)
+            f = None
+        else:
+            f = open_any(path, so)
+            reader = pd.read_csv(f, chunksize=chunksize)
+    except Exception as e:
+        issues.append(IntegrityIssue(path, symbol, year, "read_chunked_init_failed", f"{type(e).__name__}: {e}"))
+        logger.exception(f"FAILED init chunked read: {path}")
+        return symbol, year, agg, issues
 
+    rid_to_t = {}  # row_id -> first seen t (string)
+
+    got_first = False
+    last_beat = time.perf_counter()
+
+    try:
         for ci, df in enumerate(reader, 1):
+            # log au 1er chunk pour savoir si ça bloque avant
+            if not got_first:
+                logger.info(f"FIRST chunk received in {time.perf_counter()-t_first_chunk0:.2f}s rows={len(df):,}")
+                got_first = True
+
+            # heartbeat toutes les 15s (évite le "silence")
+            now = time.perf_counter()
+            if now - last_beat > 15:
+                logger.info(f"HEARTBEAT: chunk={ci} rows_so_far={agg.n_rows:,}")
+                last_beat = now
+
             if df is None or df.empty:
                 continue
 
@@ -636,6 +690,53 @@ def process_signals_file(
                             tp_bad = np.abs(tp[ok] - want_tp) > (1e-2 + 2e-3 * np.abs(want_tp))
                             sl_bad = np.abs(sl[ok] - want_sl) > (1e-2 + 2e-3 * np.abs(want_sl))
                             al.n_bad_rr_formula += int(tp_bad.sum() + sl_bad.sum())
+                    
+                    # ---- p_thr_ev0 check (EV=0 threshold) ----
+                    pcol = f"p_thr_ev0_{s.horizon}"
+                    if pcol in df.columns:
+                        p = pd.to_numeric(df[pcol], errors="coerce").to_numpy(dtype=np.float64)
+                        okp = np.isfinite(p)
+
+                        al.n_bad_p_thr_ev0_nan += int((~okp).sum())
+
+                        # range [0,1] with tiny tolerance (CSV/float32)
+                        if okp.any():
+                            bad_range = (p[okp] < -1e-6) | (p[okp] > 1.0 + 1e-6)
+                            al.n_bad_p_thr_ev0_range += int(bad_range.sum())
+
+                            # sample for quantiles
+                            al.pnl_trade  # keep existing
+                            al.p_thr_ev0_samples.add_array(p[okp], rng)
+
+                        # coherence check vs formula if inputs exist:
+                        # p_thr_ev0 = (SL + cost) / (TP + SL)
+                        tp_col = f"tp_bps_{s.horizon}"
+                        sl_col = f"sl_bps_{s.horizon}"
+                        if ("entry_spread_half_bps" in df.columns) and (tp_col in df.columns) and (sl_col in df.columns):
+                            tp = pd.to_numeric(df[tp_col], errors="coerce").to_numpy(dtype=np.float64)
+                            sl = pd.to_numeric(df[sl_col], errors="coerce").to_numpy(dtype=np.float64)
+                            half = pd.to_numeric(df["entry_spread_half_bps"], errors="coerce").to_numpy(dtype=np.float64)
+
+                            # fee_exit_bps is constant, but stage1 writes it; use it if present
+                            if "fee_exit_bps" in df.columns:
+                                fee = pd.to_numeric(df["fee_exit_bps"], errors="coerce").to_numpy(dtype=np.float64)
+                            else:
+                                fee = np.full(len(df), 0.0, dtype=np.float64)
+
+                            cost = half + fee
+                            denom = np.maximum(tp + sl, 1e-12)
+
+                            want = (sl + cost) / denom
+
+                            ok = np.isfinite(p) & np.isfinite(want)
+                            if ok.any():
+                                diff = np.abs(p[ok] - want[ok])
+                                # permissif: float32 + csv
+                                tol = 5e-4 + 5e-4 * np.abs(want[ok])
+                                # on recycle n_bad_rr_formula ou on crée un compteur dédié (mieux)
+                                # => ici: on compte comme "bad_p_thr_ev0_range" ? non.
+                                # Ajoute plutôt un compteur dédié si tu veux.
+                                al.n_bad_p_thr_ev0_formula += int((diff > tol).sum())
 
                     # pnl checks (new convention):
                     # - TP_* => pnl > 0
@@ -678,6 +779,13 @@ def process_signals_file(
 
             if (ci % 20) == 0:
                 logger.info(f"  chunk {ci}: rows_so_far={agg.n_rows:,}")
+    finally:
+        # ferme le handle local si utilisé
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
     # Post-file issues
     if agg.n_dup_row_id:
@@ -818,6 +926,10 @@ def summarize_label_metrics(symbol: str, year: int, key: str, al: AggLabel) -> D
         "rr_exit_time": al.n_time,
         "rr_exit_nofill": al.n_nofill,
         "rr_exit_none": al.n_none,
+        "p_thr_ev0_q50": al.p_thr_ev0_samples.quantiles((0.5,)).get("q50", float("nan")),
+        "p_thr_ev0_bad_nan": al.n_bad_p_thr_ev0_nan,
+        "p_thr_ev0_bad_range": al.n_bad_p_thr_ev0_range,
+        "p_thr_ev0_formula":al.n_bad_p_thr_ev0_formula,
     }
 
 def build_monthly_df(all_aggs: List[Tuple[str, int, AggFile]]) -> pd.DataFrame:
@@ -897,6 +1009,7 @@ def build_recommendations(df_label: pd.DataFrame) -> str:
         lines.append("[RR] Notes sur RR (y_<tf>)")
         lines.append("- RR est la source de vérité: GO doit matcher (TP_*), DIR doit matcher y.")
         lines.append("- Vérifie que les SL ont pnl négatif et les TP pnl positif (checks intégrés).")
+        lines.append("- p_thr_ev0_<tf> doit être dans [0,1] et cohérent avec (SL+cost)/(TP+SL).")
         lines.append("")
 
     return "\n".join(lines)

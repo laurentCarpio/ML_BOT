@@ -293,7 +293,7 @@ def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = ADX_
     minus_di = 100.0 * (_wilder_ewm(minus_dm, n) / tr_s)
 
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = _wilder_ewm(dx, n).clip(lower=0.0, upper=100.0)
+    adx = _wilder_ewm(dx, n).clip(0.0, 100.0)
     return adx
 
 def rolling_percentile_of_last(x: np.ndarray) -> float:
@@ -434,6 +434,13 @@ class TradesPrepared:
     aggr5: pd.Series
     aggr10: pd.Series
     aggr15: pd.Series
+    ntr_30s: pd.Series
+    vol_30s: pd.Series
+    ntr_2m: pd.Series
+    vol_2m: pd.Series
+    ntr_5m: pd.Series
+    vol_5m: pd.Series
+    last_trade_age_s: pd.Series
 
 def prepare_book_features(book_full: pd.DataFrame) -> BookPrepared:
     if book_full is None or book_full.empty:
@@ -456,29 +463,31 @@ def prepare_book_features(book_full: pd.DataFrame) -> BookPrepared:
     return BookPrepared(df=df, churn10=churn10.astype(float), retstd10_bps=retstd10_bps)
 
 def safe_div(num, den, default=np.nan):
-    """
-    Division robuste num/den.
-    - si den <= 0, NaN, inf -> retourne default
-    - conserve index/shape (Series in -> Series out)
-    """
     n = pd.to_numeric(num, errors="coerce")
     d = pd.to_numeric(den, errors="coerce")
 
-    out = n / d
-    bad = (~np.isfinite(out)) | (~np.isfinite(d)) | (d <= 0)
-    if isinstance(out, pd.Series):
+    if isinstance(n, pd.Series) or isinstance(d, pd.Series):
+        # conserve index
+        n = pd.Series(n, index=getattr(num, "index", None))
+        d = pd.Series(d, index=getattr(den, "index", None))
+        out = n / d
+        bad = (~np.isfinite(out)) | (~np.isfinite(d)) | (d <= 0)
         out = out.astype(float)
         out[bad] = default
         return out
-    # fallback numpy
-    out = np.asarray(out, dtype=float)
+
+    out = np.asarray(n, dtype=float) / np.asarray(d, dtype=float)
+    d2 = np.asarray(d, dtype=float)
+    bad = (~np.isfinite(out)) | (~np.isfinite(d2)) | (d2 <= 0)
+    out = out.astype(float)
     out[bad] = default
     return out
 
 def prepare_trades_features(trades_full: pd.DataFrame) -> TradesPrepared:
     if trades_full is None or trades_full.empty or "is_aggr_buy" not in trades_full.columns:
         empty = pd.Series(dtype=float)
-        return TradesPrepared(trades_full, empty, empty, empty, empty)
+        return TradesPrepared(trades_full, empty, empty, empty, empty,
+                              empty, empty, empty, empty, empty, empty, empty)
 
     df = trades_full.sort_index() if not trades_full.index.is_monotonic_increasing else trades_full
 
@@ -489,12 +498,36 @@ def prepare_trades_features(trades_full: pd.DataFrame) -> TradesPrepared:
     def r(window: str) -> pd.Series:
         buyw = buy_qty.rolling(window).sum()
         totw = qty.rolling(window).sum()
-
-        # safe_div: si totw==0 (aucun trade dans la fenêtre), ratio neutre 0.5
         out = safe_div(buyw, totw, default=0.5).astype(float)
-        return out.clip(lower=0.0, upper=1.0)
+        out = np.clip(out, 0.0, 1.0)
+        return out
 
-    return TradesPrepared(df=df, aggr3=r("3s"), aggr5=r("5s"), aggr10=r("10s"), aggr15=r("15s"))
+    # --- intensity features ---
+    ones = pd.Series(1.0, index=df.index)
+    ntr_30s = ones.rolling("30s").sum()
+    vol_30s = qty.rolling("30s").sum()
+    ntr_2m  = ones.rolling("2min").sum()
+    vol_2m  = qty.rolling("2min").sum()
+    ntr_5m  = ones.rolling("5min").sum()
+    vol_5m  = qty.rolling("5min").sum()
+
+    # last_trade_age_s: age du dernier trade connu au timestamp t
+    # on construit une série "timestamp en ns" et on forward-fill
+    ts_ns = pd.Series(df.index.asi8, index=df.index).astype("int64")
+    # age au temps courant = (t - last_trade_ts)
+    # => on laisse Stage2 faire le asof sur ts_ns, puis convertir en secondes
+    # mais on peut pré-calculer une série age=0 sur chaque trade, puis rolling min n'a pas de sens
+    # donc on expose plutôt last_trade_ts_ns:
+    last_trade_ts_ns = ts_ns
+
+    return TradesPrepared(
+        df=df,
+        aggr3=r("3s"), aggr5=r("5s"), aggr10=r("10s"), aggr15=r("15s"),
+        ntr_30s=ntr_30s.astype(float), vol_30s=vol_30s.astype(float),
+        ntr_2m=ntr_2m.astype(float),   vol_2m=vol_2m.astype(float),
+        ntr_5m=ntr_5m.astype(float),   vol_5m=vol_5m.astype(float),
+        last_trade_age_s=last_trade_ts_ns.astype(float),  # temporaire: ts_ns
+    )
 
 def _asof_values(series: pd.Series, t: pd.Series) -> np.ndarray:
     if series is None or series.empty or t is None or len(t) == 0:
@@ -825,7 +858,6 @@ class PartsSink:
         write_parquet_s3(part_path, df, self.storage_options)
         self.k += 1
 
-
 # ------------------------------
 # Signals -> base events (NO side duplication)
 # ------------------------------
@@ -892,7 +924,12 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
         else:
             tmp["y_go"] = (tmp["y_dir"] != 0).astype("int8")
         
-        opt_fields = ["pnl_net_bps","exit_reason","tp_bps","sl_bps","rr_min","risk_r_bps","fill_mode","fill_window_sec"]
+        opt_fields = [
+            "pnl_net_bps","exit_reason","tp_bps","sl_bps",
+            "rr_min","risk_r_bps","p_thr_ev0",
+            "fill_mode","fill_window_sec"
+        ]
+
         for opt in opt_fields:
             copt = f"{opt}_{tf}"
             outc = f"audit_{opt}"
@@ -1209,6 +1246,69 @@ def process_symbol_year(
                 t_feat += (time.time() - t_f0)
                 continue
 
+            # ==========================
+            # NEW oracle-safe "anti-audit" proxies (pure backward)
+            # ==========================
+            t_evt = pd.to_datetime(merged["t"], utc=True, errors="coerce")
+            t_book = pd.to_datetime(merged["book_ts"], utc=True, errors="coerce")
+
+            # 1) book_age_ms (snapshot freshness actually used)
+            age_ms = (t_evt.astype("int64") - t_book.astype("int64")) / 1e6
+            age_ms = age_ms.to_numpy(dtype="float64", copy=False)
+            age_ms[~np.isfinite(age_ms)] = np.nan
+            age_ms = np.clip(age_ms, 0.0, 60_000.0)  # cap 60s
+            # We'll store it later into bf as a model feature.
+
+            # Build book time-series (from book_prep.df) for backward-asof at shifted times
+            bdf = book_prep.df
+            bid0_s = pd.to_numeric(bdf.get("bid_0_price"), errors="coerce").astype("float64")
+            ask0_s = pd.to_numeric(bdf.get("ask_0_price"), errors="coerce").astype("float64")
+            bsz0_s = pd.to_numeric(bdf.get("bid_0_size"), errors="coerce").astype("float64").fillna(0.0)
+            asz0_s = pd.to_numeric(bdf.get("ask_0_size"), errors="coerce").astype("float64").fillna(0.0)
+
+            mid_s = ((bid0_s + ask0_s) / 2.0).replace([np.inf, -np.inf], np.nan)
+            spr_s = pd.Series(np.where(mid_s > 0, 1e4 * (ask0_s - bid0_s) / mid_s, np.nan), index=bdf.index)
+            liq_s = (bsz0_s + asz0_s).astype("float64")
+
+            # NOW values from merged snapshot (consistent with other features)
+            bid_now = pd.to_numeric(merged.get("bid_0_price"), errors="coerce").astype("float64")
+            ask_now = pd.to_numeric(merged.get("ask_0_price"), errors="coerce").astype("float64")
+            mid_now = ((bid_now + ask_now) / 2.0).to_numpy(dtype="float64", copy=False)
+
+            spr_now = np.where(
+                np.isfinite(mid_now) & (mid_now > 0),
+                1e4 * (ask_now.to_numpy(dtype="float64", copy=False) - bid_now.to_numpy(dtype="float64", copy=False)) / mid_now,
+                np.nan
+            ).astype("float64")
+
+            liq_now = (
+                pd.to_numeric(merged.get("bid_0_size"), errors="coerce").astype("float64").fillna(0.0)
+                + pd.to_numeric(merged.get("ask_0_size"), errors="coerce").astype("float64").fillna(0.0)
+            ).to_numpy(dtype="float64", copy=False)
+
+            # 2) spread_trend_10s = spread_now - spread(t-10s)
+            t_m10 = t_evt - pd.Timedelta(seconds=10)
+            spr_m10 = _asof_values(spr_s, t_m10)
+            spread_trend_10s = spr_now - spr_m10
+            spread_trend_10s[~np.isfinite(spread_trend_10s)] = np.nan
+            spread_trend_10s = np.clip(spread_trend_10s, -500.0, 500.0)
+
+            # 3) liq_trend_10s = liq_now / liq(t-10s)
+            liq_m10 = _asof_values(liq_s, t_m10)
+            liq_trend_10s = np.where(
+                np.isfinite(liq_now) & (liq_now > 0) & np.isfinite(liq_m10) & (liq_m10 > 0),
+                liq_now / liq_m10,
+                np.nan
+            ).astype("float64")
+            liq_trend_10s = np.clip(liq_trend_10s, 0.0, 100.0)
+
+            # 4) ret_bps_5s_back = 1e4*(mid_now/mid(t-5s) - 1)
+            t_m5 = t_evt - pd.Timedelta(seconds=5)
+            mid_m5 = _asof_values(mid_s, t_m5)
+            ret_bps_5s_back = 1e4 * (mid_now / np.maximum(mid_m5, 1e-12) - 1.0)
+            ret_bps_5s_back[~np.isfinite(ret_bps_5s_back)] = np.nan
+            ret_bps_5s_back = np.clip(ret_bps_5s_back, -500.0, 500.0)
+
             # entry spread diagnostics
             be = pd.to_numeric(merged.get("bid_entry"), errors="coerce")
             ae = pd.to_numeric(merged.get("ask_entry"), errors="coerce")
@@ -1252,6 +1352,11 @@ def process_symbol_year(
             # === features ===
             bf = build_book_features_sym(merged)
 
+            bf["book_age_ms"] = age_ms
+            bf["spread_trend_10s"] = spread_trend_10s
+            bf["liq_trend_10s"] = liq_trend_10s
+            bf["ret_bps_5s_back"] = ret_bps_5s_back
+
             bf["quote_churn_10s"] = _asof_values(book_prep.churn10, merged["t"])
             bf["ret_stdev_1s_10s_bps"] = _asof_values(book_prep.retstd10_bps, merged["t"])
             # Needed by build_audit_flags_from_sup (it reads from merged)
@@ -1273,7 +1378,47 @@ def process_symbol_year(
             bf["bt_dom_5s"] = agr5
             bf["bt_dom_10s"] = agr10
 
+            # --- intensity asof ---
+            ntr_30s = _asof_values(trades_prep.ntr_30s, merged["t"])
+            vol_30s = _asof_values(trades_prep.vol_30s, merged["t"])
+            ntr_2m  = _asof_values(trades_prep.ntr_2m,  merged["t"])
+            vol_2m  = _asof_values(trades_prep.vol_2m,  merged["t"])
+            ntr_5m  = _asof_values(trades_prep.ntr_5m,  merged["t"])
+            vol_5m  = _asof_values(trades_prep.vol_5m,  merged["t"])
+
+            bf["n_trades_30s"] = ntr_30s
+            bf["vol_traded_30s"] = vol_30s
+            bf["n_trades_2m"] = ntr_2m
+            bf["vol_traded_2m"] = vol_2m
+            bf["n_trades_5m"] = ntr_5m
+            bf["vol_traded_5m"] = vol_5m
+
+            # last_trade_age_s: on récupère ts_ns du dernier trade (asof), puis t - ts
+            last_ts_ns = _asof_values(trades_prep.last_trade_age_s, merged["t"])  # float64
+            t_ns = pd.to_datetime(merged["t"], utc=True, errors="coerce").astype("int64").to_numpy(dtype="int64", copy=False)
+
+            age_s = np.full(len(t_ns), np.nan, dtype="float64")
+            ok = np.isfinite(last_ts_ns)
+            age_s[ok] = (t_ns[ok] - last_ts_ns[ok].astype("int64")) / 1e9
+            age_s = np.clip(age_s, 0.0, 3600.0)
+            bf["last_trade_age_s"] = age_s
+
             bf = enrich_side_columns(merged, bf)
+
+            eps = 1e-12
+            bf["thinness_5bps_buy"]  = bf["spread_bps_top"] / (bf["cum_depth_within_5bps_opp_buy"]  + eps)
+            bf["thinness_5bps_sell"] = bf["spread_bps_top"] / (bf["cum_depth_within_5bps_opp_sell"] + eps)
+
+            bf["thinness_10bps_buy"]  = bf["spread_bps_top"] / (bf["cum_depth_within_10bps_opp_buy"]  + eps)
+            bf["thinness_10bps_sell"] = bf["spread_bps_top"] / (bf["cum_depth_within_10bps_opp_sell"] + eps)
+
+            THIN_MAX = 1e6  # safe cap, oracle-safe
+
+            for c in [
+                "thinness_5bps_buy", "thinness_5bps_sell",
+                "thinness_10bps_buy", "thinness_10bps_sell",
+            ]:
+                bf[c] = np.clip(bf[c], 0.0, THIN_MAX)
 
             # signed aggr for buy/sell (neutre => 0)
             bf["aggr_ratio_10s_side_buy"]  = 2.0 * agr10 - 1.0
@@ -1326,6 +1471,7 @@ def process_symbol_year(
                 "audit_risk_r_bps": pd.to_numeric(_col_or_default(merged, "audit_risk_r_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_fill_mode": _col_or_default(merged, "audit_fill_mode", "NA", n).astype(str).values,
                 "audit_fill_window_sec": pd.to_numeric(_col_or_default(merged, "audit_fill_window_sec", np.nan, n), errors="coerce").astype(float).values,
+                "audit_p_thr_ev0": pd.to_numeric(_col_or_default(merged, "audit_p_thr_ev0", np.nan, n), errors="coerce").astype(float).values,
             })
 
             # ✅ NEW: oracle-safe supervision (post-entry) — NEVER as model features
@@ -1334,12 +1480,14 @@ def process_symbol_year(
                 book_prep=book_prep,
                 horizons_sec=SUP_HORIZONS_SEC,
             )
-
+            
             audit_flags = build_audit_flags_from_sup(merged=merged, sup_df=sup_df, debug_cols=debug)
-            out_all = pd.concat([base_out.reset_index(drop=True),
-                     bf.reset_index(drop=True),
-                     sup_df.reset_index(drop=True),
-                     audit_flags.reset_index(drop=True)], axis=1)
+
+            out_all = pd.concat([
+                base_out.reset_index(drop=True),
+                bf.reset_index(drop=True),
+                audit_flags.reset_index(drop=True)
+            ], axis=1)
 
             # Point (6): DIR drop neutral — keep only y_dir ∈ {-1,+1}
             out_go = out_all.copy()

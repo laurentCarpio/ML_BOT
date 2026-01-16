@@ -22,6 +22,24 @@ LOW_VAR_FEATURES = set()              # ou garde vide, microprice_bias ne doit p
 
 LOW_VAR_STD_FLOOR = 0.05
 
+# =============================
+# ABS-MAX caps (post-normalization)
+# =============================
+ABS_MAX_CAPS = {
+    "spread_trend_10s": 20.0,
+
+    "liq_trend_10s": 5.0,
+    "last_trade_age_s": 5.0,
+    "book_age_ms": 5.0,
+
+    "thinness_5bps_buy": 5.0,
+    "thinness_5bps_sell": 5.0,
+    "thinness_10bps_buy": 5.0,
+    "thinness_10bps_sell": 5.0,
+}
+
+CAP_EPS = 1e-9
+
 def _is_mask_col(name: str) -> bool:
     return name.endswith("_isnan") or name.endswith("_mask") or name.endswith("_flag")
 
@@ -209,10 +227,11 @@ def parse_args():
     ap.add_argument("--require-parity", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--check-audit", action=argparse.BooleanOptionalAction, default=True)
 
-    ap.add_argument("--audit-cols", type=str, default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic",
-        help="Colonnes attendues dans *_audit, séparées par des virgules (ordre important)."
+    ap.add_argument("--audit-cols", type=str, 
+                    default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0",
+                    help="Colonnes attendues dans *_audit, séparées par des virgules (ordre important)."
     )
-    
+
     # Stage4-ish audit checks
     ap.add_argument("--audit-fp-zero-on-pos", action=argparse.BooleanOptionalAction, default=True,
                     help="Si fp_cost_bps existe: check que fp_cost_bps≈0 quand label==1 (bon trade).")
@@ -306,6 +325,11 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             print(f"[W] example: {w_files_all[0]}")
 
     audit_cols = [c.strip() for c in str(args.audit_cols).split(",") if c.strip()]
+    
+    if args.check_audit and ("audit_p_thr_ev0" not in audit_cols):
+        print("⛔ audit_p_thr_ev0 requis pour Stage4 EV. Ajoute-le dans --audit-cols.")
+        return 2
+
     if args.check_audit:
         audit_dir = f"{root.rstrip('/')}/{split}_audit"
         audit_files_all = _list_all_csv_files_flat(fs, audit_dir)
@@ -451,6 +475,46 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         return pd.DataFrame(rows, columns=["col", "name", "mean", "std", "n", "nan", "posinf", "neginf", "min", "max"])
 
     feat_stats = _finalize(feat_idx)
+
+    # ----- cap hit-rate check (how often abs(z) == cap) -----
+    cap_hit_rows = []
+    for _, r in feat_stats.iterrows():
+        name = str(r["name"])
+        cap = ABS_MAX_CAPS.get(name)
+        if cap is None:
+            continue
+        mn = float(r["min"]); mx = float(r["max"])
+        absmax = max(abs(mn), abs(mx))
+        # pooled stats can't count hits; we at least flag if absmax is exactly cap
+        if abs(absmax - cap) <= 1e-6:
+            cap_hit_rows.append((name, cap, mn, mx))
+
+    if cap_hit_rows:
+        cap_hit = pd.DataFrame(cap_hit_rows, columns=["name","cap","min","max"])
+        _print_table(cap_hit, "\nℹ️ features reaching cap at least once (pooled min/max hits):", top_k=200)
+
+    # ----- ABS-MAX cap check (uses pooled min/max already computed) -----
+    cap_rows = []
+    for _, r in feat_stats.iterrows():
+        name = str(r["name"])
+        cap = ABS_MAX_CAPS.get(name)
+        if cap is None:
+            continue
+        mn = float(r["min"])
+        mx = float(r["max"])
+        absmax = max(abs(mn), abs(mx))
+        if absmax > (cap + CAP_EPS):
+            cap_rows.append((name, cap, absmax, mn, mx))
+
+    cap_bad = pd.DataFrame(cap_rows, columns=["name","cap_abs","absmax","min","max"])
+    if not cap_bad.empty:
+        cap_bad = cap_bad.sort_values("absmax", ascending=False)
+        _print_table(cap_bad, "\n⛔ ABS-MAX caps violated:", top_k=200)
+
+        # fail only when requested + train (align with your 'fail-strong' intent)
+        if args.fail_on_strong and split == "train":
+            return 2
+        
 
     if len(scaled_set) > 0 and not feat_stats.empty:
         print("\nGLOBAL SCALED feature stats (pooled, informative):")
@@ -609,6 +673,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         idx_A   = audit_cols.index("audit_early_abort") if "audit_early_abort" in audit_cols else None
         idx_B   = audit_cols.index("audit_timeout") if "audit_timeout" in audit_cols else None
         idx_C   = audit_cols.index("audit_market_toxic") if "audit_market_toxic" in audit_cols else None
+        idx_PTHR = audit_cols.index("audit_p_thr_ev0") if "audit_p_thr_ev0" in audit_cols else None
 
         # split_stats (always ON)
         A_sum = 0
@@ -626,6 +691,11 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
         fp_pos_bad = 0
         fp_pos_n = 0
+
+        P_thr_total = 0
+        P_thr_finite = 0
+        P_thr_nan = 0
+        P_thr_bad = 0
 
         for part in scanned_parts:
             x_target = per_part_rows.get(part, 0)
@@ -762,6 +832,20 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                                 ex = vv[bad][:10]
                                 print(f"⛔ {apath}: audit_market_toxic not in {{0,1}}. Examples: {ex.tolist()}")
                                 return 2
+                    
+                    if name == "audit_p_thr_ev0":
+                        P_thr_total += int(v.size)
+                        fin = np.isfinite(v)
+                        P_thr_nan += int((~fin).sum())
+                        vv = v[fin]
+                        P_thr_finite += int(vv.size)
+                        if vv.size:
+                            bad = (vv < -1e-9) | (vv > 1.0 + 1e-9)
+                            if bad.any():
+                                P_thr_bad += int(bad.sum())
+                                ex = vv[bad][:10]
+                                print(f"⛔ {apath}: audit_p_thr_ev0 hors [0,1]. Examples: {ex.tolist()}")
+                                return 2
 
                 pr += nmin
                 total_a_rows += nmin
@@ -790,6 +874,9 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             m1 = fp_sum_C1 / max(fp_n_C1, 1)
             m0 = fp_sum_C0 / max(fp_n_C0, 1)
             print(f"[audit] fp_cost_bps mean | market_toxic=1: {m1:.6g} (n={fp_n_C1}) | market_toxic=0: {m0:.6g} (n={fp_n_C0})")
+
+        if idx_PTHR is not None:
+            print(f"[audit] audit_p_thr_ev0: total={P_thr_total} finite={P_thr_finite} nan={P_thr_nan} bad_oob={P_thr_bad}")
 
         if args.audit_fp_zero_on_pos and (idx_fp is not None) and fp_pos_n > 0:
             bad_rate = fp_pos_bad / max(fp_pos_n, 1)

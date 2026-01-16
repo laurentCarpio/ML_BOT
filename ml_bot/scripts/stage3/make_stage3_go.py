@@ -91,6 +91,18 @@ GO_FEATURES = [
     "lf_atr_rank_30m",
     "atr_pct_rank_30m",
     "adx",
+    "book_age_ms",
+    "spread_trend_10s",
+    "liq_trend_10s",
+    "ret_bps_5s_back",
+
+    "n_trades_30s", "vol_traded_30s",
+    "n_trades_2m",  "vol_traded_2m",
+    "n_trades_5m",  "vol_traded_5m",
+    "last_trade_age_s",
+
+    "thinness_5bps_buy", "thinness_5bps_sell",
+    "thinness_10bps_buy","thinness_10bps_sell",
 ]
 
 GO_FEATURES_RAW = [
@@ -99,7 +111,6 @@ GO_FEATURES_RAW = [
  
 GO_FEATURES_NORM = GO_FEATURES  # backward-friendly alias (explicitly: normalized list)
 
-
 LOG1P_FEATURES = [
     "cum_depth_within_5bps_opp_buy",
     "cum_depth_within_5bps_opp_sell",
@@ -107,6 +118,13 @@ LOG1P_FEATURES = [
     "cum_depth_within_10bps_opp_sell",
     "quote_churn_10s",
     "ret_stdev_1s_10s_bps",
+    "book_age_ms",
+    "n_trades_30s","vol_traded_30s",
+    "n_trades_2m","vol_traded_2m",
+    "n_trades_5m","vol_traded_5m",
+    "last_trade_age_s",
+    "thinness_5bps_buy","thinness_5bps_sell",
+    "thinness_10bps_buy","thinness_10bps_sell",
 ]
 
 ASINH_FEATURES = [
@@ -116,10 +134,37 @@ ASINH_FEATURES = [
     "slope_opp_5_buy", "slope_opp_5_sell",
     "slope_opp_15_buy", "slope_opp_15_sell",
     "microprice_bias_side_buy", "microprice_bias_side_sell",
+    "spread_trend_10s",
+    "liq_trend_10s",
+    "ret_bps_5s_back",
 ]
 
 ROBUST_CLIP_Q = (0.005, 0.995)
 ROBUST_EPS = 1e-9
+
+# Target max absolute z after scaling (approx, based on clipped q1..q99 range)
+TARGET_ZMAX = {
+    # keep huge dynamic range (allow big z)
+    "spread_trend_10s": 20.0,
+
+    # force these under ~5
+    "liq_trend_10s": 5.0,
+    "last_trade_age_s": 5.0,
+    "book_age_ms": 5.0,
+
+    # thinness family under ~5
+    "thinness_5bps_buy": 5.0,
+    "thinness_5bps_sell": 5.0,
+    "thinness_10bps_buy": 5.0,
+    "thinness_10bps_sell": 5.0,
+}
+
+# --- Extra safety against degenerate features (near-constant -> exploding z) ---
+# Applied AFTER pre_transforms (so units are "transformed space").
+SCALE_FLOOR_OVERRIDE = {
+    # spread_trend_10s has tiny natural variance; floor prevents huge z
+    "spread_trend_10s": 1e-3,
+}
 
 FEATURE_FLOOR_Q = 0.10
 FEATURE_FLOOR_EPS = 1e-6
@@ -291,6 +336,23 @@ def _fit_robust_params_train(
         if not np.isfinite(scale_raw) or scale_raw < ROBUST_EPS:
             scale_raw = np.nan
 
+        # --- optional per-feature scale policy: enforce target z-range on clipped data ---
+        tz = TARGET_ZMAX.get(f)
+        if tz is not None and np.isfinite(tz) and tz > 0:
+            # We want: max(|(x-med)/scale|) ≈ tz on [q1,q99] range.
+            # Worst-case distance from median within clipped interval:
+            half_range = max(abs(q99 - med), abs(med - q1))
+            # If half_range is huge, scale must be huge to keep z small. If we want z<=5, scale>=half_range/5.
+            scale_target = (half_range / tz) if half_range > 0 else 0.0
+
+            # Now enforce: scale >= scale_target (so z won't exceed tz due to clipping alone)
+            if np.isfinite(scale_target) and scale_target > 0:
+                # scale_raw might be nan or tiny; take max.
+                if not np.isfinite(scale_raw) or scale_raw < ROBUST_EPS:
+                    scale_raw = scale_target
+                else:
+                    scale_raw = max(scale_raw, scale_target)
+
         rows_raw.append((tfv, f, q1, q99, med, scale_raw, scale_mad))
 
     raw_df = pd.DataFrame(rows_raw, columns=["tf", "feature", "q1", "q99", "median", "scale_raw", "scale_mad"])
@@ -303,9 +365,18 @@ def _fit_robust_params_train(
 
     raw_df["scale_floor"] = raw_df["feature"].map(lambda f: max(float(floors.get(f, 0.0)), FEATURE_FLOOR_EPS))
 
+    # enforce per-feature floor overrides (prevents tiny scales in scaler_stats.json)
+    raw_df["scale_floor"] = raw_df.apply(
+        lambda r: max(float(r["scale_floor"]), float(SCALE_FLOOR_OVERRIDE.get(str(r["feature"]), 0.0))),
+        axis=1
+    )
+
     sr = raw_df["scale_raw"].to_numpy(dtype="float64")
     sf = raw_df["scale_floor"].to_numpy(dtype="float64")
-    raw_df["scale"] = np.where(np.isfinite(sr) & (sr > 0), sr, sf)
+
+    # IMPORTANT: enforce floor even when scale_raw exists
+    sr2 = np.where(np.isfinite(sr) & (sr > 0), sr, np.nan)
+    raw_df["scale"] = np.where(np.isfinite(sr2), np.maximum(sr2, sf), sf)
 
     return raw_df[["tf", "feature", "q1", "q99", "median", "scale", "scale_floor", "scale_raw", "scale_mad"]].copy()
 
@@ -314,7 +385,6 @@ def _apply_norm(
     params_map: Dict[str, Dict[str, Tuple[float, float, float, float]]],
     features: List[str]
 ) -> pd.DataFrame:
-    # NOTE: Only pass "normalized" features here.
     df = df.copy()
     df["tf"] = df["tf"].map(_tf_key)
     df = _pre_transforms(df)
@@ -324,14 +394,26 @@ def _apply_norm(
         pm = params_map.get(str(tfv))
         if not pm:
             continue
+
         for f in features:
             if f not in df.columns or f not in pm:
                 continue
+
             q1, q99, med, scale = pm[f]
             x = pd.to_numeric(df.loc[idx, f], errors="coerce").astype("float64")
             x = np.clip(x, q1, q99)
-            denom = scale if (np.isfinite(scale) and scale >= ROBUST_EPS) else 1.0
-            df.loc[idx, f] = (x - med) / denom
+
+            # ---- policy knobs ----
+            floor = max(float(SCALE_FLOOR_OVERRIDE.get(f, 0.0)), ROBUST_EPS)
+            denom = scale if (np.isfinite(scale) and scale >= floor) else floor
+            z = (x - med) / denom
+
+            # keep hard cap (still useful)
+            tz = TARGET_ZMAX.get(f)
+            if tz is not None and np.isfinite(tz) and tz > 0:
+                z = np.clip(z, -tz, tz)
+
+            df.loc[idx, f] = z
 
     # final sanitize: no NaN/inf survives
     for f in features:
@@ -458,9 +540,87 @@ def _write_x_ids_w_audit_shards_stream(
 
 AUDIT_PNL_COL = "audit_pnl_net_bps"
 
-def _derive_toxic_from_exit_reason(aer: pd.Series) -> np.ndarray:
-    s = aer.astype(str).str.upper()
-    return s.str.contains("TOXIC", na=False).to_numpy(dtype=np.int8)
+def _clip_rate_report(df: pd.DataFrame, feats: List[str]) -> Dict:
+    """
+    Compute clip-rate per feature (|z|==tz) after _apply_norm.
+    Returns a dict with per-feature stats + per-tf breakdown.
+    """
+    out = {
+        "global": {},
+        "by_tf": {},
+    }
+
+    # --- per tf ---
+    for tfv, g in df.groupby("tf", sort=False):
+        tfv = str(tfv)
+        out["by_tf"].setdefault(tfv, {})
+        for f in feats:
+            tz = TARGET_ZMAX.get(f)
+            if tz is None or not np.isfinite(tz) or tz <= 0:
+                continue
+            if f not in g.columns:
+                continue
+            z = pd.to_numeric(g[f], errors="coerce").to_numpy(dtype="float64", copy=False)
+            z = z[np.isfinite(z)]
+            n = int(z.size)
+            if n == 0:
+                continue
+            # exact hit: safe because we clip exactly to tz in code
+            hit = int(np.sum(np.abs(z) == float(tz)))
+            out["by_tf"][tfv][f] = {
+                "n": n,
+                "tz": float(tz),
+                "clip_hits": hit,
+                "clip_rate": float(hit / n),
+            }
+
+    # --- global ---
+    for f in feats:
+        tz = TARGET_ZMAX.get(f)
+        if tz is None or not np.isfinite(tz) or tz <= 0:
+            continue
+        if f not in df.columns:
+            continue
+        z = pd.to_numeric(df[f], errors="coerce").to_numpy(dtype="float64", copy=False)
+        z = z[np.isfinite(z)]
+        n = int(z.size)
+        if n == 0:
+            continue
+        hit = int(np.sum(np.abs(z) == float(tz)))
+        out["global"][f] = {
+            "n": n,
+            "tz": float(tz),
+            "clip_hits": hit,
+            "clip_rate": float(hit / n),
+        }
+
+    return out
+
+def _print_clip_report(rep: Dict, topk: int = 20):
+    g = rep.get("global", {})
+    if not g:
+        print("[clip_report] No features with TARGET_ZMAX found.")
+        return
+    
+    rows = []
+    for f, d in g.items():
+        rows.append((d["clip_rate"], d["clip_hits"], d["n"], d["tz"], f))
+    rows.sort(reverse=True)
+
+    print("\n[clip_report] Global clip-rate (top):")
+    print("clip_rate  hits      n        tz    feature")
+    for cr, hit, n, tz, f in rows[:topk]:
+        print(f"{cr:8.4%}  {hit:7d}  {n:7d}  {tz:7.3g}  {f:22s}")
+        
+    # focus tf breakdown for spread_trend_10s (handy)
+    f0 = "spread_trend_10s"
+    if f0 in g:
+        print(f"\n[clip_report] Per-tf clip-rate for {f0}:")
+        by_tf = rep.get("by_tf", {})
+        for tfv, m in by_tf.items():
+            if f0 in m:
+                d = m[f0]
+                print(f"  tf={tfv:>4s}  clip_rate={d['clip_rate']:.4%}  hits={d['clip_hits']}  n={d['n']}  tz={d['tz']}")
 
 def _iter_x_ids_y_from_split(
     dset: ds.Dataset,
@@ -479,6 +639,7 @@ def _iter_x_ids_y_from_split(
         "audit_timeout",
         "audit_market_toxic",
         AUDIT_PNL_COL,
+        "audit_p_thr_ev0", 
     ]) | set(feats) | set(AGGR_BT_COLS))
     needed = [c for c in needed if c in schema_names]
 
@@ -556,6 +717,28 @@ def _iter_x_ids_y_from_split(
         df["tf"] = tf_norm
         df = _apply_norm(df, params_map, feats)
 
+        if stats is not None:
+            # compute clip report on this batch and aggregate
+            rep = _clip_rate_report(df, feats)
+
+            # aggregate global
+            acc = stats.setdefault("clip_report_global", {})
+            for f, d in rep.get("global", {}).items():
+                a = acc.setdefault(f, {"n": 0, "hits": 0, "tz": d["tz"]})
+                a["n"] += int(d["n"])
+                a["hits"] += int(d["clip_hits"])
+                a["tz"] = float(d["tz"])
+
+            # aggregate per tf
+            acc_tf = stats.setdefault("clip_report_by_tf", {})
+            for tfv, mm in rep.get("by_tf", {}).items():
+                tfm = acc_tf.setdefault(tfv, {})
+                for f, d in mm.items():
+                    a = tfm.setdefault(f, {"n": 0, "hits": 0, "tz": d["tz"]})
+                    a["n"] += int(d["n"])
+                    a["hits"] += int(d["clip_hits"])
+                    a["tz"] = float(d["tz"])
+
         for c in feats:
             if c not in df.columns:
                 df[c] = 0.0
@@ -597,7 +780,38 @@ def _iter_x_ids_y_from_split(
         pnl = pd.to_numeric(df[AUDIT_PNL_COL], errors="coerce").fillna(0.0).astype("float64").to_numpy()
         fp_cost = np.maximum(0.0, -pnl).astype("float32")
 
-        audit2d = np.column_stack([fp_cost, A.astype("float32"), B.astype("float32"), C.astype("float32")])
+        # --- audit_p_thr_ev0: STRICT (no imputation) ---
+        if "audit_p_thr_ev0" not in avail_cols:
+            raise ValueError("Stage3 audit: colonne manquante 'audit_p_thr_ev0' (requise).")
+
+        pthr_s = pd.to_numeric(df["audit_p_thr_ev0"], errors="coerce")
+
+        # fail fast si NaN/inf
+        if pthr_s.isna().any():
+            bad = df.loc[pthr_s.isna(), ["row_id", "event_id", "tf", "audit_p_thr_ev0"]].head(5)
+            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 NaN/NULL détecté. Exemples:\n{bad}")
+
+        pthr64 = pthr_s.to_numpy(dtype="float64", copy=False)
+        if not np.isfinite(pthr64).all():
+            idx = np.where(~np.isfinite(pthr64))[0][:5]
+            bad = df.iloc[idx][["row_id", "event_id", "tf", "audit_p_thr_ev0"]]
+            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 contient inf/NaN. Exemples:\n{bad}")
+
+        # bornes [0,1] (tol optionnelle si tu veux)
+        if (pthr64 < 0.0).any() or (pthr64 > 1.0).any():
+            idx = np.where((pthr64 < 0.0) | (pthr64 > 1.0))[0][:5]
+            bad = df.iloc[idx][["row_id", "event_id", "tf", "audit_p_thr_ev0"]]
+            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 hors [0,1]. Exemples:\n{bad}")
+
+        pthr = pthr64.astype("float32", copy=False)
+
+        audit2d = np.column_stack([
+            fp_cost,
+            A.astype("float32"),
+            B.astype("float32"),
+            C.astype("float32"),
+            pthr,                       
+        ])
         
         # ---- split_stats (audit) ----
         if stats is not None:
@@ -642,7 +856,7 @@ def parse_args():
     ap.add_argument("--batch-size", type=int, default=200_000)
     ap.add_argument("--rows-per-shard", type=int, default=1_000_000)
 
-    ap.add_argument("--sample-per-tf-feature", type=int, default=200_000,
+    ap.add_argument("--sample-per-tf-feature", type=int, default=20_000,
                     help="Reservoir sample size per (tf, feature) for robust stats (TRAIN only).")
     ap.add_argument("--seed", type=int, default=1337)
     return ap.parse_args()
@@ -735,6 +949,21 @@ def main():
             args.rows_per_shard
         )
 
+        # pretty print aggregated clip report
+        if "clip_report_global" in split_stats:
+            # rebuild rep-like structure for printer
+            rep2 = {"global": {}, "by_tf": {}}
+            for f, a in split_stats["clip_report_global"].items():
+                n = int(a["n"]); hit = int(a["hits"]); tz = float(a["tz"])
+                rep2["global"][f] = {"n": n, "clip_hits": hit, "clip_rate": (hit / max(1, n)), "tz": tz,
+                                    "mean": 0.0, "std": 0.0, "p01": 0.0, "p99": 0.0}
+            for tfv, mm in split_stats.get("clip_report_by_tf", {}).items():
+                rep2["by_tf"][tfv] = {}
+                for f, a in mm.items():
+                    n = int(a["n"]); hit = int(a["hits"]); tz = float(a["tz"])
+                    rep2["by_tf"][tfv][f] = {"n": n, "clip_hits": hit, "clip_rate": (hit / max(1, n)), "tz": tz}
+            _print_clip_report(rep2, topk=30)
+
         print(f"[{split_name}] write stats:", split_stats)
 
         return nx, nids, nw, pos_total, neg_total, split_stats
@@ -794,7 +1023,7 @@ def main():
                 "val_ids": "val_ids/part-*.csv",
                 "test_ids": "test_ids/part-*.csv"
             },
-            "audit_format": "CSV, no header, columns: fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic (aligned with X shards)",
+            "audit_format": "CSV, no header, columns: fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic, pthr(aligned with X shards)",
             "audit_paths": {
                 "train_audit": "train_audit/part-*.csv",
                 "val_audit": "val_audit/part-*.csv",
@@ -809,8 +1038,13 @@ def main():
         f.write(json.dumps({
             "pos": int(pos_tr),
             "neg": int(neg_tr),
-            "scale_pos_weight_raw": float(posw),
-            "note": "Weights saved in train_weight shards are normalized to mean=1.",
+            "pos_weight_strategy": {
+                "type": "sample_weight",
+                "definition": "positive samples weighted as (neg/pos), then normalized to mean=1",
+                "applies_to": "train only",
+            },
+            "note": "No scale_pos_weight must be used at training time. "
+                    "Class imbalance is handled exclusively via per-sample weights (train_weight shards).",
         }, indent=2).encode("utf-8"))
 
     with _open_s3_output(fs, f"{meta_root}/write_stats.json") as f:

@@ -35,9 +35,7 @@ TST_DIR = f"{DATA_ROOT}/test"
 
 TRW_DIR = f"{DATA_ROOT}/train_weight"
 VAW_DIR = f"{DATA_ROOT}/val_weight"
-TSW_DIR = f"{DATA_ROOT}/test_weight"
 
-TRA_DIR = f"{DATA_ROOT}/train_audit"
 VAA_DIR = f"{DATA_ROOT}/val_audit"
 TSA_DIR = f"{DATA_ROOT}/test_audit"
 
@@ -49,27 +47,25 @@ MAX_RUN_SEC     = 60 * 20
 MAX_WAIT_SEC    = 60 * 40
 
 # === Stage4: sweep budgets (VAL-only decision) ===
-# B = budget en bps (somme fp_cost_bps sur les faux positifs prédits)
-DEFAULT_B_SWEEP = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0]
-
-DEFAULT_K_TOXIC_SWEEP   = [0, 1]
-DEFAULT_K_TIMEOUT_SWEEP = [10, 50, 200]   # exemple, ajuste
-DEFAULT_K_ABORT_SWEEP   = [10, 50, 200]   # exemple, ajuste
 
 HP_BASE: Dict[str, Any] = dict(
     tree_method="hist",
     eta=0.05,
     subsample=0.8,
     colsample_bytree=0.8,
-    num_round=400,
-    early_stopping_rounds=50,
+    num_round=600,              # un peu plus long pour compenser le modèle plus régularisé
+    early_stopping_rounds=80,   # laisse respirer avant de stopper
     objective="binary:logistic",
     eval_metric="logloss",
-    reg_lambda=5.0,
-    reg_alpha=0.2,
-    gamma=0.5,
-    max_depth=4,
-    min_child_weight=5,
+
+    # regularisation + anti-suractivation
+    reg_lambda=15.0,            # ↑ shrink les splits
+    reg_alpha=1.0,              # ↑ pousse à des splits plus “utiles”
+    gamma=2.0,                  # ↑ seuil minimum de gain => moins de micro-splits
+
+    # structure plus simple (évite le plateau)
+    max_depth=3,                # ↓ moins profond                    .....essayer 2  plus tard ?
+    min_child_weight=30,        # ↑ empêche les feuilles “fragiles”  .....essayer 50 plus tard ?
     max_delta_step=1,
 )
 
@@ -98,16 +94,10 @@ def parse_args():
                     help="train = lance des jobs SageMaker, eval = évalue un model_uri existant (sans retrain).")
     ap.add_argument("--model-uri", default="",
                     help="Requis en mode eval: s3://.../model.tar.gz")
-
-    ap.add_argument("--b-sweep", default=",".join(str(x) for x in DEFAULT_B_SWEEP),
-                    help="Liste de budgets B (bps) séparés par virgules. Ex: 0,0.5,1,2,5")
-    
-    ap.add_argument("--k-toxic-sweep", default=",".join(str(x) for x in DEFAULT_K_TOXIC_SWEEP))
-    ap.add_argument("--k-timeout-sweep", default=",".join(str(x) for x in DEFAULT_K_TIMEOUT_SWEEP))
-    ap.add_argument("--k-abort-sweep", default=",".join(str(x) for x in DEFAULT_K_ABORT_SWEEP))
-    
-    ap.add_argument("--audit-cols", default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic",
-                    help="Colonnes attendues dans *_audit (no header), ordre important.")
+        
+    ap.add_argument("--audit-cols", default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0",
+                    help="Colonnes attendues dans *_audit (no header), ordre important."
+    )
     
     ap.add_argument("--require-audit", action=argparse.BooleanOptionalAction, default=True,
                     help="Fail si val_audit n'existe pas.")
@@ -130,15 +120,6 @@ def _load_columns_meta(fs: s3fs.S3FileSystem, meta_dir: str):
     if not isinstance(feats, list) or not feats:
         raise RuntimeError(f"columns.json invalide: features vide ({cols_path})")
     return label, [str(x) for x in feats]
-
-def _load_train_balance(fs: s3fs.S3FileSystem, meta_dir: str):
-    path = f"{meta_dir}/train_class_balance.json"
-    try:
-        bal = _read_json_s3(fs, path)
-        spw = bal.get("scale_pos_weight_raw", None)
-        return bal, float(spw) if spw is not None else None
-    except Exception:
-        return None, None
 
 def _merge_hps(base: dict, overlay: dict):
     h = base.copy()
@@ -251,133 +232,165 @@ def _load_audit_by_cols(fs: s3fs.S3FileSystem, prefix: str, audit_cols: List[str
         out[name] = df.iloc[:, j].astype(np.float64).to_numpy()
     return out
 
-def _best_threshold_under_budgets(
+def _check_thr01(thr: np.ndarray, where: str, eps: float = 1e-12):
+    thr = np.asarray(thr, dtype=np.float64)
+    if not np.isfinite(thr).all():
+        raise RuntimeError(f"[{where}] audit_p_thr_ev0 contains NaN/inf.")
+    if np.any(thr < -eps) or np.any(thr > 1.0 + eps):
+        raise RuntimeError(f"[{where}] audit_p_thr_ev0 out of [0,1].")
+
+def _best_threshold_by_ev(
     y: np.ndarray,
     p: np.ndarray,
     fp_cost_bps: np.ndarray,
     audit_market_toxic: np.ndarray,
     audit_timeout: np.ndarray,
     audit_early_abort: np.ndarray,
-    B: float,
-    K_toxic: int,
-    K_timeout: int,
-    K_abort: int,
+    audit_p_thr_ev0: np.ndarray,
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """
-    Sélectionne un seuil sur VAL (VAL-only) qui maximise TP sous:
-      sum(fp_cost_bps sur FP prédits) <= B
-      count(audit_market_toxic==1 sur FP prédits) <= K_toxic
-    Gestion des ties: on évalue par "score group" (même proba).
+    Choisit un seuil (sur VAL) qui maximise:
+      EV = Σ_{TP} ( (1 - p_thr) * fp_cost_bps )  -  Σ_{FP} ( p_thr * fp_cost_bps )
+           -  Σ(flag penalties)
+
+    Flag penalties (en bps): on réutilise fp_cost_bps comme pénalité unitaire si flag==1.
+      penalty_flags = Σ_{pred_pos & flag}( fp_cost_bps )
+
+    Notes:
+    - audit_p_thr_ev0 est obligatoire et déjà borné [0,1].
+    - On évalue uniquement des seuils aux fins de "score groups" (p identiques).
+    - Tie-break: max EV, puis max TP, puis min FP, puis thr plus haut.
     """
-    y = y.astype(np.int64, copy=False)
-    p = p.astype(np.float64, copy=False)
-    fp_cost_bps = fp_cost_bps.astype(np.float64, copy=False)
-    mt = audit_market_toxic.astype(np.float64, copy=False)
-    to = audit_timeout.astype(np.float64, copy=False)
-    ab = audit_early_abort.astype(np.float64, copy=False)
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    cost = np.asarray(fp_cost_bps, dtype=np.float64)
+    mt = np.asarray(audit_market_toxic, dtype=np.int64)
+    to = np.asarray(audit_timeout, dtype=np.int64)
+    ab = np.asarray(audit_early_abort, dtype=np.int64)
+    thr0 = np.asarray(audit_p_thr_ev0, dtype=np.float64)
 
-    n = int(len(y))
+    n = int(y.shape[0])
     if n == 0:
-        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "empty"}
+        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "empty", "EV_bps": 0.0, "TP": 0, "FP": 0}
 
-    order = np.argsort(-p, kind="mergesort")  # stable
+    _check_flags_binary(
+        {"audit_market_toxic": mt, "audit_timeout": to, "audit_early_abort": ab},
+        ["audit_market_toxic", "audit_timeout", "audit_early_abort"],
+        "EV/flags"
+    )
+    if np.any(cost < -eps):
+        raise RuntimeError("[EV] fp_cost_bps has negative values (should be >= 0).")
+    _check_thr01(thr0, "EV/audit_p_thr_ev0", eps=eps)
+
+    # Sort par proba décroissante (stable)
+    order = np.argsort(-p, kind="mergesort")
     ps = p[order]
     ys = y[order]
-    cs = fp_cost_bps[order]
+    cs = cost[order]
     mt = mt[order]
     to = to[order]
     ab = ab[order]
+    th = thr0[order]
 
+    pred_pos_prefix = np.ones(n, dtype=bool)  # pour "prefix" logique
+    tp_mask = (ys == 1)
     fp_mask = (ys == 0)
-    tp_cum = np.cumsum(ys == 1)
-    fp_cost_cum = np.cumsum(cs * fp_mask)
 
-    tox_cum  = np.cumsum(fp_mask & (mt.astype(np.int64, copy=False) == 1))
-    tout_cum = np.cumsum(fp_mask & (to.astype(np.int64, copy=False) == 1))
-    abrt_cum = np.cumsum(fp_mask & (ab.astype(np.int64, copy=False) == 1))
-    neg_cum = np.cumsum(fp_mask)  # here prefix is predicted positive => neg_cum == FP_cum
+    # --- EV components on prefix ---
+    # TP reward: (1 - th) * cs
+    tp_reward = ((1.0 - th) * cs) * tp_mask
 
-    # group ends where score changes
-    change = np.ones_like(ps, dtype=bool)
-    change[1:] = (ps[1:] != ps[:-1])
-    group_ends = np.where(change)[0]
-    # group_ends are group starts; we need ends:
-    # start indices: group_ends; end indices: next_start-1, last=n-1
-    starts = group_ends
-    ends = np.empty_like(starts)
-    ends[:-1] = starts[1:] - 1
-    ends[-1] = n - 1
+    # FP penalty: th * cs
+    fp_penalty = (th * cs) * fp_mask
+
+    # Flags penalties (appliquées sur pred_pos uniquement)
+    flag_pen = cs * (mt == 1) + cs * (to == 1) + cs * (ab == 1)
+
+    tp_reward_cum = np.cumsum(tp_reward)
+    fp_penalty_cum = np.cumsum(fp_penalty)
+    flag_pen_cum = np.cumsum(flag_pen)
+
+    EV_cum = tp_reward_cum - fp_penalty_cum - flag_pen_cum
+
+    TP_cum = np.cumsum(tp_mask)
+    FP_cum = np.cumsum(fp_mask)
+
+    # fins de groupes de proba
+    if n == 1:
+        ends = np.array([0], dtype=np.int64)
+    else:
+        ends = np.r_[np.where(ps[1:] != ps[:-1])[0], n - 1].astype(np.int64)
 
     best = None
     for end in ends:
-        cost = float(fp_cost_cum[end])
-        tox  = int(tox_cum[end])
-        tout = int(tout_cum[end])
-        abrt = int(abrt_cum[end])
-        if (cost <= B + eps) and (tox <= K_toxic) and (tout <= K_timeout) and (abrt <= K_abort):
-            cand = {
-                "end": int(end),
-                "thr": float(ps[end]),
-                "TP": int(tp_cum[end]),
-                "FP": int(neg_cum[end]),
-                "fp_cost_sum_bps": cost,
-                "fp_toxic": tox,
-                "fp_timeout": tout,
-                "fp_abort": abrt,
-            }
-            if best is None:
+        ev = float(EV_cum[end])
+        cand = {
+            "end": int(end),
+            "thr": float(ps[end]),
+            "EV_bps": ev,
+            "TP": int(TP_cum[end]),
+            "FP": int(FP_cum[end]),
+            "tp_reward_sum_bps": float(tp_reward_cum[end]),
+            "fp_penalty_sum_bps": float(fp_penalty_cum[end]),
+            "flag_penalty_sum_bps": float(flag_pen_cum[end]),
+        }
+        if best is None:
+            best = cand
+        else:
+            if (
+                cand["EV_bps"] > best["EV_bps"] + eps or
+                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] > best["TP"]) or
+                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] < best["FP"]) or
+                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] == best["FP"] and cand["thr"] > best["thr"])
+            ):
                 best = cand
-            else:
-                # objective: max TP, then min cost, then min fp_toxic, then min FP, then higher threshold
-                if (
-                    cand["TP"] > best["TP"] or
-                    (cand["TP"] == best["TP"] and cand["fp_cost_sum_bps"] < best["fp_cost_sum_bps"] - eps) or
-                    (cand["TP"] == best["TP"] and abs(cand["fp_cost_sum_bps"] - best["fp_cost_sum_bps"]) <= eps and cand["fp_toxic"] < best["fp_toxic"]) or
-                    (cand["TP"] == best["TP"] and abs(cand["fp_cost_sum_bps"] - best["fp_cost_sum_bps"]) <= eps and cand["fp_toxic"] == best["fp_toxic"] and cand["fp_timeout"] < best["fp_timeout"]) or
-                    (cand["TP"] == best["TP"] and abs(cand["fp_cost_sum_bps"] - best["fp_cost_sum_bps"]) <= eps and cand["fp_toxic"] == best["fp_toxic"] and cand["fp_timeout"] == best["fp_timeout"] and cand["fp_abort"] < best["fp_abort"]) or
-                    (cand["TP"] == best["TP"] and abs(cand["fp_cost_sum_bps"] - best["fp_cost_sum_bps"]) <= eps and cand["fp_toxic"] == best["fp_toxic"] and cand["fp_timeout"] == best["fp_timeout"] and cand["fp_abort"] == best["fp_abort"] and cand["FP"] < best["FP"]) or
-                    (cand["TP"] == best["TP"] and abs(cand["fp_cost_sum_bps"] - best["fp_cost_sum_bps"]) <= eps and cand["fp_toxic"] == best["fp_toxic"] and cand["fp_timeout"] == best["fp_timeout"] and cand["fp_abort"] == best["fp_abort"] and cand["FP"] == best["FP"] and cand["thr"] > best["thr"])
-                ):
-                    best = cand
 
     if best is None:
-        # Aucun seuil non-trivial ne respecte le budget -> seuil = 1.0 => predict none
-        return {
-            "decision_threshold": 1.0,
-            "chosen_end": -1,
-            "TP": 0,
-            "FP": 0,
-            "fp_cost_sum_bps": 0.0,
-            "fp_toxic": 0,
-            "fp_timeout": 0,
-            "fp_abort": 0,
-            "why": "no feasible threshold under budgets",
-        }
+        # predict none
+        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "no candidates", "EV_bps": 0.0, "TP": 0, "FP": 0}
 
     return {
         "decision_threshold": float(best["thr"]),
         "chosen_end": int(best["end"]),
+        "EV_bps": float(best["EV_bps"]),
         "TP": int(best["TP"]),
         "FP": int(best["FP"]),
-        "fp_cost_sum_bps": float(best["fp_cost_sum_bps"]),
-        "fp_toxic": int(best["fp_toxic"]),
-        "fp_timeout": int(best["fp_timeout"]),
-        "fp_abort": int(best["fp_abort"]),
+        "tp_reward_sum_bps": float(best["tp_reward_sum_bps"]),
+        "fp_penalty_sum_bps": float(best["fp_penalty_sum_bps"]),
+        "flag_penalty_sum_bps": float(best["flag_penalty_sum_bps"]),
         "why": "ok",
     }
 
-def _eval_budget_fields(y, p, thr, fp_cost_bps, audit_market_toxic, audit_timeout, audit_early_abort):
-    y = y.astype(np.int64, copy=False)
-    yb = (p >= thr).astype(np.int64)
-    fp = (y == 0) & (yb == 1)
+def _eval_ev_fields(y, p, thr, fp_cost_bps, audit_market_toxic, audit_timeout, audit_early_abort, audit_p_thr_ev0, eps: float = 1e-12):
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    yb = (p >= float(thr)).astype(np.int64)
+    pred_pos = (yb == 1)
+    tp = pred_pos & (y == 1)
+    fp = pred_pos & (y == 0)
 
-    cost = float(np.sum(fp_cost_bps[fp])) if fp.any() else 0.0
-    tox  = int(np.sum(audit_market_toxic[fp].astype(np.int64, copy=False) == 1)) if fp.any() else 0
-    tout = int(np.sum(audit_timeout[fp].astype(np.int64, copy=False) == 1)) if fp.any() else 0
-    abrt = int(np.sum(audit_early_abort[fp].astype(np.int64, copy=False) == 1)) if fp.any() else 0
+    cost = np.asarray(fp_cost_bps, dtype=np.float64)
+    th = np.asarray(audit_p_thr_ev0, dtype=np.float64)
+    _check_thr01(th, "EVAL/audit_p_thr_ev0", eps=eps)
 
-    return {"fp_cost_sum_bps": cost, "fp_toxic": tox, "fp_timeout": tout, "fp_abort": abrt}
+    tp_reward = float(np.sum(((1.0 - th) * cost)[tp])) if np.any(tp) else 0.0
+    fp_penalty = float(np.sum((th * cost)[fp])) if np.any(fp) else 0.0
+
+    mt = np.asarray(audit_market_toxic, dtype=np.int64)
+    to = np.asarray(audit_timeout, dtype=np.int64)
+    ab = np.asarray(audit_early_abort, dtype=np.int64)
+
+    flag_pen = float(np.sum(cost[pred_pos & (mt == 1)])) + float(np.sum(cost[pred_pos & (to == 1)])) + float(np.sum(cost[pred_pos & (ab == 1)]))
+
+    ev = tp_reward - fp_penalty - flag_pen
+
+    return {
+        "EV_bps": float(ev),
+        "tp_reward_sum_bps": float(tp_reward),
+        "fp_penalty_sum_bps": float(fp_penalty),
+        "flag_penalty_sum_bps": float(flag_pen),
+    }
 
 def _load_booster_from_tar(fs: s3fs.S3FileSystem, model_uri: str) -> xgb.Booster:
     with fs.open(model_uri, "rb") as f:
@@ -435,15 +448,11 @@ def _eval_split_from_scores(y: np.ndarray, p: np.ndarray, thr: float) -> dict:
         "precision": float(tp / max(tp + fp, 1)),
     }
 
-def evaluate_budget_sweep(model_uri: str,
+def evaluate_ev_sweep(model_uri: str,
                           val_prefix: str, tst_prefix: str,
                           val_audit_prefix: str,
                           tst_audit_prefix: str,
                           audit_cols: List[str],
-                          B_sweep: List[float],
-                          K_toxic_sweep: List[int],
-                          K_timeout_sweep: List[int],
-                          K_abort_sweep: List[int],
                           require_audit: bool,
                           allow_feature_mismatch: bool = False,
                           eps: float = 1e-12) -> dict:
@@ -462,7 +471,7 @@ def evaluate_budget_sweep(model_uri: str,
 
     # --- VAL checks (clean) ---
     n_val = int(len(yv))
-    required = ["fp_cost_bps", "audit_market_toxic", "audit_timeout", "audit_early_abort"]
+    required = ["fp_cost_bps", "audit_market_toxic", "audit_timeout", "audit_early_abort", "audit_p_thr_ev0"]
 
     missing = [c for c in required if c not in aud_v]
     if missing:
@@ -518,77 +527,54 @@ def evaluate_budget_sweep(model_uri: str,
     pv = booster.predict(xgb.DMatrix(Xv))
     pt = booster.predict(xgb.DMatrix(Xt))
 
-    rows = []
-    for B in B_sweep:
-        for Kt in K_toxic_sweep:
-            for Kto in K_timeout_sweep:
-                for Ka in K_abort_sweep:
-                    sel = _best_threshold_under_budgets(
-                        y=yv, p=pv,
-                        fp_cost_bps=aud_v["fp_cost_bps"],
-                        audit_market_toxic=aud_v["audit_market_toxic"],
-                        audit_timeout=aud_v["audit_timeout"],
-                        audit_early_abort=aud_v["audit_early_abort"],
-                        B=float(B),
-                        K_toxic=int(Kt),
-                        K_timeout=int(Kto),
-                        K_abort=int(Ka),
-                        eps=float(eps),
-                    )
-                    thr = float(sel["decision_threshold"])
-                    val_m = _eval_split_from_scores(yv, pv, thr)
-                    val_budget = _eval_budget_fields(
-                        yv, pv, thr,
-                        aud_v["fp_cost_bps"],
-                        aud_v["audit_market_toxic"],
-                        aud_v["audit_timeout"],
-                        aud_v["audit_early_abort"],
-                    )
-                    tst_m = _eval_split_from_scores(yt, pt, thr)
+    sel = _best_threshold_by_ev(
+        y=yv, p=pv,
+        fp_cost_bps=aud_v["fp_cost_bps"],
+        audit_market_toxic=aud_v["audit_market_toxic"],
+        audit_timeout=aud_v["audit_timeout"],
+        audit_early_abort=aud_v["audit_early_abort"],
+        audit_p_thr_ev0=aud_v["audit_p_thr_ev0"],
+        eps=float(eps),
+    )
+    thr = float(sel["decision_threshold"])
 
-                    row = {
-                        "B_bps": float(B),
-                        "K_toxic": int(Kt),
-                        "K_timeout": int(Kto),
-                        "K_abort": int(Ka),
-                        "decision_threshold": float(thr),
-                        "val": {**val_m, **val_budget},
-                        "test": tst_m,
-                    }
-                    if has_test_audit:
-                        tst_budget = _eval_budget_fields(
-                            yt, pt, thr,
-                            aud_t["fp_cost_bps"],
-                            aud_t["audit_market_toxic"],
-                            aud_t["audit_timeout"],
-                            aud_t["audit_early_abort"],
-                        )
-                        row["test"].update(tst_budget)
-                    else:
-                        row["test"].update({"fp_cost_sum_bps": None, "fp_toxic": None, "fp_timeout": None, "fp_abort": None,
-                                            "note": "test_audit missing/incomplete => budgets not reported on test"})
-                    rows.append(row)
+    val_m = _eval_split_from_scores(yv, pv, thr)
+    val_ev = _eval_ev_fields(
+        yv, pv, thr,
+        aud_v["fp_cost_bps"],
+        aud_v["audit_market_toxic"],
+        aud_v["audit_timeout"],
+        aud_v["audit_early_abort"],
+        aud_v["audit_p_thr_ev0"],
+        eps=float(eps),
+    )
 
-    # Sélection VAL-only: max TP, puis min fp_cost_sum_bps, puis min fp_toxic, puis min FP, puis thr plus haut
+    tst_m = _eval_split_from_scores(yt, pt, thr)
 
-    if not rows:
-        raise RuntimeError("Budget sweep vide: vérifie --b-sweep / --k-*-sweep")
-
-    best = min(rows, key=lambda r: (
-        -r["val"]["TP"],
-        r["val"]["fp_cost_sum_bps"],
-        r["val"]["fp_toxic"],
-        r["val"]["fp_timeout"],
-        r["val"]["fp_abort"],
-        r["val"]["FP"],
-        -r["decision_threshold"],
-    ))
+    best = {
+        "decision_threshold": thr,
+        "val": {**val_m, **val_ev},
+        "test": tst_m,
+        "chosen": sel,
+    }
+    if has_test_audit:
+        tst_ev = _eval_ev_fields(
+            yt, pt, thr,
+            aud_t["fp_cost_bps"],
+            aud_t["audit_market_toxic"],
+            aud_t["audit_timeout"],
+            aud_t["audit_early_abort"],
+            aud_t["audit_p_thr_ev0"],
+            eps=float(eps),
+        )
+        best["test"].update(tst_ev)
+    else:
+        best["test"].update({"EV_bps": None, "note": "test_audit missing/incomplete => EV not reported on test"})
 
     return {
         "feature_fix": {"val": fix_v, "test": fix_t},
-        "sweep": rows,
         "best_by_val_only": best,
-        "note": "Selection uses ONLY VAL constraints/metrics. TEST is reporting only.",
+        "note": "Selection uses ONLY VAL EV. TEST is reporting only.",
     }
 
 def main():
@@ -601,21 +587,12 @@ def main():
         _require_csv_prefix(fs, VAA_DIR, "val_audit")
 
     label_name, feature_names = _load_columns_meta(fs, META_DIR)
-    _, spw = _load_train_balance(fs, META_DIR)
 
     hp_base = dict(HP_BASE)
-    if spw is not None:
-        hp_base["scale_pos_weight"] = float(spw)
-        print(f"[meta] scale_pos_weight = {spw:.6g} (from train_class_balance.json)")
     print(f"[meta] label_col = {label_name} | n_features={len(feature_names)}")
 
     sess = sagemaker.Session(boto3.Session(region_name=REGION))
     s3c = _boto3_client("s3", REGION)
-
-    B_sweep = _parse_list(args.b_sweep, float)
-    K_toxic_sweep   = _parse_list(args.k_toxic_sweep, int)
-    K_timeout_sweep = _parse_list(args.k_timeout_sweep, int)
-    K_abort_sweep   = _parse_list(args.k_abort_sweep, int)
 
     audit_cols = [c.strip() for c in str(args.audit_cols).split(",") if c.strip()]
 
@@ -640,15 +617,11 @@ def main():
         print(f"[run] MODE=eval | model_uri={args.model_uri}")
         row: Dict[str, Any] = {"mode": "eval", "model_uri": args.model_uri, "status": "ok"}
 
-        sweep = evaluate_budget_sweep(
+        sweep = evaluate_ev_sweep(
             model_uri=row["model_uri"],
             val_prefix=VAL_DIR, tst_prefix=TST_DIR,
             val_audit_prefix=VAA_DIR, tst_audit_prefix=TSA_DIR,
             audit_cols=audit_cols,
-            B_sweep=B_sweep,
-            K_toxic_sweep=K_toxic_sweep,
-            K_timeout_sweep=K_timeout_sweep,
-            K_abort_sweep=K_abort_sweep,
             require_audit=bool(args.require_audit),
             allow_feature_mismatch=bool(args.allow_feature_mismatch),
             eps=float(args.eps),
@@ -670,18 +643,14 @@ def main():
                 row["train_seconds"] = float(round(time.time() - t0, 2))
                 row["model_uri"] = est.model_data
 
-                sweep = evaluate_budget_sweep(
+                sweep = evaluate_ev_sweep(
                     model_uri=row["model_uri"],
                     val_prefix=VAL_DIR, tst_prefix=TST_DIR,
                     val_audit_prefix=VAA_DIR, tst_audit_prefix=TSA_DIR,
                     audit_cols=audit_cols,
-                    B_sweep=B_sweep,
-                    K_toxic_sweep=K_toxic_sweep,
-                    K_timeout_sweep=K_timeout_sweep,
-                    K_abort_sweep=K_abort_sweep,
                     require_audit=bool(args.require_audit),
                     allow_feature_mismatch=bool(args.allow_feature_mismatch),
-                    eps=float(args.eps)
+                    eps=float(args.eps),
                 )
 
                 row["sweep"] = _json_sanitize(sweep)
@@ -690,9 +659,9 @@ def main():
 
                 b = sweep["best_by_val_only"]
                 print(
-                    f"[BEST@VAL] B={b['B_bps']} K={b['K_toxic']} thr={b['decision_threshold']:.6g} | "
-                    f"VAL TP={b['val']['TP']} FP={b['val']['FP']} "
-                    f"fp_cost_sum_bps={b['val']['fp_cost_sum_bps']:.6g} fp_toxic={b['val']['fp_toxic']} | "
+                    f"[BEST@VAL] thr={b['decision_threshold']:.6g} | "
+                    f"VAL EV_bps={b['val'].get('EV_bps', float('nan')):.6g} "
+                    f"TP={b['val']['TP']} FP={b['val']['FP']} | "
                     f"TEST(report) TP={b['test']['TP']} FP={b['test']['FP']}"
                 )
 
@@ -707,28 +676,23 @@ def main():
     ok_rows = [r for r in results if r.get("status") == "ok"]
     best = None
     if ok_rows:
-        best = min(
-        ok_rows,
-        key=lambda r: (
-            -r["best"]["val"]["TP"],              # max TP
-            r["best"]["val"]["fp_cost_sum_bps"],  # min cost
-            r["best"]["val"]["fp_toxic"],         # min toxic
-            r["best"]["val"]["fp_timeout"],       # min timeout
-            r["best"]["val"]["fp_abort"],         # min abort
-            r["best"]["val"]["FP"],               # min FP
-            -r["best"]["decision_threshold"],     # max thr
+        best = max(
+            ok_rows,
+            key=lambda r: (
+                r["best"]["val"].get("EV_bps", -1e30),
+                r["best"]["val"]["TP"],
+                -r["best"]["val"]["FP"],
+                r["best"]["decision_threshold"],
+            ),
         )
-    )
 
     final_out = {
         "timestamp": stamp,
         "data_root": DATA_ROOT,
         "hp_base": _json_sanitize(hp_base),
-        "budget_sweep": {
-            "B_bps": B_sweep,
-            "K_toxic": K_toxic_sweep,
-            "K_timeout": K_timeout_sweep,
-            "K_abort": K_abort_sweep,
+        "selection": {
+            "type": "EV",
+            "note": "VAL-only maximize EV (TP reward - FP penalty - flag penalties) using audit_p_thr_ev0",
         },
         "results": results,
         "best": best,
@@ -759,26 +723,20 @@ def main():
             "side": "go",
             "data_root": DATA_ROOT,
             "metrics": {
-                "selection": "VAL-only budgeted sweep (sum(fp_cost_bps on FP) <= B, FP flags caps)",
+                "selection": "VAL-only maximize EV (TP reward - FP penalty - flag penalties) using audit_p_thr_ev0",
                 "best": best["best"],
-                "sweep": best["sweep"]["sweep"],
             },
             "inference": {
                 "decision_threshold": float(b["decision_threshold"]),
                 "proba_semantics": "p = P(Y=1)",
                 "invert_output": False,
                 "autoflip_allowed": False,
-                "budget_constraints": {
-                "B_bps": float(b["B_bps"]),
-                "K_toxic": int(b["K_toxic"]),
-                "K_timeout": int(b["K_timeout"]),
-                "K_abort": int(b["K_abort"]),
-                "fields": {
+                "ev_fields": {
                     "fp_cost_bps": "fp_cost_bps",
                     "audit_market_toxic": "audit_market_toxic",
                     "audit_timeout": "audit_timeout",
                     "audit_early_abort": "audit_early_abort",
-                },
+                    "audit_p_thr_ev0": "audit_p_thr_ev0",
                 },
             },
             "data_contract": {
@@ -787,7 +745,7 @@ def main():
                 "features": feature_names,
                 "scaler_stats_uri": scaler_stats_uri,
                 "normalize_at_infer": False,
-            },
+                },
             }
         
         _s3_put_bytes_uri(s3c, manifest_uri, _json_dumps_safe(manifest))

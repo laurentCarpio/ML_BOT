@@ -176,33 +176,6 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 # Book normalization + read/resample (RAM-safe 5s only)
 # ============================================================
 
-def _normalize_book_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = {c.lower(): c for c in df.columns}
-    if "timestamp" not in cols:
-        raise ValueError("Book parquet: missing 'timestamp' column")
-    ts_col = cols["timestamp"]
-
-    bid_col = ask_col = None
-    for b, a in [("bid", "ask"), ("bid_0_price", "ask_0_price")]:
-        if b in cols and a in cols:
-            bid_col, ask_col = cols[b], cols[a]
-            break
-    if bid_col is None or ask_col is None:
-        raise ValueError("Book parquet: need bid/ask (bid_0_price/ask_0_price)")
-
-    bid0 = pd.to_numeric(df[bid_col], errors="coerce").astype("float64")
-    ask0 = pd.to_numeric(df[ask_col], errors="coerce").astype("float64")
-    mid = (bid0 + ask0) / 2.0
-    spread_bps = ((ask0 - bid0) / mid) * 1e4
-
-    return pd.DataFrame({
-        "timestamp": df[ts_col],
-        "bid0": bid0,
-        "ask0": ask0,
-        "mid": mid,
-        "spread_bps": spread_bps,
-    })
-
 def _read_book_l1_resampled_5s(
     book_glob: str,
     so: dict,
@@ -601,6 +574,26 @@ def process_symbol_year(
         TP_bps_arr = (rr_tf * R_bps_arr).astype(np.float64)
         SL_bps_arr = R_bps_arr  # 1R
 
+        # --- EV threshold (EV=0) ---
+        # cost (bps) = entry_spread_half_bps + fee_exit_bps
+        cost_bps_arr = cost  # déjà float64
+
+        denom = TP_bps_arr + SL_bps_arr
+        denom = np.maximum(denom, 1e-12)  # safety
+
+        p_thr_ev0 = (SL_bps_arr + cost_bps_arr) / denom
+        p_thr_ev0 = np.clip(p_thr_ev0, 0.0, 1.0).astype(np.float32)
+
+        if not np.isfinite(p_thr_ev0).all():
+            raise RuntimeError(f"{symbol} {year} tf={tf}: p_thr_ev0 contains NaN/inf")
+
+        # sanity: si rr_tf augmente, en général TP augmente => p_thr_ev0 devrait baisser (toutes choses égales)
+        # (pas une assertion globale, juste un log si valeurs bizarres)
+        q = np.quantile(p_thr_ev0, [0.01, 0.5, 0.99])
+        logger.info(f"{symbol} {year} tf={tf} p_thr_ev0 quantiles: {q}")
+
+        out[f"p_thr_ev0_{tf}"] = p_thr_ev0
+
         logger.info(f"{symbol} {year} tf={tf} RR start (h={horizon_sec}s window={window} step={step_sec}s rr_min={rr_tf})")
         t_tf0 = _now()
 
@@ -789,6 +782,7 @@ def process_symbol_year(
             f"risk_r_bps_{tf}",
             f"tp_bps_{tf}",
             f"sl_bps_{tf}",
+            f"p_thr_ev0_{tf}",
             f"y_{tf}",          # compat: TP-only direction
             f"y_dir_{tf}",      # explicite direction (Modèle B)
             f"y_go_{tf}",       # gate GO/NO-GO (Modèle A)
