@@ -158,6 +158,125 @@ def _downcast_book(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], downcast="float")
     return df
 
+# ============================
+# PATCHES (outside process_symbol_year)
+# ============================
+
+def _mfe_mae_and_barriers_R(
+    seg_exit: np.ndarray,   # LONG: bid segment, SHORT: ask segment
+    entry_px: float,
+    R_bps: float,
+    side: str,              # "L" or "S"
+    k_pos: Tuple[int, ...] = (1, 2, 3, 4, 5),
+    k_neg: Tuple[int, ...] = (1, 2, 3),
+) -> dict:
+    """
+    Post-entry (NON-FEATURE) audit stats on an exit-price segment:
+      - MFE/MAE in bps and in R
+      - flags: hit +kR / -kR
+      - first touch: which +/-kR was hit first + step index from fill
+
+    Returns dict keys:
+      mfe_bps, mae_bps, mfe_R, mae_R,
+      hit_p{k}R, hit_m{k}R,
+      first_touch (signed int), first_touch_step
+    """
+    if (
+        seg_exit is None
+        or seg_exit.size == 0
+        or (not np.isfinite(entry_px))
+        or entry_px <= 0
+        or (not np.isfinite(R_bps))
+        or R_bps <= 0
+    ):
+        out = {
+            "mfe_bps": np.nan, "mae_bps": np.nan,
+            "mfe_R": np.nan, "mae_R": np.nan,
+            "first_touch": 0, "first_touch_step": -1,
+        }
+        for k in k_pos:
+            out[f"hit_p{k}R"] = 0
+        for k in k_neg:
+            out[f"hit_m{k}R"] = 0
+        return out
+
+    # define favorable/adverse so that "favorable_bps >= 0" always means favorable
+    if side == "L":
+        favorable_bps = (seg_exit / entry_px - 1.0) * 1e4
+        adverse_bps   = (1.0 - seg_exit / entry_px) * 1e4
+    else:  # "S"
+        favorable_bps = (1.0 - seg_exit / entry_px) * 1e4
+        adverse_bps   = (seg_exit / entry_px - 1.0) * 1e4
+
+    # numeric safety
+    # numeric safety (avoid NaN => +/-inf that would create fake touches)
+    favorable_bps = np.asarray(favorable_bps, dtype=np.float64)
+    adverse_bps   = np.asarray(adverse_bps,   dtype=np.float64)
+
+    ok_f = np.isfinite(favorable_bps)
+    ok_a = np.isfinite(adverse_bps)
+
+    # If everything is NaN/inf, return safe defaults (no touches)
+    if (not ok_f.any()) or (not ok_a.any()):
+        out = {
+            "mfe_bps": 0.0, "mae_bps": 0.0,
+            "mfe_R": 0.0, "mae_R": 0.0,
+            "first_touch": 0, "first_touch_step": -1,
+        }
+        for k in k_pos:
+            out[f"hit_p{k}R"] = 0
+        for k in k_neg:
+            out[f"hit_m{k}R"] = 0
+        return out
+
+    # Use only finite values
+    f = favorable_bps[ok_f]
+    a = adverse_bps[ok_a]
+
+    mfe_bps = float(np.max(f))
+    mae_bps = float(np.max(a))
+
+    mfe_R = float(mfe_bps / R_bps)
+    mae_R = float(mae_bps / R_bps)
+
+    hits_pos = {k: int(np.any(favorable_bps >= (k * R_bps))) for k in k_pos}
+    hits_neg = {k: int(np.any(adverse_bps   >= (k * R_bps))) for k in k_neg}
+
+    # earliest threshold crossing (first touch)
+    first_step = 10**12
+    first_code = 0
+
+    for k in k_pos:
+        idx = np.flatnonzero(favorable_bps >= (k * R_bps))
+        if idx.size:
+            s = int(idx[0])
+            if s < first_step:
+                first_step = s
+                first_code = +k
+
+    for k in k_neg:
+        idx = np.flatnonzero(adverse_bps >= (k * R_bps))
+        if idx.size:
+            s = int(idx[0])
+            if s < first_step:
+                first_step = s
+                first_code = -k
+
+    if first_step == 10**12:
+        first_step = -1
+        first_code = 0
+
+    out = {
+        "mfe_bps": mfe_bps, "mae_bps": mae_bps,
+        "mfe_R": mfe_R, "mae_R": mae_R,
+        "first_touch": int(first_code),
+        "first_touch_step": int(first_step),
+    }
+    for k, v in hits_pos.items():
+        out[f"hit_p{k}R"] = v
+    for k, v in hits_neg.items():
+        out[f"hit_m{k}R"] = v
+    return out
 
 # ============================================================
 # ATR (candles)
@@ -406,6 +525,10 @@ def _side_tp_sl_steps_after_fill(
 # Core
 # ============================================================
 
+# ============================
+# NEW VERSION: process_symbol_year (Stage1 v3 audits)
+# ============================
+
 def process_symbol_year(
     symbol: str,
     year: int,
@@ -490,7 +613,7 @@ def process_symbol_year(
     base_tf = _pick_base_tf(tfs)
     base_freq = _to_pandas_freq(base_tf)
 
-    base_book = book_5s[["bid0","ask0","mid","spread_bps"]].resample(base_freq).last().dropna(subset=["bid0","ask0","mid"])
+    base_book = book_5s[["bid0", "ask0", "mid", "spread_bps"]].resample(base_freq).last().dropna(subset=["bid0", "ask0", "mid"])
     if base_book.empty:
         logger.warning(f"empty base resample for {symbol} {year} (base_tf={base_tf})")
         return
@@ -530,11 +653,11 @@ def process_symbol_year(
     # -------------------------
     bid_path = book_5s["bid0"].astype("float64")
     ask_path = book_5s["ask0"].astype("float64")
-    mid_path = book_5s["mid"].astype("float64")   # <-- ADD
+    mid_path = book_5s["mid"].astype("float64")
 
     bid_arr = bid_path.to_numpy(dtype="float64", copy=False)
     ask_arr = ask_path.to_numpy(dtype="float64", copy=False)
-    mid_arr = mid_path.to_numpy(dtype="float64", copy=False)  # <-- ADD
+    mid_arr = mid_path.to_numpy(dtype="float64", copy=False)
 
     pos = bid_path.index.get_indexer(out.index, method="ffill").astype(np.int64, copy=False)
     arr_len = int(bid_arr.size)
@@ -554,15 +677,13 @@ def process_symbol_year(
     if nan_atr:
         logger.warning(f"{symbol} {year}: atr_bps NaN count={nan_atr}/{atr_bps_arr.size} ({nan_atr/atr_bps_arr.size:.2%})")
 
-    # FIX: éviter NaN -> NaN dans np.maximum
     atr_bps_arr = np.nan_to_num(atr_bps_arr, nan=0.0, posinf=0.0, neginf=0.0)
-
     R_bps_arr = np.maximum(float(risk_mult) * atr_bps_arr, float(risk_floor_bps)).astype(np.float64)
 
     n = len(out)
 
     # -------------------------
-    # RR labeling per TF
+    # RR labeling + AUDIT per TF
     # -------------------------
     for tf in tfs:
         horizon_sec = int(TF_HORIZONS_SEC[tf])
@@ -575,23 +696,15 @@ def process_symbol_year(
         SL_bps_arr = R_bps_arr  # 1R
 
         # --- EV threshold (EV=0) ---
-        # cost (bps) = entry_spread_half_bps + fee_exit_bps
-        cost_bps_arr = cost  # déjà float64
-
-        denom = TP_bps_arr + SL_bps_arr
-        denom = np.maximum(denom, 1e-12)  # safety
-
+        cost_bps_arr = cost
+        denom = np.maximum(TP_bps_arr + SL_bps_arr, 1e-12)
         p_thr_ev0 = (SL_bps_arr + cost_bps_arr) / denom
         p_thr_ev0 = np.clip(p_thr_ev0, 0.0, 1.0).astype(np.float32)
-
         if not np.isfinite(p_thr_ev0).all():
             raise RuntimeError(f"{symbol} {year} tf={tf}: p_thr_ev0 contains NaN/inf")
 
-        # sanity: si rr_tf augmente, en général TP augmente => p_thr_ev0 devrait baisser (toutes choses égales)
-        # (pas une assertion globale, juste un log si valeurs bizarres)
         q = np.quantile(p_thr_ev0, [0.01, 0.5, 0.99])
         logger.info(f"{symbol} {year} tf={tf} p_thr_ev0 quantiles: {q}")
-
         out[f"p_thr_ev0_{tf}"] = p_thr_ev0
 
         logger.info(f"{symbol} {year} tf={tf} RR start (h={horizon_sec}s window={window} step={step_sec}s rr_min={rr_tf})")
@@ -605,14 +718,36 @@ def process_symbol_year(
         out[f"tp_bps_{tf}"] = TP_bps_arr.astype("float32")
         out[f"sl_bps_{tf}"] = SL_bps_arr.astype("float32")
 
-        # y_dir: direction TP-only (+1/-1) else 0
+        # Labels / outcomes
         y_dir = np.zeros(n, dtype=np.int8)
-        # y_go: 1 if TP event else 0 (SL/TIME/NOFILL/NONE => 0)
         y_go = np.zeros(n, dtype=np.int8)
 
         exit_reason = np.empty(n, dtype=object)
-        exit_step = np.full(n, -1, dtype=np.int32)  # steps from base grid p0
-        pnl_net = np.zeros(n, dtype=np.float32)     # TP positive, SL negative, TIME/NOFILL 0
+        exit_step = np.full(n, -1, dtype=np.int32)
+        pnl_net = np.zeros(n, dtype=np.float32)
+
+        # ============================
+        # AUDIT (NON-FEATURE) ARRAYS
+        # per-side: L and S
+        # ============================
+        auditL_mfe_R = np.full(n, np.nan, dtype=np.float32)
+        auditL_mae_R = np.full(n, np.nan, dtype=np.float32)
+        auditL_first = np.zeros(n, dtype=np.int8)
+        auditL_first_step = np.full(n, -1, dtype=np.int32)
+
+        auditS_mfe_R = np.full(n, np.nan, dtype=np.float32)
+        auditS_mae_R = np.full(n, np.nan, dtype=np.float32)
+        auditS_first = np.zeros(n, dtype=np.int8)
+        auditS_first_step = np.full(n, -1, dtype=np.int32)
+
+        # flags +kR / -kR
+        k_pos = (1, 2, 3, 4, 5)
+        k_neg = (1, 2, 3)
+
+        auditL_hit_p = {k: np.zeros(n, dtype=np.int8) for k in k_pos}
+        auditL_hit_m = {k: np.zeros(n, dtype=np.int8) for k in k_neg}
+        auditS_hit_p = {k: np.zeros(n, dtype=np.int8) for k in k_pos}
+        auditS_hit_m = {k: np.zeros(n, dtype=np.int8) for k in k_neg}
 
         for i in range(n):
             p0 = int(pos[i])
@@ -641,6 +776,7 @@ def process_symbol_year(
 
             okL = okL and (p0 + fill_step_L < p1)
             okS = okS and (p0 + fill_step_S < p1)
+
             if (not okL) and (not okS):
                 exit_reason[i] = "NOFILL"
                 exit_step[i] = -1
@@ -649,16 +785,17 @@ def process_symbol_year(
                 pnl_net[i] = 0.0
                 continue
 
-            # Build per-side segments starting at fill time (side-specific)
-            # If a side doesn't fill, keep it as "unavailable"
             INF = 10**12
 
-            # LONG side
+            # -------------------------
+            # LONG side (post-fill segment)
+            # -------------------------
             if okL:
                 p0L = p0 + fill_step_L
                 if p0L < p1:
-                    seg_bid_L = bid_arr[p0L:p1+1]
-                    seg_ask_L = ask_arr[p0L:p1+1]
+                    seg_bid_L = bid_arr[p0L:p1 + 1]
+                    seg_ask_L = ask_arr[p0L:p1 + 1]
+
                     evL = _side_tp_sl_steps_after_fill(
                         seg_bid=seg_bid_L,
                         seg_ask=seg_ask_L,
@@ -667,18 +804,43 @@ def process_symbol_year(
                         tp_bps=float(TP_bps_arr[i]),
                         sl_bps=float(SL_bps_arr[i]),
                     )
-                    tpL = evL["tpL"]; slL = evL["slL"]
-                else:
-                    tpL = -1; slL = -1
-            else:
-                tpL = -1; slL = -1
+                    tpL = evL["tpL"]
+                    slL = evL["slL"]
 
-            # SHORT side
+                    # AUDIT: use exit-price path (LONG exits on bid)
+                    dL = _mfe_mae_and_barriers_R(
+                        seg_exit=seg_bid_L,
+                        entry_px=eL,
+                        R_bps=float(R_bps_arr[i]),
+                        side="L",
+                        k_pos=k_pos,
+                        k_neg=k_neg,
+                    )
+                    auditL_mfe_R[i] = np.float32(dL["mfe_R"])
+                    auditL_mae_R[i] = np.float32(dL["mae_R"])
+                    auditL_first[i] = np.int8(dL["first_touch"])
+                    fts = int(dL["first_touch_step"])
+                    auditL_first_step[i] = np.int32((fill_step_L + fts) if (fts >= 0 and fill_step_L >= 0) else -1)
+                    for k in k_pos:
+                        auditL_hit_p[k][i] = np.int8(dL[f"hit_p{k}R"])
+                    for k in k_neg:
+                        auditL_hit_m[k][i] = np.int8(dL[f"hit_m{k}R"])
+                else:
+                    tpL = -1
+                    slL = -1
+            else:
+                tpL = -1
+                slL = -1
+
+            # -------------------------
+            # SHORT side (post-fill segment)
+            # -------------------------
             if okS:
                 p0S = p0 + fill_step_S
                 if p0S < p1:
-                    seg_bid_S = bid_arr[p0S:p1+1]
-                    seg_ask_S = ask_arr[p0S:p1+1]
+                    seg_bid_S = bid_arr[p0S:p1 + 1]
+                    seg_ask_S = ask_arr[p0S:p1 + 1]
+
                     evS = _side_tp_sl_steps_after_fill(
                         seg_bid=seg_bid_S,
                         seg_ask=seg_ask_S,
@@ -687,11 +849,33 @@ def process_symbol_year(
                         tp_bps=float(TP_bps_arr[i]),
                         sl_bps=float(SL_bps_arr[i]),
                     )
-                    tpS = evS["tpS"]; slS = evS["slS"]
+                    tpS = evS["tpS"]
+                    slS = evS["slS"]
+
+                    # AUDIT: use exit-price path (SHORT exits on ask)
+                    dS = _mfe_mae_and_barriers_R(
+                        seg_exit=seg_ask_S,
+                        entry_px=eS,
+                        R_bps=float(R_bps_arr[i]),
+                        side="S",
+                        k_pos=k_pos,
+                        k_neg=k_neg,
+                    )
+                    auditS_mfe_R[i] = np.float32(dS["mfe_R"])
+                    auditS_mae_R[i] = np.float32(dS["mae_R"])
+                    auditS_first[i] = np.int8(dS["first_touch"])
+                    fts = int(dS["first_touch_step"])
+                    auditS_first_step[i] = np.int32((fill_step_S + fts) if (fts >= 0 and fill_step_S >= 0) else -1)
+                    for k in k_pos:
+                        auditS_hit_p[k][i] = np.int8(dS[f"hit_p{k}R"])
+                    for k in k_neg:
+                        auditS_hit_m[k][i] = np.int8(dS[f"hit_m{k}R"])
                 else:
-                    tpS = -1; slS = -1
+                    tpS = -1
+                    slS = -1
             else:
-                tpS = -1; slS = -1
+                tpS = -1
+                slS = -1
 
             # Decide if each side "wins" (TP before SL)
             def wins(tp_idx: int, sl_idx: int) -> bool:
@@ -704,15 +888,11 @@ def process_symbol_year(
             long_wins = okL and wins(tpL, slL)
             short_wins = okS and wins(tpS, slS)
 
-            # Compute absolute TP times (in steps from grid p0) for tie-break
             t_tp_long = (fill_step_L + tpL) if (long_wins and tpL >= 0 and fill_step_L >= 0) else INF
             t_tp_short = (fill_step_S + tpS) if (short_wins and tpS >= 0 and fill_step_S >= 0) else INF
 
             if long_wins or short_wins:
-                # GO
                 y_go[i] = 1
-
-                # Choose direction by earliest TP
                 if t_tp_long <= t_tp_short:
                     y_dir[i] = 1
                     exit_reason[i] = "TP_LONG"
@@ -725,9 +905,7 @@ def process_symbol_year(
                 pnl_net[i] = np.float32(float(TP_bps_arr[i]) - cost[i])
                 continue
 
-            # If no side wins, decide "what happened" for exit_reason/pnl:
-            # Prefer an SL if any SL occurred (after fill), else TIME.
-            # Use earliest SL across sides, measured from grid p0.
+            # Otherwise SL (if any) else TIME
             t_sl_long = (fill_step_L + slL) if (okL and slL >= 0 and fill_step_L >= 0) else INF
             t_sl_short = (fill_step_S + slS) if (okS and slS >= 0 and fill_step_S >= 0) else INF
             t_sl = min(t_sl_long, t_sl_short)
@@ -736,7 +914,6 @@ def process_symbol_year(
             y_dir[i] = 0
 
             if t_sl < INF:
-                # SL happened before any TP-wins condition (by definition here)
                 if t_sl_long <= t_sl_short:
                     exit_reason[i] = "SL_LONG"
                     exit_step[i] = int(t_sl_long)
@@ -750,7 +927,7 @@ def process_symbol_year(
                 exit_step[i] = -1
                 pnl_net[i] = 0.0
 
-        # Backward-compatible y_<tf> = direction TP-only
+        # Backward-compatible labels
         out[f"y_{tf}"] = y_dir
         out[f"y_dir_{tf}"] = y_dir
         out[f"y_go_{tf}"] = y_go
@@ -759,21 +936,43 @@ def process_symbol_year(
         out[f"exit_step_{tf}"] = exit_step
         out[f"pnl_net_bps_{tf}"] = pnl_net
 
-        logger.info(f"{symbol} {year} tf={tf} RR done in {_now()-t_tf0:.2f}s")
+        # ============================
+        # WRITE AUDIT (NON-FEATURE) COLUMNS
+        # ============================
+        out[f"auditL_mfe_R_{tf}"] = auditL_mfe_R
+        out[f"auditL_mae_R_{tf}"] = auditL_mae_R
+        out[f"auditL_first_touch_{tf}"] = auditL_first
+        out[f"auditL_first_touch_step_{tf}"] = auditL_first_step
+
+        out[f"auditS_mfe_R_{tf}"] = auditS_mfe_R
+        out[f"auditS_mae_R_{tf}"] = auditS_mae_R
+        out[f"auditS_first_touch_{tf}"] = auditS_first
+        out[f"auditS_first_touch_step_{tf}"] = auditS_first_step
+
+        for k in k_pos:
+            out[f"auditL_hit_p{k}R_{tf}"] = auditL_hit_p[k]
+            out[f"auditS_hit_p{k}R_{tf}"] = auditS_hit_p[k]
+        for k in k_neg:
+            out[f"auditL_hit_m{k}R_{tf}"] = auditL_hit_m[k]
+            out[f"auditS_hit_m{k}R_{tf}"] = auditS_hit_m[k]
+
+        logger.info(f"{symbol} {year} tf={tf} RR+AUDIT done in {_now()-t_tf0:.2f}s")
         gc.collect()
+
     # -------------------------
     # WRITE CSV
     # -------------------------
     base_cols = [
-        "row_id","t","symbol","year","symbol_id",
-        "bid_entry","ask_entry","mid_entry",
-        "spread_bps_entry","atr_bps",
-        "fee_exit_bps","entry_spread_half_bps",
-        "risk_mult","risk_floor_bps","rr_min_default",
-        "fill_mode","fill_window_sec",
+        "row_id", "t", "symbol", "year", "symbol_id",
+        "bid_entry", "ask_entry", "mid_entry",
+        "spread_bps_entry", "atr_bps",
+        "fee_exit_bps", "entry_spread_half_bps",
+        "risk_mult", "risk_floor_bps", "rr_min_default",
+        "fill_mode", "fill_window_sec",
     ]
 
     tf_cols: List[str] = []
+    audit_cols: List[str] = []
     for tf in tfs:
         tf_cols += [
             f"horizon_sec_{tf}",
@@ -783,15 +982,27 @@ def process_symbol_year(
             f"tp_bps_{tf}",
             f"sl_bps_{tf}",
             f"p_thr_ev0_{tf}",
-            f"y_{tf}",          # compat: TP-only direction
-            f"y_dir_{tf}",      # explicite direction (Modèle B)
-            f"y_go_{tf}",       # gate GO/NO-GO (Modèle A)
+            f"y_{tf}",
+            f"y_dir_{tf}",
+            f"y_go_{tf}",
             f"exit_reason_{tf}",
             f"exit_step_{tf}",
             f"pnl_net_bps_{tf}",
         ]
 
-    out_df = out.reset_index(drop=True)[base_cols + tf_cols]
+        # AUDIT (NON-FEATURE)
+        audit_cols += [
+            f"auditL_mfe_R_{tf}", f"auditL_mae_R_{tf}",
+            f"auditL_first_touch_{tf}", f"auditL_first_touch_step_{tf}",
+            f"auditS_mfe_R_{tf}", f"auditS_mae_R_{tf}",
+            f"auditS_first_touch_{tf}", f"auditS_first_touch_step_{tf}",
+        ]
+        for k in (1, 2, 3, 4, 5):
+            audit_cols += [f"auditL_hit_p{k}R_{tf}", f"auditS_hit_p{k}R_{tf}"]
+        for k in (1, 2, 3):
+            audit_cols += [f"auditL_hit_m{k}R_{tf}", f"auditS_hit_m{k}R_{tf}"]
+
+    out_df = out.reset_index(drop=True)[base_cols + tf_cols + audit_cols]
 
     # free big buffers
     del base_book, base_atr, candles, book_mid_1m, book_5s, bid_path, ask_path, mid_path, bid_arr, ask_arr, mid_arr, pos
@@ -811,7 +1022,6 @@ def process_symbol_year(
 
     logger.info(f"DONE {symbol} {year} rows={len(out_df):,} total_time={_now()-t0:.1f}s")
     print(f"[OK] {symbol} {year} → {len(out_df)} rows (base_tf={base_tf}, RR bid/ask, conservative fill) → {out_path}")
-
 
 # ============================================================
 # CLI

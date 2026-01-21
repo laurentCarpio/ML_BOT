@@ -234,7 +234,7 @@ def _optional_filter(schema: pa.Schema,
 
 def _rows_to_csv_bytes(arr2d: np.ndarray) -> bytes:
     buf = io.BytesIO()
-    np.savetxt(buf, arr2d, delimiter=",", fmt="%.6g")
+    np.savetxt(buf, arr2d, delimiter=",", fmt="%.9g")
     return buf.getvalue()
 
 def _rows_to_csv_bytes_str(arr2d: np.ndarray) -> bytes:
@@ -538,7 +538,38 @@ def _write_x_ids_w_audit_shards_stream(
 # Core: build one split (now yields X, ids, y for class balance)
 # =======================
 
-AUDIT_PNL_COL = "audit_pnl_net_bps"
+AUDIT_PNL_COL    = "audit_pnl_net_bps"
+
+AUDIT_CORE_COLS = [
+    "audit_pnl_net_bps",
+    "audit_early_abort",
+    "audit_timeout",
+    "audit_market_toxic",
+    "audit_p_thr_ev0",
+]
+
+AUDIT_EXTRA_COLS = [
+    "audit_mfe_R_L",
+    "audit_mae_R_L",
+    "audit_first_touch_L",
+    "audit_first_touch_step_L",
+    "audit_mfe_R_S",
+    "audit_mae_R_S",
+    "audit_first_touch_S",
+    "audit_first_touch_step_S",
+
+    "audit_hit_p1R_L", "audit_hit_p1R_S",
+    "audit_hit_p2R_L", "audit_hit_p2R_S",
+    "audit_hit_p3R_L", "audit_hit_p3R_S",
+    "audit_hit_p4R_L", "audit_hit_p4R_S",
+    "audit_hit_p5R_L", "audit_hit_p5R_S",
+
+    "audit_hit_m1R_L", "audit_hit_m1R_S",
+    "audit_hit_m2R_L", "audit_hit_m2R_S",
+    "audit_hit_m3R_L", "audit_hit_m3R_S",
+]
+
+AUDIT_ALL_COLS = AUDIT_CORE_COLS + AUDIT_EXTRA_COLS
 
 def _clip_rate_report(df: pd.DataFrame, feats: List[str]) -> Dict:
     """
@@ -635,13 +666,9 @@ def _iter_x_ids_y_from_split(
     needed = sorted(set([
         "tf", "y_go", "row_id", "event_id", "task",
         "audit_exit_reason",
-        "audit_early_abort",
-        "audit_timeout",
-        "audit_market_toxic",
-        AUDIT_PNL_COL,
-        "audit_p_thr_ev0", 
-    ]) | set(feats) | set(AGGR_BT_COLS))
+    ] + AUDIT_ALL_COLS) | set(feats) | set(AGGR_BT_COLS))
     needed = [c for c in needed if c in schema_names]
+
 
     scanner = dset.scanner(columns=needed, filter=base_filt, batch_size=batch_size)
 
@@ -669,6 +696,18 @@ def _iter_x_ids_y_from_split(
         if stats is not None:
             stats["rows_in"] = stats.get("rows_in", 0) + int(len(df))
 
+        # --- audit_exit_reason normalized (align Stage2 validator semantics) ---
+        if "audit_exit_reason" in df.columns:
+            aer_norm = (
+                df["audit_exit_reason"]
+                .fillna("NONE")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+        else:
+            aer_norm = pd.Series(["NONE"] * len(df), index=df.index)
+
         # --- aggr/bt NaN safety net ---
         present = [c for c in AGGR_BT_COLS if c in df.columns]
         if present:
@@ -678,11 +717,18 @@ def _iter_x_ids_y_from_split(
                 stats["imputed_nan_aggrbt"] = stats.get("imputed_nan_aggrbt", 0) + int(nan_mask.sum())
             for c in present:
                 v = pd.to_numeric(df[c], errors="coerce").astype("float64")
+                v = v.where(np.isfinite(v), np.nan)
+
+                if "_side_" in c:
+                    # attendu [-1, 1]
+                    v = v.clip(-1.0, 1.0)
+                else:
+                    # attendu [0, 1]
+                    v = v.clip(0.0, 1.0)
+
                 df[c] = v.fillna(_neutral_fill_value(c))
         else:
             df["aggrbt_missing"] = 0
-
-        tf_norm = tf_norm.loc[df.index]
 
         ids2d = np.column_stack([
             df["row_id"].astype(str).to_numpy(dtype=object, copy=False),
@@ -696,26 +742,25 @@ def _iter_x_ids_y_from_split(
             raise ValueError(f"y_go not in {{0,1}}. Examples:\n{bad}")
 
         # --- coverage gate for positives ONLY ---
-        if "audit_exit_reason" in df.columns:
-            aer = df["audit_exit_reason"].astype(str)
-            pos_has_exit = (aer != "NONE").to_numpy(dtype=bool)
+        # Stage2 validator treats NONE/NOFILL as "none-like"
+        pos_has_exit = (~aer_norm.isin(["NONE", "NOFILL", ""])).to_numpy(dtype=bool)
 
-            # force y_go=1 but exit_reason==NONE -> y=0 (invalid positive)
-            invalid_pos = (y_raw.to_numpy(dtype=np.int8) == 1) & (~pos_has_exit)
-            if stats is not None:
-                stats["invalid_pos_exit_reason_NONE"] = stats.get("invalid_pos_exit_reason_NONE", 0) + int(invalid_pos.sum())
+        invalid_pos = (y_raw.to_numpy(dtype=np.int8) == 1) & (~pos_has_exit)
+        if stats is not None:
+            stats["invalid_pos_exit_reason_NONE"] = stats.get("invalid_pos_exit_reason_NONE", 0) + int(invalid_pos.sum())
 
-            y_raw = pd.Series((y_raw.to_numpy(dtype=np.int8) & pos_has_exit).astype("int8"), index=df.index)
-        else:
-            if stats is not None:
-                stats["missing_audit_exit_reason_col"] = stats.get("missing_audit_exit_reason_col", 0) + 1
+        y_raw = pd.Series((y_raw.to_numpy(dtype=np.int8) & pos_has_exit).astype("int8"), index=df.index)
 
         # label final = y_go brut (après sanity exit_reason!=NONE)
         y = y_raw
 
         # normalize features
+        for c in feats:
+            if c not in df.columns:
+                df[c] = np.nan
         df["tf"] = tf_norm
         df = _apply_norm(df, params_map, feats)
+
 
         if stats is not None:
             # compute clip report on this batch and aggregate
@@ -770,15 +815,25 @@ def _iter_x_ids_y_from_split(
         C = (pd.to_numeric(df["audit_market_toxic"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
              if "audit_market_toxic" in avail_cols else np.zeros(len(df), dtype=np.int8))
 
-        # fp_cost_bps: STRICT from audit_pnl_net_bps
+        # --- audit_pnl_net_bps: STRICT ---
         if AUDIT_PNL_COL not in df.columns:
             raise ValueError(
                 f"Stage3 audit: colonne manquante '{AUDIT_PNL_COL}'. "
                 f"Colonnes dispo (sample): {sorted(list(df.columns))[:50]} ..."
             )
 
-        pnl = pd.to_numeric(df[AUDIT_PNL_COL], errors="coerce").fillna(0.0).astype("float64").to_numpy()
-        fp_cost = np.maximum(0.0, -pnl).astype("float32")
+        pnl_s = pd.to_numeric(df[AUDIT_PNL_COL], errors="coerce")
+        # pnl required iff exit_reason is NOT none-like
+        need_pnl = (~aer_norm.isin(["NONE", "NOFILL", ""])).to_numpy()
+
+        bad_pnl = pnl_s.isna().to_numpy() & need_pnl
+        if bad_pnl.any():
+            bad = df.loc[bad_pnl, ["row_id","event_id","tf","audit_exit_reason",AUDIT_PNL_COL]].head(5)
+            raise ValueError(f"audit_pnl_net_bps NaN détecté alors que exit_reason!=NONE. Exemples:\n{bad}")
+
+        # pour les NONE, on remplit à 0
+        pnl = pnl_s.fillna(0.0).astype("float32").to_numpy()
+
 
         # --- audit_p_thr_ev0: STRICT (no imputation) ---
         if "audit_p_thr_ev0" not in avail_cols:
@@ -806,35 +861,32 @@ def _iter_x_ids_y_from_split(
         pthr = pthr64.astype("float32", copy=False)
 
         audit2d = np.column_stack([
-            fp_cost,
+            pnl,
             A.astype("float32"),
             B.astype("float32"),
             C.astype("float32"),
-            pthr,                       
-        ])
+            pthr,
+        ]).astype("float32", copy=False)
         
         # ---- split_stats (audit) ----
         if stats is not None:
-            # counts
             stats["audit_rows"] = stats.get("audit_rows", 0) + int(len(df))
+
+            # flags
             stats["audit_A_sum"] = stats.get("audit_A_sum", 0) + int(A.sum())
             stats["audit_B_sum"] = stats.get("audit_B_sum", 0) + int(B.sum())
             stats["audit_C_sum"] = stats.get("audit_C_sum", 0) + int(C.sum())
 
-            # fp_cost running mean (store sum + n, compute mean at end)
-            fp_sum = float(fp_cost.sum())  # fp_cost is float32 array
-            stats["audit_fp_cost_sum"] = stats.get("audit_fp_cost_sum", 0.0) + fp_sum
-            stats["audit_fp_cost_n"] = stats.get("audit_fp_cost_n", 0) + int(fp_cost.size)
-            stats["audit_fp_cost_mean"] = (
-                stats["audit_fp_cost_sum"] / max(1, stats["audit_fp_cost_n"])
-            )
+            # pnl stats
+            stats["audit_pnl_sum"] = stats.get("audit_pnl_sum", 0.0) + float(pnl.sum())
+            stats["audit_pnl_n"]   = stats.get("audit_pnl_n", 0) + int(pnl.size)
+            stats["audit_pnl_mean"] = stats["audit_pnl_sum"] / max(1, stats["audit_pnl_n"])
 
-            # keep source (only once)
-            stats.setdefault("audit_fp_cost_source", AUDIT_PNL_COL)
+            stats.setdefault("audit_pnl_source", AUDIT_PNL_COL)
 
-        if stats is not None and "audit_fp_cost_source" not in stats:
-            stats["audit_fp_cost_source"] = AUDIT_PNL_COL
-  
+            stats["audit_pnl_frac_pos"] = float((pnl > 0).mean())
+            stats["audit_pnl_frac_neg"] = float((pnl < 0).mean())
+
         yield X, ids2d, y, audit2d
 
 # =======================
@@ -972,12 +1024,16 @@ def main():
     # First, compute train balance cheaply (still single scan, but we need posw before writing weights)
     pos_total = 0
     neg_total = 0
-    train_stats = {}
+    train_stats = {"pos": 0, "neg": 0}
     for _, _, y, _ in _iter_x_ids_y_from_split(dset_train, base_f, feats_norm, params_map,
                                                 batch_size=args.batch_size,
-                                                stats=train_stats):
-        pos_total += int((y == 1).sum())
-        neg_total += int((y == 0).sum())
+                                                stats=None):
+        yp = int((y == 1).sum())
+        yn = int((y == 0).sum())
+        train_stats["pos"] += yp
+        train_stats["neg"] += yn
+        pos_total += yp
+        neg_total += yn
 
     if pos_total == 0:
         print("⛔ TRAIN: pos_total=0 (aucun tradeable) -> stop", file=sys.stderr)
@@ -1022,8 +1078,8 @@ def main():
                 "train_ids": "train_ids/part-*.csv",
                 "val_ids": "val_ids/part-*.csv",
                 "test_ids": "test_ids/part-*.csv"
-            },
-            "audit_format": "CSV, no header, columns: fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic, pthr(aligned with X shards)",
+            }, 
+            "audit_format": "CSV, no header, columns: audit_pnl_net_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0 (aligned with X shards)",        
             "audit_paths": {
                 "train_audit": "train_audit/part-*.csv",
                 "val_audit": "val_audit/part-*.csv",

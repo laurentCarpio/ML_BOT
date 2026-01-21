@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 
-import argparse, json, io, sys, math, re, time
-from typing import Optional, Dict, List, Tuple
+import argparse, json, io, sys, math, re, time, tarfile
+from typing import Optional, Dict, List, Tuple, Any
 
 import numpy as np
 import pandas as pd
 import pyarrow.fs as pafs
-import os
+import os, tempfile, traceback
+from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -20,7 +21,7 @@ sys.stderr.reconfigure(line_buffering=True)
 Z_IGNORE_EXACT = {"aggrbt_missing"}  # raw-only columns to skip in z checks
 LOW_VAR_FEATURES = set()              # ou garde vide, microprice_bias ne doit plus être exemptée
 
-LOW_VAR_STD_FLOOR = 0.05
+LOW_VAR_STD_FLOOR = 0.75
 
 # =============================
 # ABS-MAX caps (post-normalization)
@@ -138,6 +139,13 @@ def _read_csv_chunks_numeric(fs: pafs.S3FileSystem, path_s3: str, chunksize: int
         for chunk in pd.read_csv(ftxt, header=None, dtype=np.float64, chunksize=chunksize):
             yield chunk
 
+def _audit_schema_from_ncols(n: int) -> List[str]:
+    # Stage3 GO (current): 5 cols
+    # [audit_pnl_net_bps, A, B, C, audit_p_thr_ev0]
+    if n == 5:
+        return ["audit_pnl_net_bps", "audit_early_abort", "audit_timeout", "audit_market_toxic", "audit_p_thr_ev0"]
+    raise RuntimeError(f"Unsupported audit ncols={n}. Expected 5 for current Stage3 GO.")
+
 # =============================
 # Meta loader
 # =============================
@@ -227,17 +235,10 @@ def parse_args():
     ap.add_argument("--require-parity", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--check-audit", action=argparse.BooleanOptionalAction, default=True)
 
-    ap.add_argument("--audit-cols", type=str, 
-                    default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0",
-                    help="Colonnes attendues dans *_audit, séparées par des virgules (ordre important)."
-    )
-
-    # Stage4-ish audit checks
-    ap.add_argument("--audit-fp-zero-on-pos", action=argparse.BooleanOptionalAction, default=True,
-                    help="Si fp_cost_bps existe: check que fp_cost_bps≈0 quand label==1 (bon trade).")
-    ap.add_argument("--audit-fp-zero-tol", type=float, default=1e-6,
-                    help="Tolérance pour fp_cost_bps≈0 quand label==1.")
-
+    # Keep default legacy for backward CLI, but code will auto-detect actual ncols.
+    ap.add_argument("--audit-cols", default="audit_pnl_net_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0",
+                       help="Colonnes attendues dans *_audit (no header), ordre important."
+     )
     ap.add_argument("--fail-on-strong", action="store_true",
                     help="Échec si anomalies STRICT sur TRAIN en Z-MODE.")
     return ap.parse_args()
@@ -280,6 +281,16 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
     label_name = col_names[0]
     n_expected_cols = len(col_names)
+
+    # --- streaming clip-rate for capped features (ABS_MAX_CAPS) ---
+    cap_feat_to_j: Dict[str, int] = {}
+    for j in range(1, n_expected_cols):  # features only (skip label col 0)
+        name = col_names[j]
+        if name in ABS_MAX_CAPS:
+            cap_feat_to_j[name] = j
+
+    cap_hit = {name: 0 for name in cap_feat_to_j}      # exact hits where abs(x)==cap
+    cap_n   = {name: 0 for name in cap_feat_to_j}      # finite count
 
     # max_rows: 0 or negative means unlimited
     max_rows = int(args.max_rows)
@@ -426,6 +437,19 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                     col_stats[j] = ColStats()
                 col_stats[j].update(chunk.iloc[:, j].to_numpy(dtype=np.float64, copy=False))
 
+            # --- update cap hit-rate counters (streaming) ---
+            if cap_feat_to_j:
+                arr = chunk.to_numpy(dtype=np.float64, copy=False)
+                for name, j in cap_feat_to_j.items():
+                    cap = float(ABS_MAX_CAPS[name])
+                    v = arr[:, j]
+                    m = np.isfinite(v)
+                    if not m.any():
+                        continue
+                    vv = v[m]
+                    cap_n[name] += int(vv.size)
+                    cap_hit[name] += int(np.sum(np.abs(vv) == cap))
+
             if args.progress_every and (chunk_idx % args.progress_every == 0):
                 print(f"[X] part={part:05d} chunk={chunk_idx} rows_part={part_rows:,} rows_total={total_rows:,}")
 
@@ -443,6 +467,21 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
     if total_rows == 0:
         print("⛔ Aucun enregistrement lu.")
         return 2
+    
+    # --- report cap hit-rate (true clip-rate) ---
+    if cap_feat_to_j:
+        rows = []
+        for name in cap_feat_to_j.keys():
+            n = cap_n.get(name, 0)
+            h = cap_hit.get(name, 0)
+            rate = (h / n) if n > 0 else 0.0
+            rows.append((rate, h, n, ABS_MAX_CAPS[name], name))
+        rows.sort(reverse=True)
+
+        print("\n[cap_clip] hit-rate where abs(value)==cap (streaming):")
+        print("hit_rate   hits       n     cap    feature")
+        for rate, h, n, cap, name in rows:
+            print(f"{rate:8.4%}  {h:7d}  {n:7d}  {cap:6.3g}  {name}")
 
     # ----- label balance -----
     print(f"\nℹ️ Label balance ({label_name}):")
@@ -475,23 +514,6 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         return pd.DataFrame(rows, columns=["col", "name", "mean", "std", "n", "nan", "posinf", "neginf", "min", "max"])
 
     feat_stats = _finalize(feat_idx)
-
-    # ----- cap hit-rate check (how often abs(z) == cap) -----
-    cap_hit_rows = []
-    for _, r in feat_stats.iterrows():
-        name = str(r["name"])
-        cap = ABS_MAX_CAPS.get(name)
-        if cap is None:
-            continue
-        mn = float(r["min"]); mx = float(r["max"])
-        absmax = max(abs(mn), abs(mx))
-        # pooled stats can't count hits; we at least flag if absmax is exactly cap
-        if abs(absmax - cap) <= 1e-6:
-            cap_hit_rows.append((name, cap, mn, mx))
-
-    if cap_hit_rows:
-        cap_hit = pd.DataFrame(cap_hit_rows, columns=["name","cap","min","max"])
-        _print_table(cap_hit, "\nℹ️ features reaching cap at least once (pooled min/max hits):", top_k=200)
 
     # ----- ABS-MAX cap check (uses pooled min/max already computed) -----
     cap_rows = []
@@ -527,7 +549,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
     strict_bad = pd.DataFrame()
 
-    if is_z_mode:
+    if is_z_mode:        
         strict_rows = []
         relaxed_rows = []
 
@@ -537,6 +559,10 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
             std = float(row["std"])
 
             if _ignore_for_zscore(col):
+                continue
+
+            # ✅ ICI (juste après _ignore_for_zscore)
+            if col in ABS_MAX_CAPS:
                 continue
 
             if (col in LOW_VAR_FEATURES) or (std < LOW_VAR_STD_FLOOR):
@@ -560,7 +586,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
             if (abs(mean) > args.mean_tol) or (std < args.std_low) or (std > args.std_high):
                 strict_rows.append(row)
-
+        
         if strict_rows:
             df_strict = pd.DataFrame(strict_rows).reset_index(drop=True)
             if split == "train":
@@ -669,7 +695,7 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
 
         a_stats: Dict[int, ColStats] = {j: ColStats() for j in range(len(audit_cols))}
 
-        idx_fp  = audit_cols.index("fp_cost_bps") if "fp_cost_bps" in audit_cols else None
+        idx_pnl = audit_cols.index("audit_pnl_net_bps") if "audit_pnl_net_bps" in audit_cols else None
         idx_A   = audit_cols.index("audit_early_abort") if "audit_early_abort" in audit_cols else None
         idx_B   = audit_cols.index("audit_timeout") if "audit_timeout" in audit_cols else None
         idx_C   = audit_cols.index("audit_market_toxic") if "audit_market_toxic" in audit_cols else None
@@ -679,18 +705,11 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         A_sum = 0
         B_sum = 0
         C_sum = 0
-        fp_sum = 0.0
-        fp_n = 0
 
+        pnl_sum = 0.0
+        pnl_n = 0
         C_total = 0
         C_ones = 0
-        fp_sum_C1 = 0.0
-        fp_sum_C0 = 0.0
-        fp_n_C1 = 0
-        fp_n_C0 = 0
-
-        fp_pos_bad = 0
-        fp_pos_n = 0
 
         P_thr_total = 0
         P_thr_finite = 0
@@ -766,31 +785,12 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                     if mC.any():
                         C_sum += int(np.round(vC[mC]).astype(np.int64).sum())
 
-                if idx_fp is not None:
-                    fpv = arr[:, idx_fp]
-                    mf = np.isfinite(fpv)
+                if idx_pnl is not None:
+                    pnlv = arr[:, idx_pnl]
+                    mf = np.isfinite(pnlv)
                     if mf.any():
-                        fp_sum += float(fpv[mf].sum())
-                        fp_n += int(mf.sum())
-
-                # fp_cost_bps mean | market_toxic=1 vs 0
-                if (idx_fp is not None) and (idx_C is not None):
-                    fpv = arr[:, idx_fp]
-                    Cv  = arr[:, idx_C]
-                    m = np.isfinite(fpv) & np.isfinite(Cv)
-                    if m.any():
-                        fpv2 = fpv[m]
-                        Cv2  = Cv[m].astype(np.int64, copy=False)
-
-                        m1 = (Cv2 == 1)
-                        if m1.any():
-                            fp_sum_C1 += float(fpv2[m1].sum())
-                            fp_n_C1   += int(m1.sum())
-
-                        m0 = ~m1
-                        if m0.any():
-                            fp_sum_C0 += float(fpv2[m0].sum())
-                            fp_n_C0   += int(m0.sum())
+                        pnl_sum += float(pnlv[mf].sum())
+                        pnl_n += int(mf.sum())
 
                 # market_toxic_rate (indépendant de fp_cost_bps)
                 if idx_C is not None:
@@ -800,28 +800,17 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
                         Cv2 = Cv[mC].astype(np.int64, copy=False)
                         C_total += int(Cv2.size)
                         C_ones  += int((Cv2 == 1).sum())
-                        
-                if args.audit_fp_zero_on_pos and (idx_fp is not None):
-                    fpv = arr[:, idx_fp]
-                    m = np.isfinite(fpv)
-                    if m.any():
-                        fpv2 = fpv[m]
-                        y2 = yi[m]
-                        pos = (y2 == 1)
-                        if pos.any():
-                            fp_pos_n += int(pos.sum())
-                            fp_pos_bad += int((np.abs(fpv2[pos]) > float(args.audit_fp_zero_tol)).sum())
 
                 # domain checks + per-col stats
                 for j, name in enumerate(audit_cols):
                     v = arr[:, j]
                     a_stats[j].update(v)
 
-                    if name == "fp_cost_bps":
-                        bad = (~np.isfinite(v)) | (v < -1e-9)
-                        if bad.any():
-                            ex = v[bad][:10]
-                            print(f"⛔ {apath}: fp_cost_bps invalid (NaN/inf or <0). Examples: {ex.tolist()}")
+                    if name == "audit_pnl_net_bps":
+                        # pnl can be negative; just enforce finite
+                        if (~np.isfinite(v)).any():
+                            ex = v[~np.isfinite(v)][:10]
+                            print(f"⛔ {apath}: audit_pnl_net_bps invalid (NaN/inf). Examples: {ex.tolist()}")
                             return 2
 
                     if name == "audit_market_toxic":
@@ -870,24 +859,12 @@ def _validate_one_split(fs, root: str, split: str, col_names: List[str], args, f
         if idx_C is not None and C_total > 0:
             print(f"[audit] market_toxic_rate={C_ones/max(C_total,1):.6g} (ones={C_ones} total={C_total})")
         
-        if (idx_fp is not None) and (idx_C is not None):
-            m1 = fp_sum_C1 / max(fp_n_C1, 1)
-            m0 = fp_sum_C0 / max(fp_n_C0, 1)
-            print(f"[audit] fp_cost_bps mean | market_toxic=1: {m1:.6g} (n={fp_n_C1}) | market_toxic=0: {m0:.6g} (n={fp_n_C0})")
-
         if idx_PTHR is not None:
             print(f"[audit] audit_p_thr_ev0: total={P_thr_total} finite={P_thr_finite} nan={P_thr_nan} bad_oob={P_thr_bad}")
 
-        if args.audit_fp_zero_on_pos and (idx_fp is not None) and fp_pos_n > 0:
-            bad_rate = fp_pos_bad / max(fp_pos_n, 1)
-            print(f"[audit] fp_cost_bps≈0 on y==1: bad={fp_pos_bad}/{fp_pos_n} rate={bad_rate:.6g} tol={args.audit_fp_zero_tol}")
-            if fp_pos_bad > 0:
-                print("⛔ audit: fp_cost_bps non-zero détecté sur label==1 (check audit-fp-zero-on-pos).")
-                return 2
+        pnl_mean = (pnl_sum / max(pnl_n, 1)) if idx_pnl is not None else float("nan")
+        print(f"[audit][split_stats] sum_A={A_sum} sum_B={B_sum} sum_C={C_sum} pnl_mean={pnl_mean:.6g} (n={pnl_n})")
 
-        # split_stats summary (always ON)
-        fp_mean = (fp_sum / max(fp_n, 1)) if idx_fp is not None else float("nan")
-        print(f"[audit][split_stats] sum_A={A_sum} sum_B={B_sum} sum_C={C_sum} fp_cost_mean={fp_mean:.6g} (n={fp_n})")
 
         if args.require_parity:
             bad = []

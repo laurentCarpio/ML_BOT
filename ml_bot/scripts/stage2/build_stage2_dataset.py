@@ -87,13 +87,120 @@ LOG_NEG_SPREAD_MAX_EX = 5
 DEDUP_BOOK_TS = True
 RECALC_SPREAD_ENTRY = False
 
+# ------------------------------
+# Column grouping helpers
+# ------------------------------
+META_COLS_FIXED = [
+    "event_id", "task", "row_id", "t", "symbol", "year", "tf",
+    "y_go", "y_dir",
+    "bid_entry", "ask_entry", "spread_bps_entry", "atr_bps",
+]
+
+AUDIT_PREFIXES = ("audit_",)  # Stage1 audits + Stage2 flags
+SUP_PREFIXES = ("sup_",)      # oracle post-entry supervision (NEVER in X)
+
+def normalize_audit_side_prefixes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename:
+      auditL_xxx -> audit_xxx_L
+      auditS_xxx -> audit_xxx_S
+    Leaves existing audit_* intact.
+    If a target name already exists, we keep existing and drop the renamed one to avoid collisions.
+    """
+    if df is None or df.empty:
+        return df
+
+    ren = {}
+    for c in df.columns:
+        if c.startswith("auditL_"):
+            base = c[len("auditL_"):]
+            ren[c] = f"audit_{base}_L"
+        elif c.startswith("auditS_"):
+            base = c[len("auditS_"):]
+            ren[c] = f"audit_{base}_S"
+
+    if not ren:
+        return df
+
+    # collision-safe: if target already exists, drop source
+    drop_src = [src for src, tgt in ren.items() if tgt in df.columns]
+    if drop_src:
+        df = df.drop(columns=drop_src, errors="ignore")
+        # remove those from ren so we don't rename them
+        for src in drop_src:
+            ren.pop(src, None)
+
+    if ren:
+        df = df.rename(columns=ren)
+
+    return df
+
+def lift_stage1_auditLS_to_audit_suffix(tmp: pd.DataFrame, sig: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """
+    For the given tf, copy any Stage1 columns:
+      auditL_<metric>_<tf>  -> audit_<metric>_L
+      auditS_<metric>_<tf>  -> audit_<metric>_S
+
+    We STRIP the trailing _<tf> because Stage2 has a 'tf' column already (one row per tf).
+    """
+    tf = str(tf).lower().strip()
+    tf_tag = "_" + tf
+
+    cols = [c for c in sig.columns if (c.startswith("auditL_") or c.startswith("auditS_")) and str(c).endswith(tf_tag)]
+    if not cols:
+        return tmp
+
+    for c in cols:
+        base = c[:-len(tf_tag)]  # remove _<tf>
+        if base.startswith("auditL_"):
+            metric = base[len("auditL_"):]
+            outc = f"audit_{metric}_L"
+        else:
+            metric = base[len("auditS_"):]
+            outc = f"audit_{metric}_S"
+
+        # collision-safe: if already exists, keep existing (do nothing)
+        if outc in tmp.columns:
+            continue
+
+        tmp[outc] = sig[c]
+
+    return tmp 
+
+def reorder_stage2_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Order: meta | audits | sup | features (everything else)
+    Makes it trivial for Stage3 to keep audits/sup but exclude from X.
+    """
+    cols = list(df.columns)
+
+    meta = [c for c in META_COLS_FIXED if c in cols]
+
+    audits = [c for c in cols if c.startswith(AUDIT_PREFIXES)]
+    sups   = [c for c in cols if c.startswith(SUP_PREFIXES)]
+
+    # remove duplicates while preserving order
+    seen = set()
+    def uniq(xs):
+        out = []
+        for x in xs:
+            if x not in seen:
+                out.append(x); seen.add(x)
+        return out
+
+    meta_u = uniq(meta)
+    audits_u = uniq(audits)
+    sups_u = uniq(sups)
+
+    rest = [c for c in cols if c not in seen]  # features
+
+    return df[meta_u + audits_u + sups_u + rest]
 
 # ------------------------------
 # Logging
 # ------------------------------
 def log(msg: str):
     print(f"{pd.Timestamp.utcnow().isoformat()}Z | {msg}", flush=True)
-
 
 # ------------------------------
 # S3 / Arrow helpers
@@ -939,6 +1046,9 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
                 # fallback non-suffixé (ex: fill_window_sec)
                 tmp[outc] = sig[opt]
 
+        # ✅ NEW: lift Stage1 auditL_/auditS_ for this tf into audit_*_L / audit_*_S
+        tmp = lift_stage1_auditLS_to_audit_suffix(tmp, sig, tf) 
+        
         rows.append(tmp)
 
     ev = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -1362,15 +1472,10 @@ def process_symbol_year(
             # Needed by build_audit_flags_from_sup (it reads from merged)
             merged["ret_stdev_1s_10s_bps"] = bf["ret_stdev_1s_10s_bps"].values
 
-            def _fill_aggr_neutral(x: np.ndarray) -> np.ndarray:
-                x = x.astype("float64", copy=False)
-                x[~np.isfinite(x)] = 0.5
-                return np.clip(x, 0.0, 1.0)
-
-            agr3  = _fill_aggr_neutral(_asof_values(trades_prep.aggr3,  merged["t"]))
-            agr5  = _fill_aggr_neutral(_asof_values(trades_prep.aggr5,  merged["t"]))
-            agr10 = _fill_aggr_neutral(_asof_values(trades_prep.aggr10, merged["t"]))
-            agr15 = _fill_aggr_neutral(_asof_values(trades_prep.aggr15, merged["t"]))
+            agr3  = _asof_values(trades_prep.aggr3,  merged["t"])
+            agr5  = _asof_values(trades_prep.aggr5,  merged["t"])
+            agr10 = _asof_values(trades_prep.aggr10, merged["t"])
+            agr15 = _asof_values(trades_prep.aggr15, merged["t"])
 
             bf["aggr_ratio_10s"] = agr10
             bf["aggr_ratio_15s"] = agr15
@@ -1456,7 +1561,7 @@ def process_symbol_year(
                 "y_go": pd.to_numeric(merged["y_go"], errors="coerce").fillna(0).astype(int).values,
                 "y_dir": pd.to_numeric(merged["y_dir"], errors="coerce").fillna(0).astype(int).values,
 
-                # core entry/meta
+                # core entry/metaev0
                 "bid_entry": pd.to_numeric(merged["bid_entry"], errors="coerce").astype(float).values,
                 "ask_entry": pd.to_numeric(merged["ask_entry"], errors="coerce").astype(float).values,
                 "spread_bps_entry": pd.to_numeric(merged["spread_bps_entry"], errors="coerce").astype(float).values,
@@ -1464,7 +1569,7 @@ def process_symbol_year(
 
                 # audits (optional)
                 "audit_pnl_net_bps": pd.to_numeric(_col_or_default(merged, "audit_pnl_net_bps", np.nan, n), errors="coerce").astype(float).values,
-                "audit_exit_reason": _col_or_default(merged, "audit_exit_reason", "NA", n).astype(str).values,
+                "audit_exit_reason": _col_or_default(merged, "audit_exit_reason", "NONE", n),
                 "audit_tp_bps": pd.to_numeric(_col_or_default(merged, "audit_tp_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_sl_bps": pd.to_numeric(_col_or_default(merged, "audit_sl_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_rr_min": pd.to_numeric(_col_or_default(merged, "audit_rr_min", np.nan, n), errors="coerce").astype(float).values,
@@ -1473,6 +1578,12 @@ def process_symbol_year(
                 "audit_fill_window_sec": pd.to_numeric(_col_or_default(merged, "audit_fill_window_sec", np.nan, n), errors="coerce").astype(float).values,
                 "audit_p_thr_ev0": pd.to_numeric(_col_or_default(merged, "audit_p_thr_ev0", np.nan, n), errors="coerce").astype(float).values,
             })
+
+            # ---- NEW: keep Stage1 audit_*_L/_S (lifted) into base_out ----
+            lifted = [c for c in merged.columns if c.startswith("audit_") and c not in base_out.columns]
+            if lifted:
+                base_out = pd.concat([base_out, merged[lifted].reset_index(drop=True)], axis=1)
+
 
             # ✅ NEW: oracle-safe supervision (post-entry) — NEVER as model features
             sup_df = compute_supervision_features_post_entry(
@@ -1486,8 +1597,12 @@ def process_symbol_year(
             out_all = pd.concat([
                 base_out.reset_index(drop=True),
                 bf.reset_index(drop=True),
+                sup_df.reset_index(drop=True),          # ✅ NEW: keep sup_* columns
                 audit_flags.reset_index(drop=True)
             ], axis=1)
+
+            # ✅ Normalize auditL_/auditS_ -> audit_*_L/_S
+            out_all = normalize_audit_side_prefixes(out_all)
 
             # Point (6): DIR drop neutral — keep only y_dir ∈ {-1,+1}
             out_go = out_all.copy()
@@ -1501,6 +1616,10 @@ def process_symbol_year(
             if not out_dir.empty:
                 out_dir["task"] = "dir"
                 out_dir["event_id"] = out_dir["row_id"].astype(str) + "|dir|" + out_dir["tf"].astype(str)
+
+            # ✅ Reorder for Stage3 convenience
+            out_go = reorder_stage2_columns(out_go)
+            out_dir = reorder_stage2_columns(out_dir)
 
             if debug and (not out_go.empty) and out_go["event_id"].duplicated().any():
                 raise ValueError(

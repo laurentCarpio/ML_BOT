@@ -99,18 +99,61 @@ def hash64(s: str) -> int:
 # Contract (minimum vital)
 # ----------------------------
 REQUIRED_STRUCTURE = ["t", "symbol", "year", "tf", "row_id", "task", "event_id"]
-REQUIRED_LABELS = ["y_go", "y_dir"]  # tu veux strict: présents partout
-REQUIRED_EV = ["audit_p_thr_ev0"]  # Stage2 doit avoir une colonne unique par ligne (tf déjà dans "tf")
+REQUIRED_LABELS = ["y_go", "y_dir"]
 
+# Stage2 doit porter le budget gate (déjà required)
+REQUIRED_EV = ["audit_p_thr_ev0"]
+
+# Flags audit (déjà required)
 REQUIRED_AUDIT_FLAGS = ["audit_market_toxic", "audit_timeout", "audit_early_abort"]
-OPTIONAL_AUDIT_NUM = ["audit_pnl_net_bps", "audit_tp_bps", "audit_sl_bps", "audit_rr_min", "audit_risk_r_bps"]
-OPTIONAL_AUDIT_TEXT = ["audit_exit_reason", "audit_fill_mode"]
 
-# Colonnes "oracle / leakage" à bannir (minimum)
+# ----------------------------
+# REQUIRED audit numeric (Stage2 core economics)
+# ----------------------------
+REQUIRED_AUDIT_NUM = [
+    "audit_pnl_net_bps",
+    "audit_tp_bps",
+    "audit_sl_bps",
+    "audit_rr_min",
+    "audit_risk_r_bps",
+]
+
+# ----------------------------
+# REQUIRED audit text / enums
+# ----------------------------
+REQUIRED_AUDIT_TEXT = [
+    "audit_exit_reason",
+    "audit_fill_mode",
+]
+
+# --- NEW: required audit extras (oracle-safe, non-features mais audits) ---
+REQUIRED_AUDIT_EXTRA_NUM = [
+    # MFE/MAE in R
+    "audit_mfe_R_L", "audit_mae_R_L",
+    "audit_mfe_R_S", "audit_mae_R_S",
+
+    # first touch + step
+    "audit_first_touch_L", "audit_first_touch_step_L",
+    "audit_first_touch_S", "audit_first_touch_step_S",
+]
+
+REQUIRED_AUDIT_EXTRA_HIT_FLAGS = [
+    # hit +kR
+    "audit_hit_p1R_L","audit_hit_p2R_L","audit_hit_p3R_L","audit_hit_p4R_L","audit_hit_p5R_L",
+    "audit_hit_p1R_S","audit_hit_p2R_S","audit_hit_p3R_S","audit_hit_p4R_S","audit_hit_p5R_S",
+
+    # hit -kR
+    "audit_hit_m1R_L","audit_hit_m2R_L","audit_hit_m3R_L",
+    "audit_hit_m1R_S","audit_hit_m2R_S","audit_hit_m3R_S",
+]
+
+# Colonnes oracle/leakage: on garde le strict sur Y/y et regex,
+# mais sup_* devient WARNING (voir plus bas)
 FORBIDDEN_EXACT = {"Y", "y"}
-FORBIDDEN_PREFIXES = ("sup_",)
 FORBIDDEN_REGEX = [r"^Y_", r"^label_"]
 
+# WARNING only:
+WARNING_PREFIXES = ("sup_",)
 
 # ----------------------------
 # Stats streaming
@@ -123,6 +166,7 @@ class Stats:
     ygo_counts: Counter = field(default_factory=Counter)
     ydir_counts: Counter = field(default_factory=Counter)
     nulls: Counter = field(default_factory=Counter)
+    sup_cols_seen: Counter = field(default_factory=Counter)
 
     ok_task: int = 0
     tot_task: int = 0
@@ -204,27 +248,75 @@ def validate_files(paths: List[str], dataset: str, so: dict,
     symset = set(map(str, symbols)) if symbols else None
     yrset = set(int(y) for y in years) if years else None
 
+    # Helpers for side-aware requirements
+    def _exit_norm(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.upper()
+
+    def _is_none_like_exit(v: pd.Series) -> pd.Series:
+        vv = _exit_norm(v)
+        return vv.isin(["NONE", "NOFILL", ""])
+
+    def _need_L(v: pd.Series) -> pd.Series:
+        vv = _exit_norm(v)
+        return vv.str.contains("_LONG", regex=False)
+
+    def _need_S(v: pd.Series) -> pd.Series:
+        vv = _exit_norm(v)
+        return vv.str.contains("_SHORT", regex=False)
+
+    def _is_time(v: pd.Series) -> pd.Series:
+        return _exit_norm(v).eq("TIME")
+
+    # Map side -> required columns
+    REQ_NUM_L = ["audit_mfe_R_L", "audit_mae_R_L", "audit_first_touch_step_L"]
+    REQ_NUM_S = ["audit_mfe_R_S", "audit_mae_R_S", "audit_first_touch_step_S"]
+
+    # first_touch is NUMERIC in your Stage2 (observed -1)
+    REQ_TOUCH_L = ["audit_first_touch_L"]
+    REQ_TOUCH_S = ["audit_first_touch_S"]
+    VALID_TOUCH_INT = {-1, 0, 1, 2}  # permissif : -1 = none/unknown, 1/2 = tp/sl (selon convention)
+
+    REQ_HIT_L = [c for c in REQUIRED_AUDIT_EXTRA_HIT_FLAGS if c.endswith("_L")]
+    REQ_HIT_S = [c for c in REQUIRED_AUDIT_EXTRA_HIT_FLAGS if c.endswith("_S")]
+
     for path in paths:
         pf = open_parquet(path, so)
         cols = list(pf.schema.names)
 
         # forbid (schema-level)
         bad_exact = [c for c in cols if c in FORBIDDEN_EXACT]
-        bad_pref = [c for c in cols if any(str(c).startswith(px) for px in FORBIDDEN_PREFIXES)]
         bad_re = [c for c in cols if any(re.match(rx, str(c)) for rx in FORBIDDEN_REGEX)]
-        if bad_exact or bad_pref or bad_re:
-            raise ValueError(f"[FORBIDDEN] {path}\n  exact={bad_exact}\n  pref={bad_pref}\n  re={bad_re}")
+
+        # WARNING: sup_* only
+        warn_pref = [c for c in cols if any(str(c).startswith(px) for px in WARNING_PREFIXES)]
+        if warn_pref:
+            stats.sup_cols_seen.update(warn_pref)
+
+        if bad_exact or bad_re:
+            raise ValueError(
+                f"[FORBIDDEN] {path}\n"
+                f"  exact={bad_exact}\n"
+                f"  re={bad_re}\n"
+                f"  warn_sup_prefix={warn_pref[:20]}"
+            )
 
         # required columns exist (schema-level)
-        missing = [c for c in (REQUIRED_STRUCTURE + REQUIRED_LABELS + REQUIRED_AUDIT_FLAGS + REQUIRED_EV) if c not in cols]
+        required_all = (
+            REQUIRED_STRUCTURE
+            + REQUIRED_LABELS
+            + REQUIRED_EV
+            + REQUIRED_AUDIT_FLAGS
+            + REQUIRED_AUDIT_NUM
+            + REQUIRED_AUDIT_TEXT
+            + REQUIRED_AUDIT_EXTRA_NUM
+            + REQUIRED_AUDIT_EXTRA_HIT_FLAGS
+        )
+        missing = [c for c in required_all if c not in cols]
         if missing:
             raise ValueError(f"[MISSING COLS] {path}: {missing}")
 
-        # read only columns needed for checks (faster/cheaper)
-        wanted = sorted(set(
-            REQUIRED_STRUCTURE + REQUIRED_LABELS + REQUIRED_AUDIT_FLAGS + REQUIRED_EV
-            + OPTIONAL_AUDIT_NUM + OPTIONAL_AUDIT_TEXT
-        ))
+        # read only columns needed for checks
+        wanted = sorted(set(required_all))
         wanted = [c for c in wanted if c in cols]
 
         for batch in pf.iter_batches(batch_size=batch_rows, columns=wanted):
@@ -246,12 +338,12 @@ def validate_files(paths: List[str], dataset: str, so: dict,
             n = len(df)
             stats.rows += n
 
-            # null counters (top-level)
+            # null counters
             nn = df.isna().sum().to_dict()
             for k, v in nn.items():
                 stats.nulls[k] += int(v)
 
-            # task == dataset (hard fail on first bad example)
+            # task == dataset
             stats.tot_task += n
             taskn = df["task"].map(norm_task)
             ok_task_mask = (taskn == dataset)
@@ -262,7 +354,7 @@ def validate_files(paths: List[str], dataset: str, so: dict,
 
             stats.task_counts.update(taskn.value_counts(dropna=False).to_dict())
 
-            # tf non-empty + normalized (lower/strip)
+            # tf normalized
             tf_raw = df["tf"].astype(str)
             tf_norm = df["tf"].map(norm_tf)
             stats.tot_tf_norm += n
@@ -297,77 +389,63 @@ def validate_files(paths: List[str], dataset: str, so: dict,
                 raise ValueError(f"[BAD y_dir] domain mismatch for dataset={dataset}\nfile={path}\n{ex}")
             stats.ydir_counts.update(df["y_dir"].value_counts(dropna=False).to_dict())
 
-            # ----------------------------
-            # audit_p_thr_ev0 checks (Stage1 -> Stage2 propagation)
-            # ----------------------------
-            # ----------------------------
-            # audit_p_thr_ev0 checks (Stage1 -> Stage2 propagation)
-            # ----------------------------
+            # required audit text
+            v = df["audit_exit_reason"].astype(str).str.strip().str.upper()
+            bad = v.isin(["", "NAN", "NULL"])   # <-- NONE est autorisé
+            if bad.any():
+                ex = df.loc[bad, ["symbol","year","tf","row_id","audit_exit_reason","event_id"]].head(5)
+                raise ValueError(f"[BAD audit_exit_reason] empty/null\nfile={path}\n{ex}")
+
+            v = df["audit_fill_mode"].astype(str).str.strip().str.lower()
+            bad = v.isin(["", "nan", "none", "null"])
+            if bad.any():
+                ex = df.loc[bad, ["symbol","year","tf","row_id","audit_fill_mode","event_id"]].head(5)
+                raise ValueError(f"[BAD audit_fill_mode] empty/null\nfile={path}\n{ex}")
+
+            # required audit numeric (core): non-null + finite
+            for c in REQUIRED_AUDIT_NUM:
+                s = pd.to_numeric(df[c], errors="coerce").astype("float64")
+                if s.isna().any():
+                    ex = df.loc[s.isna(), ["symbol","year","tf","row_id",c,"event_id"]].head(5)
+                    raise ValueError(f"[BAD required audit num] {c} contains NaN/NULL\nfile={path}\n{ex}")
+                if not np.isfinite(s.to_numpy()).all():
+                    bad = ~np.isfinite(s.to_numpy())
+                    ex = df.loc[bad, ["symbol","year","tf","row_id",c,"event_id"]].head(5)
+                    raise ValueError(f"[BAD required audit num] {c} contains inf/NaN\nfile={path}\n{ex}")
+
+            # audit_p_thr_ev0 checks
             pthr = pd.to_numeric(df["audit_p_thr_ev0"], errors="coerce")
             m_thr = pthr.notna()
-
             if not m_thr.any():
                 ex = df.loc[:, ["symbol","year","tf","row_id","event_id"]].head(5)
                 raise ValueError(f"[BAD audit_p_thr_ev0] all values are null/NaN\nfile={path}\n{ex}")
 
-            # finite
             bad_finite = m_thr & ~np.isfinite(pthr.to_numpy(dtype="float64"))
             if bad_finite.any():
                 ex = df.loc[bad_finite, ["symbol","year","tf","row_id","audit_p_thr_ev0","event_id"]].head(5)
-                raise ValueError(...)
+                raise ValueError(f"[BAD audit_p_thr_ev0] contains inf/NaN\nfile={path}\n{ex}")
 
-            # range [0,1] tol
             bad_range = (pthr[m_thr] < -1e-6) | (pthr[m_thr] > 1.0 + 1e-6)
             if bad_range.any():
                 ex = df.loc[m_thr & bad_range, ["symbol","year","tf","row_id","audit_p_thr_ev0","event_id"]].head(5)
                 raise ValueError(f"[BAD audit_p_thr_ev0] out of [0,1]\nfile={path}\n{ex}")
 
-            # Optional coherence check (ONLY if we can recompute the same cost used in stage1)
-            if ("audit_tp_bps" in df.columns) and ("audit_sl_bps" in df.columns):
-                tp = pd.to_numeric(df["audit_tp_bps"], errors="coerce").astype("float64")
-                sl = pd.to_numeric(df["audit_sl_bps"], errors="coerce").astype("float64")
-
-                have_cost_cols = ("entry_spread_half_bps" in df.columns) and ("fee_exit_bps" in df.columns)
-                if have_cost_cols:
-                    half = pd.to_numeric(df["entry_spread_half_bps"], errors="coerce").astype("float64")
-                    fee  = pd.to_numeric(df["fee_exit_bps"], errors="coerce").astype("float64")
-                    cost = half + fee
-
-                    denom = (tp + sl).astype("float64").clip(lower=1e-12)
-                    want = (sl + cost) / denom
-
-                    ok = pthr.notna() & want.notna()
-                    if ok.any():
-                        diff = (pthr[ok] - want[ok]).abs()
-                        tol = 5e-4 + 5e-4 * want[ok].abs()
-                        bad = diff > tol
-                        if bad.any():
-                            ex = df.loc[ok & bad, ["symbol","year","tf","row_id",
-                                                "audit_p_thr_ev0","audit_tp_bps","audit_sl_bps",
-                                                "entry_spread_half_bps","fee_exit_bps","event_id"]].head(5)
-                            raise ValueError(
-                                f"[BAD audit_p_thr_ev0 formula] mismatch vs (sl+cost)/(tp+sl)\nfile={path}\n{ex}"
-                            )
-                # else: cannot recompute cost -> skip formula check
-                
             # event_id formula row_id|task|tf
-            # (on ne refait pas tout le monde si batch huge: mais ici on peut, c'est O(n))
             eid = df["event_id"]
             rid = df["row_id"].astype(str)
             want = rid + "|" + taskn.astype(str) + "|" + tf_norm.astype(str)
-
             good_mask = eid.notna() & df["row_id"].notna() & df["task"].notna() & df["tf"].notna()
             stats.tot_event_formula += int(good_mask.sum())
             if good_mask.any():
                 okf = (eid[good_mask].astype(str).values == want[good_mask].values)
                 stats.ok_event_formula += int(okf.sum())
                 if not okf.all():
-                    bad = good_mask.copy()
-                    bad.loc[good_mask] = ~okf
-                    ex = df.loc[bad, ["symbol","year","tf","row_id","task","event_id"]].head(5)
+                    badm = good_mask.copy()
+                    badm.loc[good_mask] = ~okf
+                    ex = df.loc[badm, ["symbol","year","tf","row_id","task","event_id"]].head(5)
                     raise ValueError(f"[BAD event_id] expected row_id|task|tf\nfile={path}\n{ex}")
 
-            # optional: caped uniqueness (warning if cap reached)
+            # uniqueness (caped)
             if stats.uniqueness_enabled:
                 is_null = eid.isna()
                 stats.null_eid += int(is_null.sum())
@@ -385,24 +463,114 @@ def validate_files(paths: List[str], dataset: str, so: dict,
                 m = s.notna()
                 stats.tot_audit_flags += int(m.sum())
                 stats.ok_audit_flags += int(((s[m] == 0) | (s[m] == 1)).sum())
-                if stats.ok_audit_flags != stats.tot_audit_flags:
+                if (m & ~((s == 0) | (s == 1))).any():
                     ex = df.loc[m & ~((s == 0) | (s == 1)), ["symbol","year","tf","row_id",c,"event_id"]].head(5)
                     raise ValueError(f"[BAD audit flag] {c} must be in {{0,1}}\nfile={path}\n{ex}")
 
             # minimal audit logic: if exit_reason is set => pnl notna
-            if "audit_exit_reason" in df.columns and "audit_pnl_net_bps" in df.columns:
-                exit_na = is_na_text(df["audit_exit_reason"])
-                pnl = pd.to_numeric(df["audit_pnl_net_bps"], errors="coerce")
-                stats.tot_audit_logic += n
-                ok = exit_na | pnl.notna()
-                stats.ok_audit_logic += int(ok.sum())
-                if not ok.all():
-                    ex = df.loc[~ok, ["symbol","year","tf","row_id","audit_exit_reason","audit_pnl_net_bps","event_id"]].head(5)
-                    raise ValueError(f"[BAD audit logic] pnl missing while exit_reason set\nfile={path}\n{ex}")
+            exit_na = is_na_text(df["audit_exit_reason"])
+            pnl = pd.to_numeric(df["audit_pnl_net_bps"], errors="coerce")
+            stats.tot_audit_logic += n
+            ok_logic = exit_na | pnl.notna()
+            stats.ok_audit_logic += int(ok_logic.sum())
+            if not ok_logic.all():
+                ex = df.loc[~ok_logic, ["symbol","year","tf","row_id","audit_exit_reason","audit_pnl_net_bps","event_id"]].head(5)
+                raise ValueError(f"[BAD audit logic] pnl missing while exit_reason set\nfile={path}\n{ex}")
+
+            # -------------------------------------------------------
+            # SIDE-AWARE audit extras checks
+            # -------------------------------------------------------
+            exit_reason = df["audit_exit_reason"]
+            none_like = _is_none_like_exit(exit_reason)
+
+            # audit "complete": exit not NONE/NOFILL and flags==0
+            f_early = pd.to_numeric(df["audit_early_abort"], errors="coerce").fillna(0).astype("int64")
+            f_timeo = pd.to_numeric(df["audit_timeout"], errors="coerce").fillna(0).astype("int64")
+            f_tox   = pd.to_numeric(df["audit_market_toxic"], errors="coerce").fillna(0).astype("int64")
+            flags_ok = (f_early == 0) & (f_timeo == 0) & (f_tox == 0)
+
+            complete = (~none_like) & flags_ok
+
+            needL = complete & _need_L(exit_reason)
+            needS = complete & _need_S(exit_reason)
+            isTIME = complete & _is_time(exit_reason)
+
+            # TIME: allow "at least one side has mfe+mae notna"
+            if isTIME.any():
+                mfeL = pd.to_numeric(df["audit_mfe_R_L"], errors="coerce")
+                maeL = pd.to_numeric(df["audit_mae_R_L"], errors="coerce")
+                mfeS = pd.to_numeric(df["audit_mfe_R_S"], errors="coerce")
+                maeS = pd.to_numeric(df["audit_mae_R_S"], errors="coerce")
+                hasL = mfeL.notna() & maeL.notna()
+                hasS = mfeS.notna() & maeS.notna()
+                bad = isTIME & ~(hasL | hasS)
+                if bad.any():
+                    ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason",
+                                      "audit_mfe_R_L","audit_mae_R_L","audit_mfe_R_S","audit_mae_R_S"]].head(5)
+                    raise ValueError(f"[BAD audit extras] TIME requires at least one side (L or S) to have mfe+mae\nfile={path}\n{ex}")
+
+            # Require L-side extras only when exit is *_LONG
+            if needL.any():
+                # numeric (mfe/mae finite; step allows -1)
+                for c in ["audit_mfe_R_L", "audit_mae_R_L"]:
+                    s = pd.to_numeric(df[c], errors="coerce").astype("float64")
+                    bad = needL & (s.isna() | ~np.isfinite(s.to_numpy()))
+                    if bad.any():
+                        ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason",c]].head(5)
+                        raise ValueError(f"[BAD required audit num] {c} missing/inf for *_LONG\nfile={path}\n{ex}")
+
+                s = pd.to_numeric(df["audit_first_touch_step_L"], errors="coerce").astype("float64")
+                bad = needL & (s.isna() | ~np.isfinite(s.to_numpy()))
+                if bad.any():
+                    ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason","audit_first_touch_step_L"]].head(5)
+                    raise ValueError(f"[BAD required audit num] audit_first_touch_step_L missing/inf for *_LONG\nfile={path}\n{ex}")
+                # allow -1 (unknown/no-touch) for now
+
+                # first_touch numeric domain
+                ft = pd.to_numeric(df["audit_first_touch_L"], errors="coerce")
+                bad = needL & (ft.isna() | ~ft.isin(list(VALID_TOUCH_INT)))
+                if bad.any():
+                    ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason","audit_first_touch_L"]].head(5)
+                    raise ValueError(f"[BAD required audit code] audit_first_touch_L invalid for *_LONG (want {sorted(VALID_TOUCH_INT)})\nfile={path}\n{ex}")
+
+                # hit flags
+                for c in REQ_HIT_L:
+                    s = pd.to_numeric(df[c], errors="coerce")
+                    bad = needL & (s.isna() | ~((s == 0) | (s == 1)))
+                    if bad.any():
+                        ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason",c]].head(5)
+                        raise ValueError(f"[BAD required audit hit flag] {c} invalid/missing for *_LONG\nfile={path}\n{ex}")
+
+            # Require S-side extras only when exit is *_SHORT
+            if needS.any():
+                for c in ["audit_mfe_R_S", "audit_mae_R_S"]:
+                    s = pd.to_numeric(df[c], errors="coerce").astype("float64")
+                    bad = needS & (s.isna() | ~np.isfinite(s.to_numpy()))
+                    if bad.any():
+                        ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason",c]].head(5)
+                        raise ValueError(f"[BAD required audit num] {c} missing/inf for *_SHORT\nfile={path}\n{ex}")
+
+                s = pd.to_numeric(df["audit_first_touch_step_S"], errors="coerce").astype("float64")
+                bad = needS & (s.isna() | ~np.isfinite(s.to_numpy()))
+                if bad.any():
+                    ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason","audit_first_touch_step_S"]].head(5)
+                    raise ValueError(f"[BAD required audit num] audit_first_touch_step_S missing/inf for *_SHORT\nfile={path}\n{ex}")
+
+                ft = pd.to_numeric(df["audit_first_touch_S"], errors="coerce")
+                bad = needS & (ft.isna() | ~ft.isin(list(VALID_TOUCH_INT)))
+                if bad.any():
+                    ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason","audit_first_touch_S"]].head(5)
+                    raise ValueError(f"[BAD required audit code] audit_first_touch_S invalid for *_SHORT (want {sorted(VALID_TOUCH_INT)})\nfile={path}\n{ex}")
+
+                for c in REQ_HIT_S:
+                    s = pd.to_numeric(df[c], errors="coerce")
+                    bad = needS & (s.isna() | ~((s == 0) | (s == 1)))
+                    if bad.any():
+                        ex = df.loc[bad, ["symbol","year","tf","row_id","event_id","audit_exit_reason",c]].head(5)
+                        raise ValueError(f"[BAD required audit hit flag] {c} invalid/missing for *_SHORT\nfile={path}\n{ex}")
 
             del df, t, batch
             gc.collect()
-
 
 def print_summary(stats: Stats, dataset: str, split: str) -> None:
     log("\n" + "="*80)
@@ -438,6 +606,13 @@ def print_summary(stats: Stats, dataset: str, split: str) -> None:
         if len(stats.seen) >= stats.seen_cap:
             log(f"\n[WARN] event_id uniqueness: cap reached ({stats.seen_cap:,}). dup_eid reported is a LOWER bound.")
         log(f"event_id null: {stats.null_eid:,} | dup_eid (hashed): {stats.dup_eid:,}")
+    
+    if stats.sup_cols_seen:
+        log("\n[WARN] sup_* columns detected (schema-level):")
+        for c, n in stats.sup_cols_seen.most_common(30):
+            log(f"  {c}: {n} file(s)")
+        if len(stats.sup_cols_seen) > 30:
+            log(f"  ... (+{len(stats.sup_cols_seen)-30})")
 
     log("\n✅ Validation OK.\n")
 

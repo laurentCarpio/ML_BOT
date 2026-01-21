@@ -138,7 +138,6 @@ def write_df_csv(path: str, df: pd.DataFrame, so: dict):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_csv(path, index=False)
 
-
 # ============================
 # Basic utils
 # ============================
@@ -273,6 +272,16 @@ class AggLabel:
     n_bad_p_thr_ev0_formula: int = 0
 
 @dataclass
+class AggAudit:
+    n_checked: int = 0
+    n_bad: int = 0
+    n_bad_range: int = 0
+    n_bad_monotonic: int = 0
+    n_bad_first_touch: int = 0
+    n_bad_first_touch_step: int = 0
+    n_bad_mfe_mae: int = 0
+
+@dataclass
 class AggFile:
     n_dup_row_id: int = 0
     n_rows: int = 0
@@ -303,9 +312,29 @@ class AggFile:
     # monthly counts: (key, month, y) -> count
     monthly: Dict[Tuple[str, str, int], int] = field(default_factory=dict)
 
+    # Stage1 v3 audit stats (optional)
+    audit: AggAudit = field(default_factory=AggAudit)
+
 # ============================
 # Helpers: robust exit_reason matching
 # ============================
+
+# ============================
+# Stage1 v3 AUDIT checks (optional)
+# ============================
+
+AUDIT_POS_LEVELS = (1, 2, 3, 4, 5)
+AUDIT_NEG_LEVELS = (1, 2, 3)  # -1R/-2R/-3R
+
+AUDIT_FIRST_TOUCH_ALLOWED = set([-3, -2, -1, 0, 1, 2, 3, 4, 5])
+
+def _audit_col(prefix: str, name: str, h: str) -> str:
+    # prefix: "auditL" or "auditS"
+    return f"{prefix}_{name}_{h}"
+
+def _audit_hit_col(prefix: str, sign: str, k: int, h: str) -> str:
+    # sign: "p" for +kR, "m" for -kR
+    return f"{prefix}_hit_{sign}{k}R_{h}"
 
 def _norm_reason(x) -> str:
     if x is None:
@@ -777,6 +806,169 @@ def process_signals_file(
                             if mask_trade.any():
                                 al.pnl_trade.add_array(pnl[mask_trade], rng)
 
+                # ------------------------------------------------------------
+                # Stage1 v3 AUDIT checks (optional) — only if columns exist
+                # ------------------------------------------------------------
+                # We validate, per horizon, both sides L/S:
+                # - audit*_mfe_R >= 0 ; audit*_mae_R >= 0
+                # - audit*_first_touch in allowed set; step logic:
+                #       first_touch == 0  => step == -1
+                #       first_touch != 0  => step >= 0
+                # - hit flags are 0/1
+                # - monotonicity: hit_p3 => hit_p2 => hit_p1 ; hit_m3 => hit_m2 => hit_m1
+                # - coherence with first_touch:
+                #       first_touch == +k => hit_p{k} == 1
+                #       first_touch == -k => hit_m{k} == 1
+                #
+                # If some cols are missing, we just skip that check.
+
+                # horizons present among RR labels are the natural loop driver
+                for h in rr_col_by_h.keys():
+                    for side_prefix in ("auditL", "auditS"):
+                        mfe_col  = _audit_col(side_prefix, "mfe_R", h)
+                        mae_col  = _audit_col(side_prefix, "mae_R", h)
+                        ft_col   = _audit_col(side_prefix, "first_touch", h)
+                        fts_col  = _audit_col(side_prefix, "first_touch_step", h)
+
+                        # If none of the core audit cols exist, skip (fast)
+                        if (mfe_col not in df.columns) and (mae_col not in df.columns) and (ft_col not in df.columns):
+                            continue
+
+                        A = agg.audit  # shorthand
+
+                        # --- MFE/MAE range checks
+                        if mfe_col in df.columns:
+                            mfe = pd.to_numeric(df[mfe_col], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(mfe)
+                            if ok.any():
+                                A.n_checked += int(ok.sum())
+                                bad = (mfe[ok] < -1e-9)
+                                A.n_bad_mfe_mae += int(bad.sum())
+                                A.n_bad += int(bad.sum())
+
+                        if mae_col in df.columns:
+                            mae = pd.to_numeric(df[mae_col], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(mae)
+                            if ok.any():
+                                A.n_checked += int(ok.sum())
+                                bad = (mae[ok] < -1e-9)
+                                A.n_bad_mfe_mae += int(bad.sum())
+                                A.n_bad += int(bad.sum())
+
+                        # --- first_touch domain + step rules
+                        if ft_col in df.columns:
+                            ft = pd.to_numeric(df[ft_col], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(ft)
+                            if ok.any():
+                                ft_i = ft[ok].astype(np.int16)
+                                A.n_checked += int(ok.sum())
+
+                                bad_dom = np.array([int(v) not in AUDIT_FIRST_TOUCH_ALLOWED for v in ft_i], dtype=bool)
+                                if bad_dom.any():
+                                    A.n_bad_first_touch += int(bad_dom.sum())
+                                    A.n_bad += int(bad_dom.sum())
+
+                                if fts_col in df.columns:
+                                    fts = pd.to_numeric(df[fts_col], errors="coerce").to_numpy(dtype=np.float64)
+                                    ok2 = ok & np.isfinite(fts)
+                                    if ok2.any():
+                                        ft2 = ft[ok2].astype(np.int16)
+                                        st2 = fts[ok2].astype(np.int64)
+
+                                        # ft==0 => step must be -1
+                                        bad0 = (ft2 == 0) & (st2 != -1)
+                                        # ft!=0 => step must be >=0
+                                        bad1 = (ft2 != 0) & (st2 < 0)
+
+                                        b = int(bad0.sum() + bad1.sum())
+                                        if b:
+                                            A.n_bad_first_touch_step += b
+                                            A.n_bad += b
+
+                        # --- hit flags checks (0/1) + monotonicity
+                        # Collect present hit cols
+                        hit_p_cols = []
+                        hit_m_cols = []
+                        for k in AUDIT_POS_LEVELS:
+                            c = _audit_hit_col(side_prefix, "p", k, h)
+                            if c in df.columns:
+                                hit_p_cols.append((k, c))
+                        for k in AUDIT_NEG_LEVELS:
+                            c = _audit_hit_col(side_prefix, "m", k, h)
+                            if c in df.columns:
+                                hit_m_cols.append((k, c))
+
+                        # 0/1 check on present columns
+                        for k, c in hit_p_cols + hit_m_cols:
+                            v = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(v)
+                            if ok.any():
+                                A.n_checked += int(ok.sum())
+                                bad = ~((v[ok] == 0.0) | (v[ok] == 1.0))
+                                if bad.any():
+                                    b = int(bad.sum())
+                                    A.n_bad_range += b
+                                    A.n_bad += b
+
+                        # Monotonicity: hit_p5=>...=>hit_p1 (when all involved exist)
+                        # We check only consecutive pairs that exist
+                        for (k2, c2), (k1, c1) in zip(hit_p_cols[1:], hit_p_cols[:-1]):
+                            v2 = pd.to_numeric(df[c2], errors="coerce").to_numpy(dtype=np.float64)
+                            v1 = pd.to_numeric(df[c1], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(v2) & np.isfinite(v1)
+                            if ok.any():
+                                # if higher barrier hit then lower must be hit
+                                bad = (v2[ok] == 1.0) & (v1[ok] != 1.0)
+                                if bad.any():
+                                    b = int(bad.sum())
+                                    A.n_bad_monotonic += b
+                                    A.n_bad += b
+
+                        for (k2, c2), (k1, c1) in zip(hit_m_cols[1:], hit_m_cols[:-1]):
+                            v2 = pd.to_numeric(df[c2], errors="coerce").to_numpy(dtype=np.float64)
+                            v1 = pd.to_numeric(df[c1], errors="coerce").to_numpy(dtype=np.float64)
+                            ok = np.isfinite(v2) & np.isfinite(v1)
+                            if ok.any():
+                                bad = (v2[ok] == 1.0) & (v1[ok] != 1.0)
+                                if bad.any():
+                                    b = int(bad.sum())
+                                    A.n_bad_monotonic += b
+                                    A.n_bad += b
+
+                        # Coherence with first_touch if both are available:
+                        if (ft_col in df.columns):
+                            ft = pd.to_numeric(df[ft_col], errors="coerce").to_numpy(dtype=np.float64)
+                            okft = np.isfinite(ft)
+                            if okft.any():
+                                ft_i = ft[okft].astype(np.int16)
+
+                                # Build arrays for specific hit cols if present
+                                # first_touch=+k -> hit_p{k}=1; first_touch=-k -> hit_m{k}=1
+                                for k in AUDIT_POS_LEVELS:
+                                    c = _audit_hit_col(side_prefix, "p", k, h)
+                                    if c not in df.columns:
+                                        continue
+                                    hp = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=np.float64)[okft]
+                                    ok = np.isfinite(hp)
+                                    if ok.any():
+                                        bad = (ft_i[ok] == k) & (hp[ok] != 1.0)
+                                        if bad.any():
+                                            b = int(bad.sum())
+                                            A.n_bad_first_touch += b
+                                            A.n_bad += b
+
+                                for k in AUDIT_NEG_LEVELS:
+                                    c = _audit_hit_col(side_prefix, "m", k, h)
+                                    if c not in df.columns:
+                                        continue
+                                    hm = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=np.float64)[okft]
+                                    ok = np.isfinite(hm)
+                                    if ok.any():
+                                        bad = (ft_i[ok] == -k) & (hm[ok] != 1.0)
+                                        if bad.any():
+                                            b = int(bad.sum())
+                                            A.n_bad_first_touch += b
+                                            A.n_bad += b
             if (ci % 20) == 0:
                 logger.info(f"  chunk {ci}: rows_so_far={agg.n_rows:,}")
     finally:
@@ -821,6 +1013,15 @@ def process_signals_file(
         issues.append(IntegrityIssue(
             path, symbol, year, "spread_bps_entry_recalc_mismatch",
             f"bad={agg.n_bad_spread_recalc_mismatch} / checked={agg.n_checked_spread_recalc}"
+        ))
+    
+    if agg.audit.n_bad:
+        issues.append(IntegrityIssue(
+            path, symbol, year, "audit_stage1_v3_inconsistencies",
+            f"bad={agg.audit.n_bad} checked≈{agg.audit.n_checked} "
+            f"(range={agg.audit.n_bad_range}, mono={agg.audit.n_bad_monotonic}, "
+            f"first_touch={agg.audit.n_bad_first_touch}, step={agg.audit.n_bad_first_touch_step}, "
+            f"mfe_mae={agg.audit.n_bad_mfe_mae})"
         ))
 
     # RR-only per-label issues
@@ -873,6 +1074,13 @@ def summarize_file_metrics(symbol: str, year: int, agg: AggFile) -> Dict[str, ob
         "spread_bps_entry_min_count": agg.spread_min_count,
         "spread_recalc_bad": agg.n_bad_spread_recalc_mismatch,
         "spread_recalc_checked": agg.n_checked_spread_recalc,
+        "audit_checked": agg.audit.n_checked,
+        "audit_bad": agg.audit.n_bad,
+        "audit_bad_range": agg.audit.n_bad_range,
+        "audit_bad_monotonic": agg.audit.n_bad_monotonic,
+        "audit_bad_first_touch": agg.audit.n_bad_first_touch,
+        "audit_bad_first_touch_step": agg.audit.n_bad_first_touch_step,
+        "audit_bad_mfe_mae": agg.audit.n_bad_mfe_mae,
     }
 
 def summarize_label_metrics(symbol: str, year: int, key: str, al: AggLabel) -> Dict[str, object]:
