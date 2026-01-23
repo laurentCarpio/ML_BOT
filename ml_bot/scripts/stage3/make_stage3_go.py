@@ -242,6 +242,35 @@ def _rows_to_csv_bytes_str(arr2d: np.ndarray) -> bytes:
     np.savetxt(buf, arr2d, delimiter=",", fmt="%s")
     return buf.getvalue()
 
+def resolve_rr_min(df: pd.DataFrame) -> pd.Series:
+    """
+    Fail-safe RR_MIN resolver:
+      1) If audit_rr_min exists AND has at least one finite non-null value -> use it.
+      2) Else, use rr_min_<tf> (row-wise) where tf is the row's tf.
+      3) If neither works -> return NaNs (caller may raise).
+    This guarantees we never use an all-NaN audit_rr_min column.
+    """
+    # 1) Prefer audit_rr_min only if it is not empty/useless
+    if "audit_rr_min" in df.columns:
+        s = pd.to_numeric(df["audit_rr_min"], errors="coerce")
+        if np.isfinite(s.to_numpy()).any():
+            return s.astype("float32")
+
+    # 2) Rebuild from rr_min_<tf>
+    if "tf" not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype="float32")
+
+    tf = df["tf"].astype(str).str.lower().str.strip()
+    out = pd.Series(np.nan, index=df.index, dtype="float32")
+
+    # vectorisé par groupe de tf
+    for tfv, idx in tf.groupby(tf).groups.items():
+        col = f"rr_min_{tfv}"
+        if col in df.columns:
+            out.loc[idx] = pd.to_numeric(df.loc[idx, col], errors="coerce").astype("float32")
+
+    return out
+
 # =======================
 # Transforms + Robust norm
 # =======================
@@ -546,6 +575,11 @@ AUDIT_CORE_COLS = [
     "audit_timeout",
     "audit_market_toxic",
     "audit_p_thr_ev0",
+    "audit_rr_min",  
+    "audit_R_bps",
+    "audit_cost_bps",
+    "audit_cost_R",
+    "audit_exit_reason_code",
 ]
 
 AUDIT_EXTRA_COLS = [
@@ -569,7 +603,18 @@ AUDIT_EXTRA_COLS = [
     "audit_hit_m3R_L", "audit_hit_m3R_S",
 ]
 
-AUDIT_ALL_COLS = AUDIT_CORE_COLS + AUDIT_EXTRA_COLS
+AUDIT_HIT_STEP_COLS = [
+    "audit_hit_step_p1R_L", "audit_hit_step_p1R_S",
+    "audit_hit_step_p2R_L", "audit_hit_step_p2R_S",
+    "audit_hit_step_p3R_L", "audit_hit_step_p3R_S",
+    "audit_hit_step_p4R_L", "audit_hit_step_p4R_S",
+    "audit_hit_step_p5R_L", "audit_hit_step_p5R_S",
+    "audit_hit_step_m1R_L", "audit_hit_step_m1R_S",
+    "audit_hit_step_m2R_L", "audit_hit_step_m2R_S",
+    "audit_hit_step_m3R_L", "audit_hit_step_m3R_S",
+]
+
+AUDIT_ALL_COLS = AUDIT_CORE_COLS + AUDIT_EXTRA_COLS + AUDIT_HIT_STEP_COLS
 
 def _clip_rate_report(df: pd.DataFrame, feats: List[str]) -> Dict:
     """
@@ -663,12 +708,13 @@ def _iter_x_ids_y_from_split(
 ):
     schema_names = set(dset.schema.names)
 
+    RR_MIN_COLS = ["rr_min_15m","rr_min_30m","rr_min_1h","rr_min_2h","rr_min_4h"]
+
     needed = sorted(set([
         "tf", "y_go", "row_id", "event_id", "task",
         "audit_exit_reason",
-    ] + AUDIT_ALL_COLS) | set(feats) | set(AGGR_BT_COLS))
+    ] + AUDIT_ALL_COLS + RR_MIN_COLS) | set(feats) | set(AGGR_BT_COLS))
     needed = [c for c in needed if c in schema_names]
-
 
     scanner = dset.scanner(columns=needed, filter=base_filt, batch_size=batch_size)
 
@@ -707,6 +753,19 @@ def _iter_x_ids_y_from_split(
             )
         else:
             aer_norm = pd.Series(["NONE"] * len(df), index=df.index)
+        
+        EXIT_REASON_CODE = {
+            "NONE": 0,
+            "NOFILL": 1,
+            "TIME": 2,
+            "TP_LONG": 3,
+            "TP_SHORT": 4,
+            "SL_LONG": 5,
+            "SL_SHORT": 6,
+        }
+
+        aer_code = aer_norm.map(lambda s: EXIT_REASON_CODE.get(str(s), 0)).astype("int16").to_numpy()
+        df["audit_exit_reason_code"] = aer_code
 
         # --- aggr/bt NaN safety net ---
         present = [c for c in AGGR_BT_COLS if c in df.columns]
@@ -743,7 +802,7 @@ def _iter_x_ids_y_from_split(
 
         # --- coverage gate for positives ONLY ---
         # Stage2 validator treats NONE/NOFILL as "none-like"
-        pos_has_exit = (~aer_norm.isin(["NONE", "NOFILL", ""])).to_numpy(dtype=bool)
+        pos_has_exit = (~np.isin(aer_code, [0, 1]))  # exclude NONE=0, NOFILL=1
 
         invalid_pos = (y_raw.to_numpy(dtype=np.int8) == 1) & (~pos_has_exit)
         if stats is not None:
@@ -802,72 +861,143 @@ def _iter_x_ids_y_from_split(
         X = np.hstack([y.to_numpy(dtype="float32").reshape(-1, 1), Xf])
         X = np.nan_to_num(X, copy=False, posinf=0.0, neginf=0.0)
 
-        # ----- AUDIT (aligned) -----
+        # ----- AUDIT (aligned, STRICT contract) -----
         avail_cols = set(df.columns)
 
-        # A/B/C flags (default 0 if missing)
-        A = (pd.to_numeric(df["audit_early_abort"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
-             if "audit_early_abort" in avail_cols else np.zeros(len(df), dtype=np.int8))
+        # core required
+        for c in AUDIT_CORE_COLS:
+            if c not in avail_cols:
+                raise ValueError(f"Stage3 audit: colonne manquante '{c}' (requise).")
 
-        B = (pd.to_numeric(df["audit_timeout"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
-             if "audit_timeout" in avail_cols else np.zeros(len(df), dtype=np.int8))
+        # extra required (NO retro-compat => fail-hard)
+        missing_extra = [c for c in AUDIT_EXTRA_COLS if c not in avail_cols]
+        if missing_extra:
+            raise ValueError(f"Stage3 audit: AUDIT_EXTRA_COLS manquantes (fail-hard): {missing_extra}")
+        
+        missing_steps = [c for c in AUDIT_HIT_STEP_COLS if c not in avail_cols]
+        if missing_steps:
+            raise ValueError(f"Stage3 audit: AUDIT_HIT_STEP_COLS manquantes (fail-hard): {missing_steps}")
 
-        C = (pd.to_numeric(df["audit_market_toxic"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
-             if "audit_market_toxic" in avail_cols else np.zeros(len(df), dtype=np.int8))
+        # flags core (0/1 strict-ish)
+        A = pd.to_numeric(df["audit_early_abort"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
+        B = pd.to_numeric(df["audit_timeout"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
+        C = pd.to_numeric(df["audit_market_toxic"], errors="coerce").fillna(0).astype("int8").clip(0, 1).to_numpy()
 
-        # --- audit_pnl_net_bps: STRICT ---
-        if AUDIT_PNL_COL not in df.columns:
-            raise ValueError(
-                f"Stage3 audit: colonne manquante '{AUDIT_PNL_COL}'. "
-                f"Colonnes dispo (sample): {sorted(list(df.columns))[:50]} ..."
-            )
-
-        pnl_s = pd.to_numeric(df[AUDIT_PNL_COL], errors="coerce")
-        # pnl required iff exit_reason is NOT none-like
+        # pnl strict (as you had)
+        pnl_s = pd.to_numeric(df["audit_pnl_net_bps"], errors="coerce")
         need_pnl = (~aer_norm.isin(["NONE", "NOFILL", ""])).to_numpy()
-
         bad_pnl = pnl_s.isna().to_numpy() & need_pnl
         if bad_pnl.any():
-            bad = df.loc[bad_pnl, ["row_id","event_id","tf","audit_exit_reason",AUDIT_PNL_COL]].head(5)
-            raise ValueError(f"audit_pnl_net_bps NaN détecté alors que exit_reason!=NONE. Exemples:\n{bad}")
-
-        # pour les NONE, on remplit à 0
+            bad = df.loc[bad_pnl, ["row_id","event_id","tf","audit_exit_reason","audit_pnl_net_bps"]].head(5)
+            raise ValueError(f"audit_pnl_net_bps NaN alors que exit_reason!=NONE. Exemples:\n{bad}")
         pnl = pnl_s.fillna(0.0).astype("float32").to_numpy()
 
-
-        # --- audit_p_thr_ev0: STRICT (no imputation) ---
-        if "audit_p_thr_ev0" not in avail_cols:
-            raise ValueError("Stage3 audit: colonne manquante 'audit_p_thr_ev0' (requise).")
-
+        # p_thr strict (as you had)
         pthr_s = pd.to_numeric(df["audit_p_thr_ev0"], errors="coerce")
-
-        # fail fast si NaN/inf
         if pthr_s.isna().any():
-            bad = df.loc[pthr_s.isna(), ["row_id", "event_id", "tf", "audit_p_thr_ev0"]].head(5)
-            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 NaN/NULL détecté. Exemples:\n{bad}")
-
+            bad = df.loc[pthr_s.isna(), ["row_id","event_id","tf","audit_p_thr_ev0"]].head(5)
+            raise ValueError(f"audit_p_thr_ev0 NaN/NULL. Exemples:\n{bad}")
         pthr64 = pthr_s.to_numpy(dtype="float64", copy=False)
         if not np.isfinite(pthr64).all():
             idx = np.where(~np.isfinite(pthr64))[0][:5]
-            bad = df.iloc[idx][["row_id", "event_id", "tf", "audit_p_thr_ev0"]]
-            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 contient inf/NaN. Exemples:\n{bad}")
-
-        # bornes [0,1] (tol optionnelle si tu veux)
+            bad = df.iloc[idx][["row_id","event_id","tf","audit_p_thr_ev0"]]
+            raise ValueError(f"audit_p_thr_ev0 inf/NaN. Exemples:\n{bad}")
         if (pthr64 < 0.0).any() or (pthr64 > 1.0).any():
             idx = np.where((pthr64 < 0.0) | (pthr64 > 1.0))[0][:5]
-            bad = df.iloc[idx][["row_id", "event_id", "tf", "audit_p_thr_ev0"]]
-            raise ValueError(f"Stage3 audit: audit_p_thr_ev0 hors [0,1]. Exemples:\n{bad}")
-
+            bad = df.iloc[idx][["row_id","event_id","tf","audit_p_thr_ev0"]]
+            raise ValueError(f"audit_p_thr_ev0 hors [0,1]. Exemples:\n{bad}")
         pthr = pthr64.astype("float32", copy=False)
 
-        audit2d = np.column_stack([
-            pnl,
-            A.astype("float32"),
-            B.astype("float32"),
-            C.astype("float32"),
-            pthr,
-        ]).astype("float32", copy=False)
+        # Build full audit columns in the declared order
+        # --- NEW: rr_min / R / cost sanity (Stage4 dependency) ---
+        def _req_f32(name: str) -> np.ndarray:
+            s = pd.to_numeric(df[name], errors="coerce")
+            if s.isna().any():
+                bad = df.loc[s.isna(), ["row_id","event_id","tf",name]].head(5)
+                raise ValueError(f"{name} NaN/NULL. Exemples:\n{bad}")
+            v = s.to_numpy(dtype="float64", copy=False)
+            if not np.isfinite(v).all():
+                idx = np.where(~np.isfinite(v))[0][:5]
+                bad = df.iloc[idx][["row_id","event_id","tf",name]]
+                raise ValueError(f"{name} non-finite. Exemples:\n{bad}")
+            return v.astype("float32", copy=False)
+
+        rr_min = resolve_rr_min(df)
+        if not np.isfinite(rr_min.to_numpy()).any():
+            # aucun rr_min valide => fail hard (data incorrect)
+            raise ValueError(
+                "Stage3: rr_min missing. Neither a usable audit_rr_min nor rr_min_<tf> columns found."
+            )
         
+        df["audit_rr_min"] = rr_min.to_numpy(dtype="float32", copy=False)
+        audit_rr_min = df["audit_rr_min"].to_numpy(dtype="float32", copy=False)
+        audit_R_bps    = _req_f32("audit_R_bps")
+        audit_cost_bps = _req_f32("audit_cost_bps")
+        audit_cost_R   = _req_f32("audit_cost_R")
+        
+        # Core mapping:
+        audit_cols_arrays = {
+            "audit_pnl_net_bps": pnl.astype("float32", copy=False),
+            "audit_early_abort": A.astype("float32", copy=False),
+            "audit_timeout": B.astype("float32", copy=False),
+            "audit_market_toxic": C.astype("float32", copy=False),
+            "audit_p_thr_ev0": pthr.astype("float32", copy=False),
+        }
+
+        audit_cols_arrays.update({
+            "audit_rr_min": audit_rr_min,
+            "audit_R_bps": audit_R_bps,
+            "audit_cost_bps": audit_cost_bps,
+            "audit_cost_R": audit_cost_R,
+            "audit_exit_reason_code" : aer_code.astype("float32", copy=False),
+        })
+ 
+        # Extras: allow NaN for opposite-side diagnostics -> sanitize with safe defaults
+        # Policy:
+        #   - Side-specific diagnostics (mfe/mae/first_touch, hit flags, hit steps):
+        #       * NaN is acceptable and is imputed.
+        #   - Any +inf/-inf is NOT acceptable: coerced to NaN, then imputed.
+        #   - IMPORTANT:
+        #       * hit FLAGS (audit_hit_p*kR_*, audit_hit_m*kR_*) are binarized to {0,1}.
+        #       * hit STEP cols (audit_hit_step_*) must KEEP step indices; -1 means "never hit".
+        for c in (AUDIT_EXTRA_COLS + AUDIT_HIT_STEP_COLS):
+            s = pd.to_numeric(df[c], errors="coerce").astype("float64")
+            s = s.where(np.isfinite(s), np.nan)  # inf -> NaN
+
+            is_step = c.startswith("audit_hit_step_") or ("_step_" in c)
+
+            if is_step:
+                # Preserve semantics: -1 means "never touched" (do NOT conflate with step=0)
+                v = s.fillna(-1.0).to_numpy(dtype="float64", copy=False)
+                # steps should be integer-like (still stored float32 in audit shard)
+                v = np.rint(v)
+            else:
+                # Regular diagnostics: NaN -> 0
+                v = s.fillna(0.0).to_numpy(dtype="float64", copy=False)
+
+            # Normalize HIT FLAGS only (do NOT touch hit_step_* cols)
+            is_hit_flag = c.startswith("audit_hit_") and (not c.startswith("audit_hit_step_")) and ("_step_" not in c)
+            if is_hit_flag:
+                v = np.where(v >= 0.5, 1.0, 0.0)
+
+            # After sanitize, must be finite
+            if not np.isfinite(v).all():
+                idx = np.where(~np.isfinite(v))[0][:5]
+                bad = df.iloc[idx][["row_id", "event_id", "tf", c]]
+                raise ValueError(f"Stage3 audit: {c} non-finite after sanitize. Exemples:\n{bad}")
+
+            audit_cols_arrays[c] = v.astype("float32", copy=False)
+
+        # PATCH: Stage4 depends on first_touch_{L,S} being always numeric
+        for k in ["audit_first_touch_L", "audit_first_touch_S"]:
+            vv = np.asarray(audit_cols_arrays[k], dtype=np.float32)
+            if not np.isfinite(vv).all():
+                idx = np.where(~np.isfinite(vv))[0][:5]
+                bad = df.iloc[idx][["row_id", "event_id", "tf", k]]
+                raise ValueError(f"Stage3 audit: {k} non-finite after sanitize. Exemples:\n{bad}")
+
+        audit2d = np.column_stack([audit_cols_arrays[c] for c in AUDIT_ALL_COLS]).astype("float32", copy=False)
+
         # ---- split_stats (audit) ----
         if stats is not None:
             stats["audit_rows"] = stats.get("audit_rows", 0) + int(len(df))
@@ -945,6 +1075,9 @@ def main():
     feats_out = list(feats_norm) + [c for c in feats_raw if c not in feats_norm]
 
     print("Fitting robust scaler params on TRAIN (GO)...")
+    print("[stage3] AUDIT_ALL_COLS n =", len(AUDIT_ALL_COLS))
+    print("[stage3] hit_step cols =", [c for c in AUDIT_ALL_COLS if c.startswith("audit_hit_step_")])
+    
     rob = _fit_robust_params_train(
         dset_train, base_f, feats_norm,
         batch_size=args.batch_size,
@@ -1079,12 +1212,21 @@ def main():
                 "val_ids": "val_ids/part-*.csv",
                 "test_ids": "test_ids/part-*.csv"
             }, 
-            "audit_format": "CSV, no header, columns: audit_pnl_net_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0 (aligned with X shards)",        
-            "audit_paths": {
+            "audit_format": "CSV, no header, columns: " + ",".join(AUDIT_ALL_COLS) + " (aligned with X shards)",
+                "audit_paths": {
                 "train_audit": "train_audit/part-*.csv",
                 "val_audit": "val_audit/part-*.csv",
                 "test_audit": "test_audit/part-*.csv"
             },
+            "audit_exit_reason_code_map": {
+                "0": "NONE",
+                "1": "NOFILL",
+                "2": "TIME",
+                "3": "TP_LONG",
+                "4": "TP_SHORT",
+                "5": "SL_LONG",
+                "6": "SL_SHORT"
+                },
         }, indent=2).encode("utf-8"))
 
     with _open_s3_output(fs, f"{meta_root}/scaler_stats.json") as f:

@@ -28,6 +28,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List
+import json
+import fsspec
 
 import numpy as np
 import pandas as pd
@@ -87,6 +89,47 @@ LOG_NEG_SPREAD_MAX_EX = 5
 DEDUP_BOOK_TS = True
 RECALC_SPREAD_ENTRY = False
 
+_HIT_STEP_RE = re.compile(r"^audit_hit_step_[pm]\d+R_[LS]$")
+_HIT_FLAG_RE = re.compile(r"^audit_hit_[pm]\d+R_[LS]$") 
+
+def _cast_audits_canonical(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    df contient des colonnes audit_* déjà sans suffixe tf.
+    IMPORTANT: on force hit_step en int32 avec -1 par défaut.
+    """
+    for c in list(df.columns):
+        if c in ("audit_exit_reason", "audit_fill_mode"):
+            df[c] = df[c].astype(str)
+            continue
+
+        if _HIT_STEP_RE.match(c):
+            # must be int with -1 when missing
+            s = pd.to_numeric(df[c], errors="coerce")
+            s = s.fillna(-1).astype(np.int32)
+            df[c] = s
+            continue
+
+        if _HIT_FLAG_RE.match(c):
+            s = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.int8)
+            df[c] = s
+            continue
+
+        if c.startswith("audit_first_touch_step_") and c.endswith(("_L", "_S")):
+            s = pd.to_numeric(df[c], errors="coerce").fillna(-1).astype(np.int32)
+            df[c] = s
+            continue
+
+        if c.startswith("audit_first_touch_") and c.endswith(("_L", "_S")):
+            s = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.int8)
+            df[c] = s
+            continue
+
+        # le reste: float (mfe_R/mae_R/p_thr/etc)
+        if c.startswith("audit_"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
+
+    return df
+
 # ------------------------------
 # Column grouping helpers
 # ------------------------------
@@ -99,73 +142,6 @@ META_COLS_FIXED = [
 AUDIT_PREFIXES = ("audit_",)  # Stage1 audits + Stage2 flags
 SUP_PREFIXES = ("sup_",)      # oracle post-entry supervision (NEVER in X)
 
-def normalize_audit_side_prefixes(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rename:
-      auditL_xxx -> audit_xxx_L
-      auditS_xxx -> audit_xxx_S
-    Leaves existing audit_* intact.
-    If a target name already exists, we keep existing and drop the renamed one to avoid collisions.
-    """
-    if df is None or df.empty:
-        return df
-
-    ren = {}
-    for c in df.columns:
-        if c.startswith("auditL_"):
-            base = c[len("auditL_"):]
-            ren[c] = f"audit_{base}_L"
-        elif c.startswith("auditS_"):
-            base = c[len("auditS_"):]
-            ren[c] = f"audit_{base}_S"
-
-    if not ren:
-        return df
-
-    # collision-safe: if target already exists, drop source
-    drop_src = [src for src, tgt in ren.items() if tgt in df.columns]
-    if drop_src:
-        df = df.drop(columns=drop_src, errors="ignore")
-        # remove those from ren so we don't rename them
-        for src in drop_src:
-            ren.pop(src, None)
-
-    if ren:
-        df = df.rename(columns=ren)
-
-    return df
-
-def lift_stage1_auditLS_to_audit_suffix(tmp: pd.DataFrame, sig: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """
-    For the given tf, copy any Stage1 columns:
-      auditL_<metric>_<tf>  -> audit_<metric>_L
-      auditS_<metric>_<tf>  -> audit_<metric>_S
-
-    We STRIP the trailing _<tf> because Stage2 has a 'tf' column already (one row per tf).
-    """
-    tf = str(tf).lower().strip()
-    tf_tag = "_" + tf
-
-    cols = [c for c in sig.columns if (c.startswith("auditL_") or c.startswith("auditS_")) and str(c).endswith(tf_tag)]
-    if not cols:
-        return tmp
-
-    for c in cols:
-        base = c[:-len(tf_tag)]  # remove _<tf>
-        if base.startswith("auditL_"):
-            metric = base[len("auditL_"):]
-            outc = f"audit_{metric}_L"
-        else:
-            metric = base[len("auditS_"):]
-            outc = f"audit_{metric}_S"
-
-        # collision-safe: if already exists, keep existing (do nothing)
-        if outc in tmp.columns:
-            continue
-
-        tmp[outc] = sig[c]
-
-    return tmp 
 
 def reorder_stage2_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -202,9 +178,33 @@ def reorder_stage2_columns(df: pd.DataFrame) -> pd.DataFrame:
 def log(msg: str):
     print(f"{pd.Timestamp.utcnow().isoformat()}Z | {msg}", flush=True)
 
+def assert_has_cols(df: pd.DataFrame, cols: list[str], *, name: str):
+    miss = [c for c in cols if c not in df.columns]
+    if miss:
+        raise ValueError(f"{name} missing columns: {miss[:20]} (total {len(miss)})")
+
+def assert_schema_has(dataset: ds.Dataset, cols: list[str], *, name: str):
+    names = set(dataset.schema.names)
+    miss = [c for c in cols if c not in names]
+    if miss:
+        raise ValueError(f"{name} parquet schema missing: {miss[:20]} (total {len(miss)})")
+    
 # ------------------------------
 # S3 / Arrow helpers
 # ------------------------------
+def read_json_s3(path: str, storage_options: dict) -> dict:
+    with fsspec.open(path, "rb", **(storage_options or {})) as f:
+        return json.load(f)
+
+def tfs_from_stage1_columns(stage1_cols: dict) -> list[str]:
+    # tf_cols contient "horizon_sec_<tf>" etc.
+    tfs = set()
+    for c in stage1_cols.get("tf_cols", []):
+        c = str(c)
+        if c.startswith("horizon_sec_"):
+            tfs.add(c[len("horizon_sec_"):])
+    return sorted(tfs, key=TF_SORT_KEY)
+
 def so(region: str, anon: bool) -> dict:
     out = {"client_kwargs": {"region_name": region}}
     if anon:
@@ -525,6 +525,17 @@ def attach_candle_features(merged_ev: pd.DataFrame, candles_1m: pd.DataFrame) ->
 
     return pd.concat(parts, ignore_index=True)
 
+def _check_schema(df: pd.DataFrame, schema_cols, name: str):
+    cols = list(df.columns)
+    if schema_cols is None:
+        return cols  # first time becomes reference
+    if cols != schema_cols:
+        # diff readable
+        s = set(schema_cols); c = set(cols)
+        added = sorted(list(c - s))[:30]
+        removed = sorted(list(s - c))[:30]
+        raise ValueError(f"{name} schema drift: added={added} removed={removed}")
+    return schema_cols
 # ------------------------------
 # Prepared caches
 # ------------------------------
@@ -968,33 +979,16 @@ class PartsSink:
 # ------------------------------
 # Signals -> base events (NO side duplication)
 # ------------------------------
-def parse_tfs_from_signals_columns(cols: List[str]) -> List[str]:
-    tfs = set()
-    for c in cols:
-        c = str(c)
-        if c.startswith("y_go_"):
-            tfs.add(c[len("y_go_"):])
-        elif c.startswith("y_dir_"):
-            tfs.add(c[len("y_dir_"):])
-        elif c.startswith("y_"):
-            tail = c[2:]
-            if not (tail.startswith("go_") or tail.startswith("dir_")):
-                tfs.add(tail)
-    return sorted(list(tfs), key=TF_SORT_KEY)
 
 def _col_or_default(df: pd.DataFrame, col: str, default, n: int) -> pd.Series:
     if col in df.columns:
         return df[col]
     return pd.Series([default] * n, index=df.index)
 
-def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
-    """
-    1 ligne par (row_id, t, tf) avec y_go/y_dir/audits/entries.
-    NOTE (Point 1-2): PAS de event_id ici.
-    event_id sera construit plus tard: row_id|task|tf
-    """
-    base_req = ["row_id", "t", "symbol", "year", "bid_entry", "ask_entry", "spread_bps_entry", "atr_bps"]
-    for c in base_req:
+def make_events_base_v2(sig: pd.DataFrame, tfs: list[str], stage1_cols: dict) -> pd.DataFrame:
+    # requis stage1
+    need = ["row_id", "t", "symbol", "year", "bid_entry", "ask_entry", "spread_bps_entry", "atr_bps"]
+    for c in need:
         if c not in sig.columns:
             raise ValueError(f"Signals missing required column: {c}")
 
@@ -1004,51 +998,78 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
     if sig.empty:
         return pd.DataFrame()
 
+    audit_cols_all = stage1_cols.get("audit_cols", [])
+    tf_cols_all    = stage1_cols.get("tf_cols", [])
+    base_cols_all  = stage1_cols.get("base_cols", [])
+
     rows = []
     for tf in tfs:
-        cols_keep = ["row_id","t","symbol","year","bid_entry","ask_entry","spread_bps_entry","atr_bps"]
-        if "mid_entry" in sig.columns:
-            cols_keep.append("mid_entry")
+        tf = str(tf).lower().strip()
+        suf = "_" + tf
+
+        # base + entries
+        cols_keep = [c for c in base_cols_all if c in sig.columns]
+        # safety: assure t/row_id/symbol/year
+        for c in ["row_id","t","symbol","year"]:
+            if c not in cols_keep and c in sig.columns:
+                cols_keep.append(c)
+
         tmp = sig[cols_keep].copy()
+        # Keep rr_min_{tf} as config parameter in stage2
+        rrc = f"rr_min{suf}"
+        if rrc in sig.columns:
+            tmp[rrc] = pd.to_numeric(sig[rrc], errors="coerce").astype(np.float32)
+
+        tmp["tf"] = tf
+
+        # labels
+        ydir = f"y_dir_{tf}"
+        yleg = f"y_{tf}"
+        ygo  = f"y_go_{tf}"
+        if ydir in sig.columns:
+            tmp["y_dir"] = pd.to_numeric(sig[ydir], errors="coerce").fillna(0).astype(np.int8)
+        elif yleg in sig.columns:
+            tmp["y_dir"] = pd.to_numeric(sig[yleg], errors="coerce").fillna(0).astype(np.int8)
+        else:
+            tmp["y_dir"] = np.int8(0)
+
+        if ygo in sig.columns:
+            tmp["y_go"] = pd.to_numeric(sig[ygo], errors="coerce").fillna(0).astype(np.int8)
+        else:
+            tmp["y_go"] = (tmp["y_dir"] != 0).astype(np.int8)
+
+        # lift tf_cols -> audit_* canonical (tu peux en garder moins si tu veux)
+        # mapping simple “tf suffix -> audit_”
+        map_tf_to_audit = {
+            f"p_thr_ev0{suf}": "audit_p_thr_ev0",
+            f"pnl_net_bps{suf}": "audit_pnl_net_bps",
+            f"exit_reason{suf}": "audit_exit_reason",
+            f"tp_bps{suf}": "audit_tp_bps",
+            f"sl_bps{suf}": "audit_sl_bps",
+            f"risk_r_bps{suf}": "audit_risk_r_bps",
+            f"fill_mode{suf}": "audit_fill_mode",
+        }
+        for src, dst in map_tf_to_audit.items():
+            if src in sig.columns and dst not in tmp.columns:
+                tmp[dst] = sig[src]
+
+        # lift ALL audit cols for this tf: audit_*_{tf} -> audit_*
+        for c in audit_cols_all:
+            c = str(c)
+            if c.endswith(suf) and c in sig.columns:
+                tmp[c[:-len(suf)]] = sig[c]  # strip suffix
+
+        # Guardrail: make sure we did not accidentally create audit_rr_min
+        if "audit_rr_min" in tmp.columns:
+            tmp.drop(columns=["audit_rr_min"], inplace=True)
+
+        # ensure mid_entry if missing
         if "mid_entry" not in tmp.columns:
             tmp["mid_entry"] = (pd.to_numeric(tmp["bid_entry"], errors="coerce") +
                                 pd.to_numeric(tmp["ask_entry"], errors="coerce")) / 2.0
 
-        tmp["tf"] = str(tf).lower().strip()
-
-        ydir_col = f"y_dir_{tf}"
-        yleg_col = f"y_{tf}"
-        if ydir_col in sig.columns:
-            tmp["y_dir"] = pd.to_numeric(sig[ydir_col], errors="coerce").fillna(0).astype("int8")
-        elif yleg_col in sig.columns:
-            tmp["y_dir"] = pd.to_numeric(sig[yleg_col], errors="coerce").fillna(0).astype("int8")
-        else:
-            tmp["y_dir"] = np.int8(0)
-
-        ygo_col = f"y_go_{tf}"
-        if ygo_col in sig.columns:
-            tmp["y_go"] = pd.to_numeric(sig[ygo_col], errors="coerce").fillna(0).astype("int8")
-        else:
-            tmp["y_go"] = (tmp["y_dir"] != 0).astype("int8")
-        
-        opt_fields = [
-            "pnl_net_bps","exit_reason","tp_bps","sl_bps",
-            "rr_min","risk_r_bps","p_thr_ev0",
-            "fill_mode","fill_window_sec"
-        ]
-
-        for opt in opt_fields:
-            copt = f"{opt}_{tf}"
-            outc = f"audit_{opt}"
-            if copt in sig.columns:
-                tmp[outc] = sig[copt]
-            elif opt in sig.columns:
-                # fallback non-suffixé (ex: fill_window_sec)
-                tmp[outc] = sig[opt]
-
-        # ✅ NEW: lift Stage1 auditL_/auditS_ for this tf into audit_*_L / audit_*_S
-        tmp = lift_stage1_auditLS_to_audit_suffix(tmp, sig, tf) 
-        
+        # cast audits safely (CRITICAL for hit_step)
+        tmp = _cast_audits_canonical(tmp)
         rows.append(tmp)
 
     ev = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -1060,7 +1081,6 @@ def make_events_base(sig: pd.DataFrame, tfs: List[str]) -> pd.DataFrame:
     ev["ym"] = ev["t"].dt.strftime("%Y-%m")
     ev = ev.sort_values(["t","tf"]).reset_index(drop=True)
     return ev
-
 # ------------------------------
 # Core processing
 # ------------------------------
@@ -1073,42 +1093,70 @@ def month_dir_from_root_tpl(root_tpl: str, symbol: str, year: int) -> str:
     p = root_tpl.replace("<SYMBOL>", symbol).replace("<YEAR>", str(year)).rstrip("/")
     return p.rsplit("/", 1)[0]
 
-def build_audit_flags_from_sup(merged: pd.DataFrame, sup_df: pd.DataFrame, *, debug_cols: bool = False) -> pd.DataFrame:
-
+def build_audit_flags_from_sup(
+    merged: pd.DataFrame,
+    sup_df: pd.DataFrame,
+    *,
+    noise_override: np.ndarray | pd.Series | None = None,
+    debug_cols: bool = False,
+) -> pd.DataFrame:
     """
     Construit A/B/C à partir de sup_* + colonnes context (atr_bps, spread_bps_entry, ret_stdev_1s_10s_bps).
     Retourne un DF avec audit_early_abort, audit_timeout, audit_market_toxic (+ debug cols).
+
+    - noise_override: permet de fournir directement la série/array de noise (ret_stdev_1s_10s_bps)
+      sans écrire dans `merged` (évite la fragmentation / copies).
     """
     out = pd.DataFrame(index=sup_df.index)
+
+    # --- TF config (vectorisé) ---
     tf = merged["tf"].astype(str).str.lower().str.strip()
     cfg_list = tf.map(_cfg_for_tf).tolist()
-    W = np.array([d["W"] for d in cfg_list], dtype="float64")
-    L = np.array([d["L"] for d in cfg_list], dtype="float64")
-    C = np.array([d["C"] for d in cfg_list], dtype="float64")
-    wA = np.array([d["wA"] for d in cfg_list], dtype="float64")
-    lA = np.array([d["lA"] for d in cfg_list], dtype="float64")
-    chopB = np.array([d["chopB"] for d in cfg_list], dtype="float64")
-    k30 = np.array([d["k_eps30"] for d in cfg_list], dtype="float64")
-    k120 = np.array([d["k_eps120"] for d in cfg_list], dtype="float64")
 
-    # base arrays
+    W     = np.array([d["W"]       for d in cfg_list], dtype="float64")
+    L     = np.array([d["L"]       for d in cfg_list], dtype="float64")
+    C     = np.array([d["C"]       for d in cfg_list], dtype="float64")
+    wA    = np.array([d["wA"]      for d in cfg_list], dtype="float64")
+    lA    = np.array([d["lA"]      for d in cfg_list], dtype="float64")
+    chopB = np.array([d["chopB"]   for d in cfg_list], dtype="float64")
+    k30   = np.array([d["k_eps30"] for d in cfg_list], dtype="float64")
+    k120  = np.array([d["k_eps120"]for d in cfg_list], dtype="float64")
+
+    # --- helpers ---
+    def _to_f64(arr_like, n: int, default=np.nan) -> np.ndarray:
+        if arr_like is None:
+            return np.full(n, default, dtype="float64")
+        if isinstance(arr_like, pd.Series):
+            a = pd.to_numeric(arr_like, errors="coerce").to_numpy(dtype="float64", copy=False)
+        else:
+            a = pd.to_numeric(np.asarray(arr_like), errors="coerce").astype("float64", copy=False)
+        if a.shape[0] != n:
+            raise ValueError(f"build_audit_flags_from_sup: len mismatch (got {a.shape[0]}, expected {n})")
+        return a
+
+    n = len(merged)
+
+    # --- base arrays ---
     spread_entry = pd.to_numeric(merged.get("spread_bps_entry"), errors="coerce").astype("float64").to_numpy()
-    atr_bps = pd.to_numeric(merged.get("atr_bps"), errors="coerce").astype("float64").to_numpy()
+    atr_bps      = pd.to_numeric(merged.get("atr_bps"), errors="coerce").astype("float64").to_numpy()
 
     widen_5s = pd.to_numeric(sup_df.get("sup_spread_widen_bps_5s"), errors="coerce").astype("float64").to_numpy()
     liq_drop = pd.to_numeric(sup_df.get("sup_liq_drop_ratio_5s"), errors="coerce").astype("float64").to_numpy()
-    chop = pd.to_numeric(sup_df.get("sup_chop_score_120s"), errors="coerce").astype("float64").to_numpy()
+    chop     = pd.to_numeric(sup_df.get("sup_chop_score_120s"), errors="coerce").astype("float64").to_numpy()
 
-    ret5 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_5s"), errors="coerce").astype("float64").to_numpy()
-    ret30 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_30s"), errors="coerce").astype("float64").to_numpy()
+    ret5   = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_5s"), errors="coerce").astype("float64").to_numpy()
+    ret30  = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_30s"), errors="coerce").astype("float64").to_numpy()
     ret120 = pd.to_numeric(sup_df.get("sup_ret_bps_fwd_120s"), errors="coerce").astype("float64").to_numpy()
 
-    if "ret_stdev_1s_10s_bps" in merged.columns:
+    # --- noise (prefer override to avoid writing into merged) ---
+    if noise_override is not None:
+        noise = _to_f64(noise_override, n, default=0.0)
+    elif "ret_stdev_1s_10s_bps" in merged.columns:
         noise = pd.to_numeric(merged["ret_stdev_1s_10s_bps"], errors="coerce").astype("float64").to_numpy()
     else:
-        # fallback safe: treat missing noise as 0 (eps floors will handle min=2.0)
-        noise = np.zeros(len(merged), dtype="float64")
+        noise = np.zeros(n, dtype="float64")
 
+    # NaN/inf -> 0 (safe), eps floors will handle min=2.0
     noise = np.where(np.isfinite(noise), noise, 0.0)
 
     # ---- C: market toxic ----
@@ -1123,11 +1171,10 @@ def build_audit_flags_from_sup(merged: pd.DataFrame, sup_df: pd.DataFrame, *, de
     early_abort = (
         (np.isfinite(ret5) & (ret5 <= -X)) |
         ((np.isfinite(widen_5s) & (widen_5s >= wA)) & (np.isfinite(liq_drop) & (liq_drop <= lA)))
-
     )
 
     # ---- B: timeout ----
-    eps30 = np.maximum(2.0, k30 * noise)
+    eps30  = np.maximum(2.0, k30  * noise)
     eps120 = np.maximum(2.0, k120 * noise)
 
     timeout = (
@@ -1139,17 +1186,16 @@ def build_audit_flags_from_sup(merged: pd.DataFrame, sup_df: pd.DataFrame, *, de
     )
 
     out["audit_market_toxic"] = toxic.astype("int8")
-    out["audit_early_abort"] = early_abort.astype("int8")
-    out["audit_timeout"] = timeout.astype("int8")
+    out["audit_early_abort"]  = early_abort.astype("int8")
+    out["audit_timeout"]      = timeout.astype("int8")
 
-    # debug / transparence (optionnel pour éviter de bloat Stage2)
     if debug_cols:
         out["audit_widen_norm_5s"] = widen_norm.astype("float64")
-        out["audit_eps30"] = eps30.astype("float64")
-        out["audit_eps120"] = eps120.astype("float64")
-        out["audit_X_abort"] = X.astype("float64")
-    return out
+        out["audit_eps30"]         = eps30.astype("float64")
+        out["audit_eps120"]        = eps120.astype("float64")
+        out["audit_X_abort"]       = X.astype("float64")
 
+    return out
 def process_symbol_year(
     symbol: str,
     year: int,
@@ -1166,27 +1212,36 @@ def process_symbol_year(
 ) -> int:
     t_global0 = time.time()
 
+    go_schema_cols = None
+    dir_schema_cols = None
+    
     sig_path = f"{signals_root.rstrip('/')}/{symbol}/{year}_signals.csv"
     log(f"[{symbol} {year}] read signals: {sig_path}")
+
     sig = read_csv_s3(sig_path, storage_options)
     if sig is None or sig.empty:
         log(f"[{symbol} {year}] signals empty -> skip")
         return 0
+    assert_has_cols(sig, ["row_id","t","bid_entry","ask_entry","spread_bps_entry","atr_bps"], name="stage1 signals csv")
 
     if "symbol" not in sig.columns:
         sig["symbol"] = symbol
     if "year" not in sig.columns:
         sig["year"] = year
 
-    found_tfs = parse_tfs_from_signals_columns(list(sig.columns))
+    cols_json_path = f"{signals_root.rstrip('/')}/stage1_columns.json"
+    log(f"[{symbol} {year}] read stage1_columns.json: {cols_json_path}")
+    stage1_cols = read_json_s3(cols_json_path, storage_options)
+
+    found_tfs = tfs_from_stage1_columns(stage1_cols)
     if tfs_keep:
         keep = set([x.lower().strip() for x in tfs_keep])
         found_tfs = [x for x in found_tfs if x in keep]
     if not found_tfs:
-        log(f"[{symbol} {year}] no TF found after filter -> skip")
+        log(f"[{symbol} {year}] no TF after filter -> skip")
         return 0
 
-    ev = make_events_base(sig=sig, tfs=found_tfs)
+    ev = make_events_base_v2(sig=sig, tfs=found_tfs, stage1_cols=stage1_cols)
     if ev is None or ev.empty:
         log(f"[{symbol} {year}] events empty -> skip")
         return 0
@@ -1232,6 +1287,11 @@ def process_symbol_year(
         try:
             book_dset = dataset_from_month_parquet(book_path, pafs)
             trades_dset = dataset_from_month_parquet(trades_path, pafs)
+            # book needs at least level0
+            assert_schema_has(book_dset, ["timestamp","bid_0_price","ask_0_price","bid_0_size","ask_0_size"], name=f"book {ym}")
+            # trades needs at least timestamp/qty and aggr flag if you rely on it
+            assert_schema_has(trades_dset, ["timestamp","qty"], name=f"trades {ym}")
+
         except Exception as e:
             if debug:
                 log(f"[{symbol} {year} {ym}] skip month: {e}")
@@ -1338,23 +1398,64 @@ def process_symbol_year(
                 allow_exact_matches=True,
             )
 
+            # --- sanity merge ---
+            nan_rate = merged["book_ts"].isna().mean()
+            if nan_rate > 0.05:
+                log(f"[WARN] {symbol} {year} {ym} bucket={bucket} merge_asof book_ts NaN rate={nan_rate:.2%}")
+
+            # drop rows with no book match (typically month boundary)
+            merged = merged.dropna(subset=["book_ts"]).copy()
+            merged = merged.copy()
+            if merged.empty:
+                t_feat += (time.time() - t_f0)
+                continue
+
+            # now safe to compute dt
+            t_ns = pd.to_datetime(merged["t"], utc=True, errors="coerce").astype("int64").to_numpy()
+            b_ns = pd.to_datetime(merged["book_ts"], utc=True, errors="coerce").astype("int64").to_numpy()
+            dt_ns = t_ns - b_ns
+
+            # dt négatif = très mauvais (asof inversé / data corrupt)
+            neg_dt = np.isfinite(dt_ns) & (dt_ns < 0)
+            if neg_dt.any():
+                ex = merged.loc[neg_dt, ["t","book_ts","tf"]].head(5)
+                raise ValueError(f"NEGATIVE dt_ns detected (asof bug / unsorted input). Examples:\n{ex}")
+
             # staleness per tf
             tf = merged["tf"].astype(str).str.lower().str.strip()
+
             max_stale_ns = tf.map(lambda x: int(MAX_STALE_BY_TF.get(x, pd.Timedelta(seconds=5)).to_timedelta64())).to_numpy()
 
             t_ns = pd.to_datetime(merged["t"], utc=True, errors="coerce").astype("int64").to_numpy()
             b_ns = pd.to_datetime(merged["book_ts"], utc=True, errors="coerce").astype("int64").to_numpy()
-            dt_ns = t_ns - b_ns
+            
             ok_stale = dt_ns <= max_stale_ns
 
             bid0 = pd.to_numeric(merged.get("bid_0_price"), errors="coerce").astype(float)
             ask0 = pd.to_numeric(merged.get("ask_0_price"), errors="coerce").astype(float)
             ok_px = np.isfinite(bid0) & np.isfinite(ask0) & (bid0 > 0) & (ask0 > 0) & (ask0 >= bid0)
 
+            # --- sanity merge ---
+            if merged["book_ts"].isna().mean() > 0.05:
+                log(f"[WARN] {symbol} {year} {ym} bucket={bucket} merge_asof book_ts NaN rate={merged['book_ts'].isna().mean():.2%}")
+
+            t_ns = pd.to_datetime(merged["t"], utc=True, errors="coerce").astype("int64")
+            b_ns = pd.to_datetime(merged["book_ts"], utc=True, errors="coerce").astype("int64")
+            dt_ns = (t_ns - b_ns).to_numpy()
+
+            # staleness check : si tu drop > 95% des lignes, tu veux le savoir vite
+            pre_n = len(merged)
+            
             merged = merged[ok_stale & ok_px].copy()
+            post_n = len(merged)
+            if pre_n > 0 and post_n / pre_n < 0.05:
+                log(f"[WARN] {symbol} {year} {ym} bucket={bucket} kept={post_n}/{pre_n} ({post_n/pre_n:.2%}) after stale+px filters")
+
             if merged.empty:
                 t_feat += (time.time() - t_f0)
                 continue
+
+            merged = _cast_audits_canonical(merged)
 
             # ==========================
             # NEW oracle-safe "anti-audit" proxies (pure backward)
@@ -1470,7 +1571,6 @@ def process_symbol_year(
             bf["quote_churn_10s"] = _asof_values(book_prep.churn10, merged["t"])
             bf["ret_stdev_1s_10s_bps"] = _asof_values(book_prep.retstd10_bps, merged["t"])
             # Needed by build_audit_flags_from_sup (it reads from merged)
-            merged["ret_stdev_1s_10s_bps"] = bf["ret_stdev_1s_10s_bps"].values
 
             agr3  = _asof_values(trades_prep.aggr3,  merged["t"])
             agr5  = _asof_values(trades_prep.aggr5,  merged["t"])
@@ -1572,13 +1672,20 @@ def process_symbol_year(
                 "audit_exit_reason": _col_or_default(merged, "audit_exit_reason", "NONE", n),
                 "audit_tp_bps": pd.to_numeric(_col_or_default(merged, "audit_tp_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_sl_bps": pd.to_numeric(_col_or_default(merged, "audit_sl_bps", np.nan, n), errors="coerce").astype(float).values,
-                "audit_rr_min": pd.to_numeric(_col_or_default(merged, "audit_rr_min", np.nan, n), errors="coerce").astype(float).values,
                 "audit_risk_r_bps": pd.to_numeric(_col_or_default(merged, "audit_risk_r_bps", np.nan, n), errors="coerce").astype(float).values,
                 "audit_fill_mode": _col_or_default(merged, "audit_fill_mode", "NA", n).astype(str).values,
-                "audit_fill_window_sec": pd.to_numeric(_col_or_default(merged, "audit_fill_window_sec", np.nan, n), errors="coerce").astype(float).values,
                 "audit_p_thr_ev0": pd.to_numeric(_col_or_default(merged, "audit_p_thr_ev0", np.nan, n), errors="coerce").astype(float).values,
             })
 
+            # ---- KEEP rr_min_<tf> config columns for Stage3 (NON-audit; do not map to audit_rr_min) ----
+            # Ensure schema stability: always emit rr_min_<tf> for every TF in found_tfs
+            for tfv in found_tfs:
+                col = f"rr_min_{str(tfv).lower().strip()}"
+                base_out[col] = pd.to_numeric(
+                    _col_or_default(merged, col, np.nan, n),
+                    errors="coerce"
+                ).astype(np.float32).values
+                
             # ---- NEW: keep Stage1 audit_*_L/_S (lifted) into base_out ----
             lifted = [c for c in merged.columns if c.startswith("audit_") and c not in base_out.columns]
             if lifted:
@@ -1592,17 +1699,27 @@ def process_symbol_year(
                 horizons_sec=SUP_HORIZONS_SEC,
             )
             
-            audit_flags = build_audit_flags_from_sup(merged=merged, sup_df=sup_df, debug_cols=debug)
-
+            audit_flags = build_audit_flags_from_sup(
+                merged=merged,
+                sup_df=sup_df,
+                noise_override=bf["ret_stdev_1s_10s_bps"].values,
+                debug_cols=debug
+            )
+            
             out_all = pd.concat([
                 base_out.reset_index(drop=True),
                 bf.reset_index(drop=True),
                 sup_df.reset_index(drop=True),          # ✅ NEW: keep sup_* columns
                 audit_flags.reset_index(drop=True)
             ], axis=1)
+            out_all = _cast_audits_canonical(out_all)
 
-            # ✅ Normalize auditL_/auditS_ -> audit_*_L/_S
-            out_all = normalize_audit_side_prefixes(out_all)
+            # Guardrail: Stage2 must not output audit_rr_min anymore (was a legacy duplicate)
+            if "audit_rr_min" in out_all.columns:
+                out_all.drop(columns=["audit_rr_min"], inplace=True)
+            # Fail-safe: never keep deprecated audit_fill_window_sec
+            if "audit_fill_window_sec" in out_all.columns:
+                out_all.drop(columns=["audit_fill_window_sec"], inplace=True)
 
             # Point (6): DIR drop neutral — keep only y_dir ∈ {-1,+1}
             out_go = out_all.copy()
@@ -1642,6 +1759,11 @@ def process_symbol_year(
             if debug:
                 log(f"[{symbol} {year} {ym}] out_go rows={len(out_go):,} out_dir rows={len(out_dir):,} dir_rate={(len(out_dir)/max(1,len(out_go))):.2%}")
 
+            if not out_go.empty:
+                go_schema_cols = _check_schema(out_go, go_schema_cols, f"GO {symbol}/{year}")
+            if not out_dir.empty:
+                dir_schema_cols = _check_schema(out_dir, dir_schema_cols, f"DIR {symbol}/{year}")
+                
             if not out_go.empty:
                 df_go_parts.append(out_go)
                 go_rows_acc += len(out_go)

@@ -3,11 +3,11 @@ import json
 import time
 import tarfile
 import tempfile
-import io
+import io, re
 import sys
 import traceback
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -36,9 +36,6 @@ TST_DIR = f"{DATA_ROOT}/test"
 TRW_DIR = f"{DATA_ROOT}/train_weight"
 VAW_DIR = f"{DATA_ROOT}/val_weight"
 
-VAA_DIR = f"{DATA_ROOT}/val_audit"
-TSA_DIR = f"{DATA_ROOT}/test_audit"
-
 META_DIR = f"{DATA_ROOT}/_meta"
 
 INSTANCE_TYPE   = "ml.c5.xlarge"
@@ -46,32 +43,143 @@ SPOT            = True
 MAX_RUN_SEC     = 60 * 20
 MAX_WAIT_SEC    = 60 * 40
 
-# === Stage4: sweep budgets (VAL-only decision) ===
+_AUDIT_COLS_RE = re.compile(r"columns\s*:\s*([^()]+)", re.IGNORECASE)
+
+# =========================
+# Stage4 selection policy:
+#   - VAL-only selection of:
+#       * decision threshold thr
+#       * (tp_R, sl_R, side) combo using new audit_* fields
+#   - hard gates always:
+#       allowed = (p>=thr) & (p>=audit_p_thr_ev0) & (flags==0)
+#   - objective for selection:
+#       maximize EV_R = sum(simulated_R[allowed])
+#
+# Notes:
+#   We assume Stage3 now writes audit_first_touch_{L,S} such that:
+#     >0 means first touch was profit barrier with magnitude in R (ex: 1..5)
+#     <0 means first touch was stop barrier with magnitude in R (ex: -1..-3)
+#      0 means no barrier touched before exit.
+#   If your encoding differs, adjust _tp_sl_value_from_first_touch().
+# =========================
 
 HP_BASE: Dict[str, Any] = dict(
     tree_method="hist",
     eta=0.05,
     subsample=0.8,
     colsample_bytree=0.8,
-    num_round=600,              # un peu plus long pour compenser le modèle plus régularisé
-    early_stopping_rounds=80,   # laisse respirer avant de stopper
+    num_round=600,
+    early_stopping_rounds=80,
     objective="binary:logistic",
     eval_metric="logloss",
-
-    # regularisation + anti-suractivation
-    reg_lambda=15.0,            # ↑ shrink les splits
-    reg_alpha=1.0,              # ↑ pousse à des splits plus “utiles”
-    gamma=2.0,                  # ↑ seuil minimum de gain => moins de micro-splits
-
-    # structure plus simple (évite le plateau)
-    max_depth=3,                # ↓ moins profond                    .....essayer 2  plus tard ?
-    min_child_weight=30,        # ↑ empêche les feuilles “fragiles”  .....essayer 50 plus tard ?
+    reg_lambda=15.0,
+    reg_alpha=1.0,
+    gamma=2.0,
+    max_depth=3,
+    min_child_weight=30,
     max_delta_step=1,
 )
 
+# SageMaker built-in XGBoost container
 XGB_IMAGE = image_uri_retrieve("xgboost", REGION, version="1.7-1")
 
+# ========= AUDIT expected fields =========
+# Core used for gating + baseline EV
+AUDIT_REQUIRED_CORE = [
+    "audit_pnl_net_bps",
+    "audit_early_abort",
+    "audit_timeout",
+    "audit_market_toxic",
+    "audit_p_thr_ev0",
+]
+
+AUDIT_REQUIRED_STAGE4 = [
+    "audit_cost_R",
+    "audit_cost_bps",
+    "audit_R_bps",
+    "audit_rr_min",
+    "audit_exit_reason_code",
+]
+
+# Extra diagnostics (optional, but if present we summarize them)
+AUDIT_DIAG_OPTIONAL = [
+    "audit_mfe_R_L", "audit_mae_R_L",
+    "audit_mfe_R_S", "audit_mae_R_S",
+    "audit_first_touch_step_L",
+    "audit_first_touch_step_S",
+    "audit_hit_p1R_L", "audit_hit_p1R_S",
+    "audit_hit_p2R_L", "audit_hit_p2R_S",
+    "audit_hit_p3R_L", "audit_hit_p3R_S",
+    "audit_hit_p4R_L", "audit_hit_p4R_S",
+    "audit_hit_p5R_L", "audit_hit_p5R_S",
+    "audit_hit_m1R_L", "audit_hit_m1R_S",
+    "audit_hit_m2R_L", "audit_hit_m2R_S",
+    "audit_hit_m3R_L", "audit_hit_m3R_S",
+]
+
 # ========= HELPERS =========
+
+def _p_thr_ev0_from_costR(cost_R: np.ndarray, tp_r: int, sl_r: int) -> np.ndarray:
+    cost_R = np.asarray(cost_R, dtype=np.float64)
+    denom = float(tp_r + sl_r)
+    thr = (float(sl_r) + cost_R) / max(denom, 1e-12)
+    thr = np.clip(thr, 0.0, 1.0)
+    # NaN/inf -> 1.0 (super conservateur, bloque)
+    thr[~np.isfinite(thr)] = 1.0
+    return thr
+
+def _required_hit_step_cols(tp_max: int, sl_max: int) -> List[str]:
+    cols = []
+    for side in ["L", "S"]:
+        for k in range(1, tp_max + 1):
+            cols.append(f"audit_hit_step_p{k}R_{side}")
+        for k in range(1, sl_max + 1):
+            cols.append(f"audit_hit_step_m{k}R_{side}")
+    return cols
+
+def _read_json_s3(fs: s3fs.S3FileSystem, uri: str) -> dict:
+    with fs.open(uri, "rb") as f:
+        return json.load(f)
+
+def _load_meta_contract(fs: s3fs.S3FileSystem, meta_dir: str) -> Tuple[str, List[str], List[str], Dict[str, str]]:
+    """
+    Fail-hard:
+      - columns.json doit contenir label/features
+      - + audit_format avec "columns: a,b,c"
+      - + audit_paths dict avec train_audit/val_audit/test_audit
+    """
+    cols_path = f"{meta_dir}/columns.json"
+    meta = _read_json_s3(fs, cols_path)
+
+    label = str(meta.get("label", ""))
+    feats = meta.get("features") or meta.get("feature_cols") or []
+    if not label or not isinstance(feats, list) or not feats:
+        raise RuntimeError(f"columns.json invalide: label/features manquants ({cols_path})")
+
+    audit_format = meta.get("audit_format", "")
+    if not isinstance(audit_format, str) or not audit_format.strip():
+        raise RuntimeError(f"columns.json invalide: audit_format manquant ({cols_path})")
+
+    m = _AUDIT_COLS_RE.search(audit_format)
+    if not m:
+        raise RuntimeError(f"audit_format invalide: attendu 'columns: ...' | got={audit_format}")
+
+    audit_cols = [c.strip() for c in m.group(1).split(",") if c.strip()]
+    if not audit_cols:
+        raise RuntimeError(f"audit_format invalide: aucune colonne parsée | got={audit_format}")
+
+    audit_paths = meta.get("audit_paths", None)
+    if not isinstance(audit_paths, dict):
+        raise RuntimeError(f"columns.json invalide: audit_paths manquant ou non-dict ({cols_path})")
+
+    for k in ["train_audit", "val_audit", "test_audit"]:
+        if k not in audit_paths or not isinstance(audit_paths[k], str) or not audit_paths[k].strip():
+            raise RuntimeError(f"columns.json invalide: audit_paths['{k}'] manquant/mauvais")
+        if "part-*.csv" not in audit_paths[k]:
+            raise RuntimeError(f"columns.json invalide: audit_paths['{k}'] doit contenir 'part-*.csv' | got={audit_paths[k]}")
+
+    return label, [str(x) for x in feats], audit_cols, {str(k): str(v) for k, v in audit_paths.items()}
+
 def _check_flags_binary(aud: Dict[str, np.ndarray], keys: List[str], where: str):
     for k in keys:
         if k not in aud:
@@ -79,47 +187,105 @@ def _check_flags_binary(aud: Dict[str, np.ndarray], keys: List[str], where: str)
         v = aud[k].astype(np.int64, copy=False)
         if not np.isin(v, [0, 1]).all():
             raise RuntimeError(f"[{where}] {k} must be 0/1.")
-        
-def _parse_list(s: str, cast=float) -> List:
-    if s is None:
-        return []
-    s = str(s).strip()
-    if not s:
-        return []
-    return [cast(x.strip()) for x in s.split(",") if x.strip() != ""]
+
+def _assert_ev_inputs_finite(aud: Dict[str, np.ndarray], where: str, tp_max: int, sl_max: int):
+    keys = [
+        "audit_p_thr_ev0",
+        "audit_market_toxic",
+        "audit_timeout",
+        "audit_early_abort",
+    ] + _required_hit_step_cols(tp_max=tp_max, sl_max=sl_max)
+
+    for k in keys:
+        v = np.asarray(aud[k], dtype=np.float64)
+        if not np.isfinite(v).all():
+            raise RuntimeError(f"[{where}] {k} has NaN/inf (EV path unsafe)")
+                
+def _assert_hit_flags_monotonic(aud: Dict[str, np.ndarray], side: str, where: str):
+    # ex: hit_p5 => hit_p4 => ... => hit_p1
+    for k in [5, 4, 3, 2]:
+        a = aud.get(f"audit_hit_p{k}R_{side}")
+        b = aud.get(f"audit_hit_p{k-1}R_{side}")
+        if a is not None and b is not None:
+            if np.any((a >= 0.5) & (b < 0.5)):
+                raise RuntimeError(f"[{where}] monotonic violated: hit_p{k}R_{side} implies hit_p{k-1}R_{side}")
+
+    for k in [3, 2]:
+        a = aud.get(f"audit_hit_m{k}R_{side}")
+        b = aud.get(f"audit_hit_m{k-1}R_{side}")
+        if a is not None and b is not None:
+            if np.any((a >= 0.5) & (b < 0.5)):
+                raise RuntimeError(f"[{where}] monotonic violated: hit_m{k}R_{side} implies hit_m{k-1}R_{side}")
+
+def _assert_first_touch_sane(aud: Dict[str, np.ndarray], side: str, where: str):
+    ft = np.asarray(aud[f"audit_first_touch_{side}"], dtype=np.float64)
+    if not np.isfinite(ft).all():
+        raise RuntimeError(f"[{where}] audit_first_touch_{side} has NaN/inf")
+
+    # si tu veux imposer un encodage quasi-integer (recommandé)
+    frac = np.abs(ft - np.round(ft))
+    if np.nanmax(frac) > 1e-6:
+        raise RuntimeError(f"[{where}] audit_first_touch_{side} not integer-like (max frac={np.nanmax(frac)})")
+
+    # check logique signes (optionnel mais utile)
+    # si first_touch >0, ça devrait correspondre à une hit_p1R_* dans l'idéal
+    hp1 = aud.get(f"audit_hit_p1R_{side}")
+    if hp1 is not None:
+        bad = (ft > 0) & (np.asarray(hp1, dtype=np.float64) < 0.5)
+        # tolérance: ne pas fail si tu sais que hit flags ne sont pas fiables
+        if np.any(bad):
+            # mets juste un warning si tu préfères
+            raise RuntimeError(f"[{where}] first_touch_{side}>0 but hit_p1R_{side}=0 on some rows (incoherent audit)")
+
+    hm1 = aud.get(f"audit_hit_m1R_{side}")
+    if hm1 is not None:
+        bad = (ft < 0) & (np.asarray(hm1, dtype=np.float64) < 0.5)
+        if np.any(bad):
+            raise RuntimeError(f"[{where}] first_touch_{side}<0 but hit_m1R_{side}=0 on some rows (incoherent audit)")
+
+def _validate_side_audit_contract(aud: Dict[str, np.ndarray], where: str):
+    # hit flags doivent être 0/1 (EXCLURE hit_step_*)
+    hit_cols = [k for k in aud.keys() if k.startswith("audit_hit_") and not k.startswith("audit_hit_step_")]
+    for k in hit_cols:
+        v = np.asarray(aud[k], dtype=np.float64)
+        if not np.isfinite(v).all():
+            raise RuntimeError(f"[{where}] {k} has NaN/inf")
+        if np.any((v < -1e-6) | (v > 1.0 + 1e-6)):
+            raise RuntimeError(f"[{where}] {k} out of [0,1]")
+
+    # (optionnel) check steps
+    step_cols = [k for k in aud.keys() if k.startswith("audit_hit_step_")]
+    for k in step_cols:
+        v = np.asarray(aud[k], dtype=np.float64)
+        if not np.isfinite(v).all():
+            raise RuntimeError(f"[{where}] {k} has NaN/inf")
+        if np.any(v < -1.0 - 1e-6):
+            raise RuntimeError(f"[{where}] {k} has values < -1 (bad step encoding)")
+        frac = np.abs(v - np.round(v))
+        if np.nanmax(frac) > 1e-6:
+            raise RuntimeError(f"[{where}] {k} not integer-like (max frac={np.nanmax(frac)})")
+
+    # first_touch optional checks (si présents)
+    for side in ["L", "S"]:
+        if f"audit_first_touch_{side}" in aud:
+            _assert_first_touch_sane(aud, side, where)
+            _assert_hit_flags_monotonic(aud, side, where)
 
 def parse_args():
-    ap = argparse.ArgumentParser("Stage4 grid search + VAL-only budgeted threshold sweep (fp_cost_bps, audit_market_toxic).")
+    ap = argparse.ArgumentParser(
+        "Stage4 grid search + VAL-only threshold + TP/SL sweep maximizing EV_R with hard gates."
+    )
     ap.add_argument("--mode", choices=["train", "eval"], default="train",
                     help="train = lance des jobs SageMaker, eval = évalue un model_uri existant (sans retrain).")
     ap.add_argument("--model-uri", default="",
                     help="Requis en mode eval: s3://.../model.tar.gz")
-        
-    ap.add_argument("--audit-cols", default="fp_cost_bps,audit_early_abort,audit_timeout,audit_market_toxic,audit_p_thr_ev0",
-                    help="Colonnes attendues dans *_audit (no header), ordre important."
-    )
-    
-    ap.add_argument("--require-audit", action=argparse.BooleanOptionalAction, default=True,
-                    help="Fail si val_audit n'existe pas.")
     ap.add_argument("--allow-feature-mismatch", action="store_true", default=False)
-
-    # tie-break + safety
     ap.add_argument("--eps", type=float, default=1e-12,
-                    help="Epsilon pour seuils si nécessaire.")
+                    help="Epsilon pour tie-break / seuils.")
+    # TP/SL sweep ranges
+    ap.add_argument("--tp-max", type=int, default=5, help="Max TP in R (inclusive).")
+    ap.add_argument("--sl-max", type=int, default=3, help="Max SL in R (inclusive).")
     return ap.parse_args()
-
-def _read_json_s3(fs: s3fs.S3FileSystem, uri: str) -> dict:
-    with fs.open(uri, "rb") as f:
-        return json.load(f)
-
-def _load_columns_meta(fs: s3fs.S3FileSystem, meta_dir: str):
-    cols_path = f"{meta_dir}/columns.json"
-    meta = _read_json_s3(fs, cols_path)
-    label = str(meta.get("label", "is_tradeable"))
-    feats = meta.get("features") or meta.get("feature_cols") or []
-    if not isinstance(feats, list) or not feats:
-        raise RuntimeError(f"columns.json invalide: features vide ({cols_path})")
-    return label, [str(x) for x in feats]
 
 def _merge_hps(base: dict, overlay: dict):
     h = base.copy()
@@ -223,11 +389,13 @@ def _load_xy_by_columns(fs: s3fs.S3FileSystem, prefix: str, feature_names: List[
     X = df.iloc[:, 1:1+n_feat].astype(np.float32).to_numpy()
     return X, y
 
-def _load_audit_by_cols(fs: s3fs.S3FileSystem, prefix: str, audit_cols: List[str]) -> Dict[str, np.ndarray]:
-    df = _load_csv_dir(fs, prefix)
-    if df.shape[1] != len(audit_cols):
-        raise RuntimeError(f"[{prefix}] audit shape mismatch: got {df.shape[1]} expected {len(audit_cols)} ({audit_cols})")
-    out = {}
+def _load_audit_contract(fs: s3fs.S3FileSystem, audit_prefix: str, audit_cols: List[str]) -> Dict[str, np.ndarray]:
+    df = _load_csv_dir(fs, audit_prefix)
+    if int(df.shape[1]) != int(len(audit_cols)):
+        raise RuntimeError(
+            f"[{audit_prefix}] AUDIT shape mismatch: got {df.shape[1]} cols, expected {len(audit_cols)} cols={audit_cols}"
+        )
+    out: Dict[str, np.ndarray] = {}
     for j, name in enumerate(audit_cols):
         out[name] = df.iloc[:, j].astype(np.float64).to_numpy()
     return out
@@ -238,159 +406,6 @@ def _check_thr01(thr: np.ndarray, where: str, eps: float = 1e-12):
         raise RuntimeError(f"[{where}] audit_p_thr_ev0 contains NaN/inf.")
     if np.any(thr < -eps) or np.any(thr > 1.0 + eps):
         raise RuntimeError(f"[{where}] audit_p_thr_ev0 out of [0,1].")
-
-def _best_threshold_by_ev(
-    y: np.ndarray,
-    p: np.ndarray,
-    fp_cost_bps: np.ndarray,
-    audit_market_toxic: np.ndarray,
-    audit_timeout: np.ndarray,
-    audit_early_abort: np.ndarray,
-    audit_p_thr_ev0: np.ndarray,
-    eps: float = 1e-12,
-) -> Dict[str, Any]:
-    """
-    Choisit un seuil (sur VAL) qui maximise:
-      EV = Σ_{TP} ( (1 - p_thr) * fp_cost_bps )  -  Σ_{FP} ( p_thr * fp_cost_bps )
-           -  Σ(flag penalties)
-
-    Flag penalties (en bps): on réutilise fp_cost_bps comme pénalité unitaire si flag==1.
-      penalty_flags = Σ_{pred_pos & flag}( fp_cost_bps )
-
-    Notes:
-    - audit_p_thr_ev0 est obligatoire et déjà borné [0,1].
-    - On évalue uniquement des seuils aux fins de "score groups" (p identiques).
-    - Tie-break: max EV, puis max TP, puis min FP, puis thr plus haut.
-    """
-    y = np.asarray(y, dtype=np.int64)
-    p = np.asarray(p, dtype=np.float64)
-    cost = np.asarray(fp_cost_bps, dtype=np.float64)
-    mt = np.asarray(audit_market_toxic, dtype=np.int64)
-    to = np.asarray(audit_timeout, dtype=np.int64)
-    ab = np.asarray(audit_early_abort, dtype=np.int64)
-    thr0 = np.asarray(audit_p_thr_ev0, dtype=np.float64)
-
-    n = int(y.shape[0])
-    if n == 0:
-        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "empty", "EV_bps": 0.0, "TP": 0, "FP": 0}
-
-    _check_flags_binary(
-        {"audit_market_toxic": mt, "audit_timeout": to, "audit_early_abort": ab},
-        ["audit_market_toxic", "audit_timeout", "audit_early_abort"],
-        "EV/flags"
-    )
-    if np.any(cost < -eps):
-        raise RuntimeError("[EV] fp_cost_bps has negative values (should be >= 0).")
-    _check_thr01(thr0, "EV/audit_p_thr_ev0", eps=eps)
-
-    # Sort par proba décroissante (stable)
-    order = np.argsort(-p, kind="mergesort")
-    ps = p[order]
-    ys = y[order]
-    cs = cost[order]
-    mt = mt[order]
-    to = to[order]
-    ab = ab[order]
-    th = thr0[order]
-
-    pred_pos_prefix = np.ones(n, dtype=bool)  # pour "prefix" logique
-    tp_mask = (ys == 1)
-    fp_mask = (ys == 0)
-
-    # --- EV components on prefix ---
-    # TP reward: (1 - th) * cs
-    tp_reward = ((1.0 - th) * cs) * tp_mask
-
-    # FP penalty: th * cs
-    fp_penalty = (th * cs) * fp_mask
-
-    # Flags penalties (appliquées sur pred_pos uniquement)
-    flag_pen = cs * (mt == 1) + cs * (to == 1) + cs * (ab == 1)
-
-    tp_reward_cum = np.cumsum(tp_reward)
-    fp_penalty_cum = np.cumsum(fp_penalty)
-    flag_pen_cum = np.cumsum(flag_pen)
-
-    EV_cum = tp_reward_cum - fp_penalty_cum - flag_pen_cum
-
-    TP_cum = np.cumsum(tp_mask)
-    FP_cum = np.cumsum(fp_mask)
-
-    # fins de groupes de proba
-    if n == 1:
-        ends = np.array([0], dtype=np.int64)
-    else:
-        ends = np.r_[np.where(ps[1:] != ps[:-1])[0], n - 1].astype(np.int64)
-
-    best = None
-    for end in ends:
-        ev = float(EV_cum[end])
-        cand = {
-            "end": int(end),
-            "thr": float(ps[end]),
-            "EV_bps": ev,
-            "TP": int(TP_cum[end]),
-            "FP": int(FP_cum[end]),
-            "tp_reward_sum_bps": float(tp_reward_cum[end]),
-            "fp_penalty_sum_bps": float(fp_penalty_cum[end]),
-            "flag_penalty_sum_bps": float(flag_pen_cum[end]),
-        }
-        if best is None:
-            best = cand
-        else:
-            if (
-                cand["EV_bps"] > best["EV_bps"] + eps or
-                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] > best["TP"]) or
-                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] < best["FP"]) or
-                (abs(cand["EV_bps"] - best["EV_bps"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] == best["FP"] and cand["thr"] > best["thr"])
-            ):
-                best = cand
-
-    if best is None:
-        # predict none
-        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "no candidates", "EV_bps": 0.0, "TP": 0, "FP": 0}
-
-    return {
-        "decision_threshold": float(best["thr"]),
-        "chosen_end": int(best["end"]),
-        "EV_bps": float(best["EV_bps"]),
-        "TP": int(best["TP"]),
-        "FP": int(best["FP"]),
-        "tp_reward_sum_bps": float(best["tp_reward_sum_bps"]),
-        "fp_penalty_sum_bps": float(best["fp_penalty_sum_bps"]),
-        "flag_penalty_sum_bps": float(best["flag_penalty_sum_bps"]),
-        "why": "ok",
-    }
-
-def _eval_ev_fields(y, p, thr, fp_cost_bps, audit_market_toxic, audit_timeout, audit_early_abort, audit_p_thr_ev0, eps: float = 1e-12):
-    y = np.asarray(y, dtype=np.int64)
-    p = np.asarray(p, dtype=np.float64)
-    yb = (p >= float(thr)).astype(np.int64)
-    pred_pos = (yb == 1)
-    tp = pred_pos & (y == 1)
-    fp = pred_pos & (y == 0)
-
-    cost = np.asarray(fp_cost_bps, dtype=np.float64)
-    th = np.asarray(audit_p_thr_ev0, dtype=np.float64)
-    _check_thr01(th, "EVAL/audit_p_thr_ev0", eps=eps)
-
-    tp_reward = float(np.sum(((1.0 - th) * cost)[tp])) if np.any(tp) else 0.0
-    fp_penalty = float(np.sum((th * cost)[fp])) if np.any(fp) else 0.0
-
-    mt = np.asarray(audit_market_toxic, dtype=np.int64)
-    to = np.asarray(audit_timeout, dtype=np.int64)
-    ab = np.asarray(audit_early_abort, dtype=np.int64)
-
-    flag_pen = float(np.sum(cost[pred_pos & (mt == 1)])) + float(np.sum(cost[pred_pos & (to == 1)])) + float(np.sum(cost[pred_pos & (ab == 1)]))
-
-    ev = tp_reward - fp_penalty - flag_pen
-
-    return {
-        "EV_bps": float(ev),
-        "tp_reward_sum_bps": float(tp_reward),
-        "fp_penalty_sum_bps": float(fp_penalty),
-        "flag_penalty_sum_bps": float(flag_pen),
-    }
 
 def _load_booster_from_tar(fs: s3fs.S3FileSystem, model_uri: str) -> xgb.Booster:
     with fs.open(model_uri, "rb") as f:
@@ -415,7 +430,7 @@ def _load_booster_from_tar(fs: s3fs.S3FileSystem, model_uri: str) -> xgb.Booster
             booster.load_model(tmp.name)
     return booster
 
-def _align_X_to_model(X: np.ndarray, n_model: int) -> tuple[np.ndarray, dict]:
+def _align_X_to_model(X: np.ndarray, n_model: int) -> Tuple[np.ndarray, dict]:
     """Permissif: ajuste X au nombre de features du modèle (truncate/pad)."""
     n = int(X.shape[1])
     if n == n_model:
@@ -426,97 +441,343 @@ def _align_X_to_model(X: np.ndarray, n_model: int) -> tuple[np.ndarray, dict]:
     return np.concatenate([X, pad], axis=1), {"action": "pad", "before": n, "after": n_model, "added": n_model - n}
 
 def _require_exact_feature_count(X: np.ndarray, n_model: int, where: str) -> dict:
-    """Strict: refuse si mismatch. Retourne juste un petit meta dict."""
     n = int(X.shape[1])
     if n != n_model:
         raise RuntimeError(f"[{where}] feature mismatch: data has {n} cols, model expects {n_model}. Refuse.")
     return {"action": "none", "before": n, "after": n}
 
-def _eval_split_from_scores(y: np.ndarray, p: np.ndarray, thr: float) -> dict:
-    y = y.astype(int)
-    yb = (p >= thr).astype(int)
-    tp = int(np.sum((y == 1) & (yb == 1)))
-    fp = int(np.sum((y == 0) & (yb == 1)))
-    tn = int(np.sum((y == 0) & (yb == 0)))
-    fn = int(np.sum((y == 1) & (yb == 0)))
+# ========= TP/SL simulation =========
+
+def _tp_sl_value_from_hit_steps(
+    aud: Dict[str, np.ndarray],
+    side: str,
+    tp_r: int,
+    sl_r: int,
+) -> np.ndarray:
+    """
+    Uses hit STEPS to simulate TP/SL in R:
+      t_tp = hit_step_p{tp_r}R_side
+      t_sl = hit_step_m{sl_r}R_side
+
+    Convention:
+      - step >= 0 : touched at that step
+      - step == -1 : never touched
+    Decision:
+      - if t_tp>=0 and (t_sl<0 or t_tp < t_sl): +tp_r
+      - elif t_sl>=0: -sl_r
+      - else: 0 (no touch / time)
+    """
+    t_tp = np.asarray(aud[f"audit_hit_step_p{tp_r}R_{side}"], dtype=np.int64)
+    t_sl = np.asarray(aud[f"audit_hit_step_m{sl_r}R_{side}"], dtype=np.int64)
+
+    # sanity: steps must be >= -1
+    if np.any(t_tp < -1) or np.any(t_sl < -1):
+        raise RuntimeError(f"Bad hit steps (<-1) for side={side} tp={tp_r} sl={sl_r}")
+
+    out = np.zeros_like(t_tp, dtype=np.float64)
+
+    tp_hit = (t_tp >= 0)
+    sl_hit = (t_sl >= 0)
+
+    tp_wins = tp_hit & (~sl_hit | (t_tp < t_sl))
+    sl_wins = sl_hit & (~tp_hit | (t_sl < t_tp))
+
+    out[tp_wins] = float(tp_r)
+    out[sl_wins] = -float(sl_r)
+
+    # tie case (t_tp == t_sl >=0) : decide policy
+    # recommended: treat as SL (conservative) OR 0 (ignore). Pick one.
+    ties = tp_hit & sl_hit & (t_tp == t_sl)
+    # conservative:
+    out[ties] = -float(sl_r)
+
+    return out
+
+def _check_required_audit_cols(aud: Dict[str, np.ndarray], cols: List[str], where: str):
+    missing = [c for c in cols if c not in aud]
+    if missing:
+        raise RuntimeError(f"[{where}] audit missing required cols: {missing}")
+
+def _best_threshold_by_value(
+    y: np.ndarray,
+    p: np.ndarray,
+    value: np.ndarray,
+    audit_market_toxic: np.ndarray,
+    audit_timeout: np.ndarray,
+    audit_early_abort: np.ndarray,
+    budget_thr: np.ndarray,
+    eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """
+    Choose a decision threshold `thr` that maximizes EV(value) under hard gates.
+
+    Implementation detail (important):
+      - We sort samples by predicted probability `p` in descending order.
+      - Each candidate threshold `thr` is taken as one of the unique values of `p`.
+      - For a given `thr`, the predicted-positive set is the PREFIX of the sorted list:
+            pred(thr) = { i : p_i >= thr }   (i.e., indices 0..end in sorted order)
+
+    Hard gates (applied only within the predicted-positive prefix):
+      - ok_flags  = (audit_market_toxic==0) & (audit_timeout==0) & (audit_early_abort==0)
+      - ok_budget = (p >= audit_p_thr_ev0)
+      - allowed(thr) = pred(thr) & ok_flags & ok_budget
+
+    Objective:
+      - EV(thr) = sum(value[i] for i in allowed(thr))
+
+    Tie-break (in order):
+      1) higher EV
+      2) higher TP (among allowed(thr))
+      3) lower FP (among allowed(thr))
+      4) higher thr
+    """
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    v = np.asarray(value, dtype=np.float64)
+
+    mt = np.asarray(audit_market_toxic, dtype=np.int64)
+    to = np.asarray(audit_timeout, dtype=np.int64)
+    ab = np.asarray(audit_early_abort, dtype=np.int64)
+    thr0 = np.asarray(budget_thr, dtype=np.float64)
+
+    n = int(y.shape[0])
+    if n == 0:
+        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "empty", "EV": 0.0, "TP": 0, "FP": 0}
+
+    _check_flags_binary(
+        {"audit_market_toxic": mt, "audit_timeout": to, "audit_early_abort": ab},
+        ["audit_market_toxic", "audit_timeout", "audit_early_abort"],
+        "VALUE/flags",
+    )
+    
+    _check_thr01(thr0, "VALUE/budget_thr", eps=eps)
+
+    order = np.argsort(-p, kind="mergesort")
+    ps = p[order]; ys = y[order]; vv = v[order]
+    mt = mt[order]; to = to[order]; ab = ab[order]; th = thr0[order]
+
+    tp_mask = (ys == 1)
+    fp_mask = (ys == 0)
+    ok_flags = (mt == 0) & (to == 0) & (ab == 0)
+    ok_budget = (ps >= th)
+    allowed = ok_flags & ok_budget
+
+    pred_cum = np.arange(n, dtype=np.int64) + 1
+    allowed_cum = np.cumsum(allowed.astype(np.int64))
+    blocked_flags_cum  = np.cumsum((~ok_flags).astype(np.int64))
+    blocked_budget_cum = np.cumsum((ok_flags & (~ok_budget)).astype(np.int64))
+
+    EV_cum = np.cumsum(vv * allowed)
+    TP_cum = np.cumsum((tp_mask & allowed).astype(np.int64))
+    FP_cum = np.cumsum((fp_mask & allowed).astype(np.int64))
+
+    ends = np.array([0], dtype=np.int64) if n == 1 else np.r_[np.where(ps[1:] != ps[:-1])[0], n - 1].astype(np.int64)
+
+    best = None
+    for end in ends:
+        cand = {
+            "end": int(end),
+            "thr": float(ps[end]),
+            "EV": float(EV_cum[end]),
+            "TP": int(TP_cum[end]),
+            "FP": int(FP_cum[end]),
+            "n_pred": int(pred_cum[end]),
+            "n_allowed": int(allowed_cum[end]),
+            "n_blocked_flags": int(blocked_flags_cum[end]),
+            "n_blocked_budget": int(blocked_budget_cum[end]),
+        }
+        if best is None:
+            best = cand
+        else:
+            if (
+                cand["EV"] > best["EV"] + eps or
+                (abs(cand["EV"] - best["EV"]) <= eps and cand["TP"] > best["TP"]) or
+                (abs(cand["EV"] - best["EV"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] < best["FP"]) or
+                (abs(cand["EV"] - best["EV"]) <= eps and cand["TP"] == best["TP"] and cand["FP"] == best["FP"] and cand["thr"] > best["thr"])
+            ):
+                best = cand
+
+    if best is None:
+        return {"decision_threshold": 1.0, "chosen_end": -1, "why": "no candidates", "EV": 0.0, "TP": 0, "FP": 0}
+
+    return {
+        "decision_threshold": float(best["thr"]),
+        "chosen_end": int(best["end"]),
+        "EV": float(best["EV"]),
+        "TP": int(best["TP"]),
+        "FP": int(best["FP"]),
+        "n_pred": int(best["n_pred"]),
+        "n_allowed": int(best["n_allowed"]),
+        "n_blocked_flags": int(best["n_blocked_flags"]),
+        "n_blocked_budget": int(best["n_blocked_budget"]),
+        "why": "ok",
+    }
+
+def _eval_gated_metrics(
+    y: np.ndarray,
+    p: np.ndarray,
+    thr: float,
+    audit_market_toxic: np.ndarray,
+    audit_timeout: np.ndarray,
+    audit_early_abort: np.ndarray,
+    budget_thr: np.ndarray,
+) -> Dict[str, Any]:
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+
+    pred_pos = (p >= float(thr))
+
+    mt = np.asarray(audit_market_toxic, dtype=np.int64)
+    to = np.asarray(audit_timeout, dtype=np.int64)
+    ab = np.asarray(audit_early_abort, dtype=np.int64)
+    th = np.asarray(budget_thr, dtype=np.float64)
+
+    ok_flags = (mt == 0) & (to == 0) & (ab == 0)
+    ok_budget = (p >= th)
+    allowed = pred_pos & ok_flags & ok_budget
+
+    tp = int(np.sum((y == 1) & allowed))
+    fp = int(np.sum((y == 0) & allowed))
+    tn = int(np.sum((y == 0) & (~allowed)))
+    fn = int(np.sum((y == 1) & (~allowed)))
+
     n_neg = max(int(np.sum(y == 0)), 1)
     n_pos = max(int(np.sum(y == 1)), 1)
+
     return {
         "TP": tp, "FP": fp, "TN": tn, "FN": fn,
         "FPR": float(fp / n_neg),
         "TPR": float(tp / n_pos),
         "precision": float(tp / max(tp + fp, 1)),
+        "n_allowed": int(np.sum(allowed)),
+        "n_pred": int(np.sum(pred_pos)),
+        "n_blocked_flags": int(np.sum(pred_pos & (~ok_flags))),
+        "n_blocked_budget": int(np.sum(pred_pos & ok_flags & (~ok_budget))),
+        "allowed_mask_sum": int(np.sum(allowed)),
     }
 
-def evaluate_ev_sweep(model_uri: str,
-                          val_prefix: str, tst_prefix: str,
-                          val_audit_prefix: str,
-                          tst_audit_prefix: str,
-                          audit_cols: List[str],
-                          require_audit: bool,
-                          allow_feature_mismatch: bool = False,
-                          eps: float = 1e-12) -> dict:
+def _summarize_extra_audit(aud: Dict[str, np.ndarray], allowed_mask: np.ndarray) -> Dict[str, Any]:
+    """
+    Small diagnostics to help compare models:
+      - mean/quantiles of mfe/mae (if present)
+      - hit rates (if present)
+      - first_touch stats (if present)
+    """
+    out: Dict[str, Any] = {}
+    m = np.asarray(allowed_mask, dtype=bool)
+    if m.size == 0 or m.sum() == 0:
+        return {"note": "no allowed rows -> no extra audit summary"}
+
+    def _q(x: np.ndarray) -> Dict[str, float]:
+        x = np.asarray(x, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return {"n": 0}
+        return {
+            "n": int(x.size),
+            "mean": float(np.mean(x)),
+            "p05": float(np.quantile(x, 0.05)),
+            "p50": float(np.quantile(x, 0.50)),
+            "p95": float(np.quantile(x, 0.95)),
+        }
+
+    for k in ["audit_mfe_R_L", "audit_mae_R_L", "audit_mfe_R_S", "audit_mae_R_S"]:
+        if k in aud:
+            out[k] = _q(aud[k][m])
+
+    for k in ["audit_first_touch_L", "audit_first_touch_S"]:
+        if k in aud:
+            ft = aud[k][m]
+            out[k] = {
+                **_q(ft),
+                "frac_pos": float(np.mean(ft > 0)) if np.isfinite(ft).any() else 0.0,
+                "frac_neg": float(np.mean(ft < 0)) if np.isfinite(ft).any() else 0.0,
+                "frac_zero": float(np.mean(ft == 0)) if np.isfinite(ft).any() else 0.0,
+            }
+
+    # hit flags
+    hit_keys = [k for k in AUDIT_DIAG_OPTIONAL if k.startswith("audit_hit_") and k in aud]
+    if hit_keys:
+        hit_rates = {}
+        for k in hit_keys:
+            v = aud[k][m]
+            v = np.asarray(v, dtype=np.float64)
+            v = v[np.isfinite(v)]
+            if v.size == 0:
+                continue
+            # treat as 0/1
+            hit_rates[k] = float(np.mean(v >= 0.5))
+        out["hit_rates_allowed"] = hit_rates
+
+    return out
+
+# ========= MAIN EVAL =========
+
+def evaluate_ev_sweep(
+    model_uri: str,
+    val_prefix: str,
+    tst_prefix: str,
+    allow_feature_mismatch: bool = False,
+    eps: float = 1e-12,
+    tp_max: int = 5,
+    sl_max: int = 3,
+) -> dict:
     fs = s3fs.S3FileSystem()
+
     booster = _load_booster_from_tar(fs, model_uri)
-    _, feature_names = _load_columns_meta(fs, META_DIR)
+    label_name, feature_names, audit_cols, audit_paths = _load_meta_contract(fs, META_DIR)
+
+    val_audit_prefix = f"{DATA_ROOT}/{audit_paths['val_audit'].split('/')[0]}"
+    tst_audit_prefix = f"{DATA_ROOT}/{audit_paths['test_audit'].split('/')[0]}"
+
+    # FAIL-HARD: audits must exist
+    _require_csv_prefix(fs, val_audit_prefix, "val_audit")
+    _require_csv_prefix(fs, tst_audit_prefix, "test_audit")
+
+    AUDIT_REQUIRED_TPSL = _required_hit_step_cols(tp_max=int(tp_max), sl_max=int(sl_max))
 
     Xv, yv = _load_xy_by_columns(fs, val_prefix, feature_names)
     Xt, yt = _load_xy_by_columns(fs, tst_prefix, feature_names)
 
-    if require_audit:
-        _require_csv_prefix(fs, val_audit_prefix, "val_audit")
+    for name, yy in [("VAL", yv), ("TEST", yt)]:
+        u = np.unique(yy)
+        if not np.all(np.isin(u, [0, 1])):
+            raise RuntimeError(f"[{name}] y must be in {{0,1}}. got uniques={u[:10]}")
 
-    aud_cols = [c.strip() for c in audit_cols if c.strip()]
-    aud_v = _load_audit_by_cols(fs, val_audit_prefix, aud_cols)
+    aud_v = _load_audit_contract(fs, val_audit_prefix, audit_cols)
+    aud_t = _load_audit_contract(fs, tst_audit_prefix, audit_cols)
+    
+    _validate_side_audit_contract(aud_v, "VAL")
+    _validate_side_audit_contract(aud_t, "TEST")
 
-    # --- VAL checks (clean) ---
+    # Fail-hard: core + tp/sl fields must exist (since you said Stage4 must use new audit_*)
+    _check_required_audit_cols(aud_v, AUDIT_REQUIRED_CORE, "VAL")
+    _check_required_audit_cols(aud_t, AUDIT_REQUIRED_CORE, "TEST")
+    _check_required_audit_cols(aud_v, AUDIT_REQUIRED_TPSL, "VAL")
+    _check_required_audit_cols(aud_t, AUDIT_REQUIRED_TPSL, "TEST")
+    _check_required_audit_cols(aud_v, AUDIT_REQUIRED_STAGE4, "VAL")
+    _check_required_audit_cols(aud_t, AUDIT_REQUIRED_STAGE4, "TEST")
+
+    # --- checks ---
     n_val = int(len(yv))
-    required = ["fp_cost_bps", "audit_market_toxic", "audit_timeout", "audit_early_abort", "audit_p_thr_ev0"]
-
-    missing = [c for c in required if c not in aud_v]
-    if missing:
-        raise RuntimeError(f"val_audit missing cols: {missing} (audit_cols={aud_cols})")
-
-    for k in required:
+    for k in AUDIT_REQUIRED_CORE + AUDIT_REQUIRED_TPSL:
         if len(aud_v[k]) != n_val:
             raise RuntimeError(f"[VAL] audit length mismatch for {k}: y={n_val} got={len(aud_v[k])}")
-
     _check_flags_binary(aud_v, ["audit_market_toxic", "audit_timeout", "audit_early_abort"], "VAL")
+    _check_thr01(aud_v["audit_p_thr_ev0"], "VAL/audit_p_thr_ev0", eps=float(eps))
 
-    if np.any(aud_v["fp_cost_bps"] < -eps):    
-        raise RuntimeError("[VAL] fp_cost_bps has negative values (should be >= 0).")
+    n_test = int(len(yt))
+    for k in AUDIT_REQUIRED_CORE + AUDIT_REQUIRED_TPSL:
+        if len(aud_t[k]) != n_test:
+            raise RuntimeError(f"[TEST] audit length mismatch for {k}: y={n_test} got={len(aud_t[k])}")
+    _check_flags_binary(aud_t, ["audit_market_toxic", "audit_timeout", "audit_early_abort"], "TEST")
+    _check_thr01(aud_t["audit_p_thr_ev0"], "TEST/audit_p_thr_ev0", eps=float(eps))
 
-    # --- TEST audit (optional reporting only) ---
-    has_test_audit = True
-    try:
-        _require_csv_prefix(fs, tst_audit_prefix, "test_audit")
-        aud_t = _load_audit_by_cols(fs, tst_audit_prefix, aud_cols)
+    _assert_ev_inputs_finite(aud_v, "VAL", tp_max=int(tp_max), sl_max=int(sl_max))
+    _assert_ev_inputs_finite(aud_t, "TEST", tp_max=int(tp_max), sl_max=int(sl_max))
 
-        # same checks as VAL
-        n_test = int(len(yt))
-        missing_t = [c for c in required if c not in aud_t]
-        if missing_t:
-            raise RuntimeError(f"test_audit missing cols: {missing_t} (audit_cols={aud_cols})")
-
-        for k in required:
-            if len(aud_t[k]) != n_test:
-                raise RuntimeError(f"[TEST] audit length mismatch for {k}: y={n_test} got={len(aud_t[k])}")
-
-        _check_flags_binary(aud_t, ["audit_market_toxic", "audit_timeout", "audit_early_abort"], "TEST")
-
-        if np.any(aud_t["fp_cost_bps"] < -eps):
-            raise RuntimeError("[TEST] fp_cost_bps has negative values (should be >= 0).")
-
-    except FileNotFoundError:
-        has_test_audit = False
-        aud_t = {}
-    except Exception as e:
-        print(f"[WARN] test_audit invalide, budgets TEST désactivés: {e}", file=sys.stderr)
-        has_test_audit = False
-        aud_t = {}
-
+    # --- align features ---
     n_model = int(booster.num_features())
-
     if allow_feature_mismatch:
         Xv, fix_v = _align_X_to_model(Xv, n_model)
         Xt, fix_t = _align_X_to_model(Xt, n_model)
@@ -524,77 +785,218 @@ def evaluate_ev_sweep(model_uri: str,
         fix_v = _require_exact_feature_count(Xv, n_model, "VAL")
         fix_t = _require_exact_feature_count(Xt, n_model, "TEST")
 
-    pv = booster.predict(xgb.DMatrix(Xv))
-    pt = booster.predict(xgb.DMatrix(Xt))
+    pv = booster.predict(xgb.DMatrix(Xv), output_margin=False)
+    pt = booster.predict(xgb.DMatrix(Xt), output_margin=False)
 
-    sel = _best_threshold_by_ev(
-        y=yv, p=pv,
-        fp_cost_bps=aud_v["fp_cost_bps"],
+    if not np.isfinite(pv).all(): raise RuntimeError("[VAL] pv NaN/inf")
+    if not np.isfinite(pt).all(): raise RuntimeError("[TEST] pt NaN/inf")
+
+    if np.min(pv) < -1e-6 or np.max(pv) > 1.0 + 1e-6:
+        raise RuntimeError(f"Pred proba out of [0,1]: min={pv.min()} max={pv.max()}")
+
+    # =========================
+    # 1) Baseline (old) EV in bps on VAL for reference
+    # =========================
+    # NOTE: this baseline ignores new audit_* except gates.
+    def _best_thr_baseline_pnl(aud: Dict[str, np.ndarray], y: np.ndarray, p: np.ndarray) -> Dict[str, Any]:
+        # reuse _best_threshold_by_value with value = pnl_net_bps
+        return _best_threshold_by_value(
+            y=y, p=p,
+            value=np.asarray(aud["audit_pnl_net_bps"], dtype=np.float64),
+            audit_market_toxic=aud["audit_market_toxic"],
+            audit_timeout=aud["audit_timeout"],
+            audit_early_abort=aud["audit_early_abort"],
+            audit_p_thr_ev0=aud["audit_p_thr_ev0"],
+            eps=float(eps),
+        )
+
+    baseline_sel = _best_thr_baseline_pnl(aud_v, yv, pv)
+
+    # =========================
+    # 2) NEW: TP/SL sweep using audit_hit_step_*
+    #    We choose (tp_r, sl_r, side, thr) maximizing EV_R on VAL.
+    # =========================
+    best_combo = None
+
+    for side in ["L", "S"]:
+        for tp_r in range(1, int(tp_max) + 1):
+            for sl_r in range(1, int(sl_max) + 1):
+                value_r = _tp_sl_value_from_hit_steps(aud_v, side=side, tp_r=tp_r, sl_r=sl_r)
+                budget_thr = _p_thr_ev0_from_costR(aud_v["audit_cost_R"], tp_r=tp_r, sl_r=sl_r)
+
+                sel = _best_threshold_by_value(
+                    y=yv, p=pv,
+                    value=value_r,
+                    audit_market_toxic=aud_v["audit_market_toxic"],
+                    audit_timeout=aud_v["audit_timeout"],
+                    audit_early_abort=aud_v["audit_early_abort"],
+                    budget_thr=budget_thr,
+                    eps=float(eps),
+                )
+
+                cand = {
+                    "side": side,
+                    "tp_r": int(tp_r),
+                    "sl_r": int(sl_r),
+                    "decision_threshold": float(sel["decision_threshold"]),
+                    "chosen_end": int(sel["chosen_end"]),
+                    "EV_R": float(sel["EV"]),
+                    "TP": int(sel["TP"]),
+                    "FP": int(sel["FP"]),
+                    "n_pred": int(sel["n_pred"]),
+                    "n_allowed": int(sel["n_allowed"]),
+                    "n_blocked_flags": int(sel["n_blocked_flags"]),
+                    "n_blocked_budget": int(sel["n_blocked_budget"]),
+                }
+
+                if best_combo is None:
+                    best_combo = cand
+                else:
+                    # tie-break: EV_R, TP, -FP, thr
+                    if (
+                        cand["EV_R"] > best_combo["EV_R"] + eps or
+                        (abs(cand["EV_R"] - best_combo["EV_R"]) <= eps and cand["TP"] > best_combo["TP"]) or
+                        (abs(cand["EV_R"] - best_combo["EV_R"]) <= eps and cand["TP"] == best_combo["TP"] and cand["FP"] < best_combo["FP"]) or
+                        (abs(cand["EV_R"] - best_combo["EV_R"]) <= eps and cand["TP"] == best_combo["TP"] and cand["FP"] == best_combo["FP"] and cand["decision_threshold"] > best_combo["decision_threshold"])
+                    ):
+                        best_combo = cand
+
+    if best_combo is None:
+        raise RuntimeError("TP/SL sweep produced no candidate (unexpected).")
+
+    # =========================
+    # 3) Evaluate chosen combo on VAL + TEST (reporting)
+    # =========================
+    thr = float(best_combo["decision_threshold"])
+    side = str(best_combo["side"])
+    tp_r = int(best_combo["tp_r"])
+    sl_r = int(best_combo["sl_r"])
+
+    # allowed masks to summarize extras
+    def _allowed_mask(p: np.ndarray, thr: float, aud: Dict[str, np.ndarray]) -> np.ndarray:
+        p = np.asarray(p, dtype=np.float64)
+        pred_pos = (p >= float(thr))
+        ok_flags = (
+            (np.asarray(aud["audit_market_toxic"], dtype=np.int64) == 0) &
+            (np.asarray(aud["audit_timeout"], dtype=np.int64) == 0) &
+            (np.asarray(aud["audit_early_abort"], dtype=np.int64) == 0)
+        )
+        ok_budget = (p >= np.asarray(aud["audit_p_thr_ev0"], dtype=np.float64))
+        return (pred_pos & ok_flags & ok_budget)
+    
+    # value arrays
+    v_val_r = _tp_sl_value_from_hit_steps(aud_v, side=side, tp_r=tp_r, sl_r=sl_r)
+    v_tst_r = _tp_sl_value_from_hit_steps(aud_t, side=side, tp_r=tp_r, sl_r=sl_r)
+
+    m_val = _allowed_mask(pv, thr, aud_v)
+    m_tst = _allowed_mask(pt, thr, aud_t)
+
+    if not np.isfinite(v_val_r).all():
+        raise RuntimeError("[VAL] v_val_r has NaN/inf after _tp_sl_value_from_first_touch()")
+    if not np.isfinite(v_tst_r).all():
+        raise RuntimeError("[TEST] v_tst_r has NaN/inf after _tp_sl_value_from_first_touch()")
+
+    # sanity: allowed est bien sous-ensemble de pred_pos
+    if np.any(m_val & (pv < thr)):
+        raise RuntimeError("[VAL] allowed mask includes p<thr (mask bug)")
+    if np.any(m_tst & (pt < thr)):
+        raise RuntimeError("[TEST] allowed mask includes p<thr (mask bug)")
+
+    # gated classification metrics
+    val_cls = _eval_gated_metrics(
+        y=yv, p=pv, thr=thr,
         audit_market_toxic=aud_v["audit_market_toxic"],
         audit_timeout=aud_v["audit_timeout"],
         audit_early_abort=aud_v["audit_early_abort"],
         audit_p_thr_ev0=aud_v["audit_p_thr_ev0"],
-        eps=float(eps),
     )
-    thr = float(sel["decision_threshold"])
-
-    val_m = _eval_split_from_scores(yv, pv, thr)
-    val_ev = _eval_ev_fields(
-        yv, pv, thr,
-        aud_v["fp_cost_bps"],
-        aud_v["audit_market_toxic"],
-        aud_v["audit_timeout"],
-        aud_v["audit_early_abort"],
-        aud_v["audit_p_thr_ev0"],
-        eps=float(eps),
+    tst_cls = _eval_gated_metrics(
+        y=yt, p=pt, thr=thr,
+        audit_market_toxic=aud_t["audit_market_toxic"],
+        audit_timeout=aud_t["audit_timeout"],
+        audit_early_abort=aud_t["audit_early_abort"],
+        audit_p_thr_ev0=aud_t["audit_p_thr_ev0"],
     )
 
-    tst_m = _eval_split_from_scores(yt, pt, thr)
+    # gated EVs
+    val_ev_r = float(np.sum(v_val_r[m_val])) if m_val.any() else 0.0
+    tst_ev_r = float(np.sum(v_tst_r[m_tst])) if m_tst.any() else 0.0
+
+    # baseline pnl EV (bps) evaluated at chosen thr too (so you can compare)
+    val_pnl_bps = float(np.sum(np.asarray(aud_v["audit_pnl_net_bps"], dtype=np.float64)[m_val])) if m_val.any() else 0.0
+    tst_pnl_bps = float(np.sum(np.asarray(aud_t["audit_pnl_net_bps"], dtype=np.float64)[m_tst])) if m_tst.any() else 0.0
+
+    extra_val = _summarize_extra_audit(aud_v, m_val)
+    extra_tst = _summarize_extra_audit(aud_t, m_tst)
 
     best = {
         "decision_threshold": thr,
-        "val": {**val_m, **val_ev},
-        "test": tst_m,
-        "chosen": sel,
+        "tp_sl": {"side": side, "tp_r": tp_r, "sl_r": sl_r},
+        "objective": "maximize EV_R (VAL-only) under hard gates",
+        "val": {
+            **val_cls,
+            "EV_R": val_ev_r,
+            "pnl_sum_bps_gated": val_pnl_bps,
+            "extra_audit_summary": extra_val,
+        },
+        "test": {
+            **tst_cls,
+            "EV_R": tst_ev_r,
+            "pnl_sum_bps_gated": tst_pnl_bps,
+            "extra_audit_summary": extra_tst,
+        },
+        "chosen_combo": best_combo,
+        "baseline_val_best_thr_by_pnl_bps": {
+            "decision_threshold": float(baseline_sel["decision_threshold"]),
+            "EV_bps": float(baseline_sel["EV"]),  # here EV is pnl_bps because value=pnl_bps
+            "TP": int(baseline_sel["TP"]),
+            "FP": int(baseline_sel["FP"]),
+            "n_allowed": int(baseline_sel["n_allowed"]),
+        },
     }
-    if has_test_audit:
-        tst_ev = _eval_ev_fields(
-            yt, pt, thr,
-            aud_t["fp_cost_bps"],
-            aud_t["audit_market_toxic"],
-            aud_t["audit_timeout"],
-            aud_t["audit_early_abort"],
-            aud_t["audit_p_thr_ev0"],
-            eps=float(eps),
-        )
-        best["test"].update(tst_ev)
-    else:
-        best["test"].update({"EV_bps": None, "note": "test_audit missing/incomplete => EV not reported on test"})
 
     return {
         "feature_fix": {"val": fix_v, "test": fix_t},
         "best_by_val_only": best,
-        "note": "Selection uses ONLY VAL EV. TEST is reporting only.",
+        "note": "Selection uses ONLY VAL EV_R from TP/SL simulation via audit_hit_step_* (L/S). TEST is reporting only.",
+        "audit_cols_seen": audit_cols,
     }
 
 def main():
     args = parse_args()
     fs = s3fs.S3FileSystem()
+
     _require_csv_prefix(fs, TRN_DIR, "train")
     _require_csv_prefix(fs, VAL_DIR, "validation")
     _require_csv_prefix(fs, TST_DIR, "test")
-    if args.require_audit:
-        _require_csv_prefix(fs, VAA_DIR, "val_audit")
+    _require_csv_prefix(fs, TRW_DIR, "train_weight")
+    _require_csv_prefix(fs, VAW_DIR, "validation_weight")
 
-    label_name, feature_names = _load_columns_meta(fs, META_DIR)
+    # meta contract FIRST (needed for audit paths)
+    label_name, feature_names, audit_cols, audit_paths = _load_meta_contract(fs, META_DIR)
+
+    val_audit_prefix  = f"{DATA_ROOT}/{audit_paths['val_audit'].split('/')[0]}"
+    test_audit_prefix = f"{DATA_ROOT}/{audit_paths['test_audit'].split('/')[0]}"
+
+    _require_csv_prefix(fs, val_audit_prefix, "val_audit")
+    _require_csv_prefix(fs, test_audit_prefix, "test_audit")
+
+    print(f"[meta] label_col={label_name} | n_features={len(feature_names)}")
+    print(f"[meta] audit_cols(n={len(audit_cols)})={audit_cols}")
+    print(f"[meta] audit_paths={audit_paths}")
+
+    # fail-fast if audit_cols don't include new fields
+    missing_needed = [c for c in AUDIT_REQUIRED_CORE if c not in set(audit_cols)]
+    if missing_needed:
+        raise RuntimeError(
+            "Stage4 requires new audit_* but columns.json audit_format is missing required fields: "
+            f"{missing_needed}"
+        )
 
     hp_base = dict(HP_BASE)
-    print(f"[meta] label_col = {label_name} | n_features={len(feature_names)}")
 
     sess = sagemaker.Session(boto3.Session(region_name=REGION))
     s3c = _boto3_client("s3", REGION)
-
-    audit_cols = [c.strip() for c in str(args.audit_cols).split(",") if c.strip()]
 
     PRIORITY_COMBOS = [
         dict(),  # baseline
@@ -619,12 +1021,12 @@ def main():
 
         sweep = evaluate_ev_sweep(
             model_uri=row["model_uri"],
-            val_prefix=VAL_DIR, tst_prefix=TST_DIR,
-            val_audit_prefix=VAA_DIR, tst_audit_prefix=TSA_DIR,
-            audit_cols=audit_cols,
-            require_audit=bool(args.require_audit),
+            val_prefix=VAL_DIR,
+            tst_prefix=TST_DIR,
             allow_feature_mismatch=bool(args.allow_feature_mismatch),
             eps=float(args.eps),
+            tp_max=int(args.tp_max),
+            sl_max=int(args.sl_max),
         )
         row["sweep"] = _json_sanitize(sweep)
         row["best"]  = _json_sanitize(sweep["best_by_val_only"])
@@ -645,12 +1047,12 @@ def main():
 
                 sweep = evaluate_ev_sweep(
                     model_uri=row["model_uri"],
-                    val_prefix=VAL_DIR, tst_prefix=TST_DIR,
-                    val_audit_prefix=VAA_DIR, tst_audit_prefix=TSA_DIR,
-                    audit_cols=audit_cols,
-                    require_audit=bool(args.require_audit),
+                    val_prefix=VAL_DIR,
+                    tst_prefix=TST_DIR,
                     allow_feature_mismatch=bool(args.allow_feature_mismatch),
                     eps=float(args.eps),
+                    tp_max=int(args.tp_max),
+                    sl_max=int(args.sl_max),
                 )
 
                 row["sweep"] = _json_sanitize(sweep)
@@ -660,9 +1062,10 @@ def main():
                 b = sweep["best_by_val_only"]
                 print(
                     f"[BEST@VAL] thr={b['decision_threshold']:.6g} | "
-                    f"VAL EV_bps={b['val'].get('EV_bps', float('nan')):.6g} "
-                    f"TP={b['val']['TP']} FP={b['val']['FP']} | "
-                    f"TEST(report) TP={b['test']['TP']} FP={b['test']['FP']}"
+                    f"TP/SL={b['tp_sl']['side']} tp={b['tp_sl']['tp_r']}R sl={b['tp_sl']['sl_r']}R | "
+                    f"VAL EV_R={b['val'].get('EV_R', float('nan')):.6g} | "
+                    f"VAL pnl_bps(gated)={b['val'].get('pnl_sum_bps_gated', float('nan')):.6g} | "
+                    f"TP={b['val']['TP']} FP={b['val']['FP']}"
                 )
 
             except Exception as e:
@@ -676,13 +1079,14 @@ def main():
     ok_rows = [r for r in results if r.get("status") == "ok"]
     best = None
     if ok_rows:
+        # Select by VAL EV_R first, then TP, then -FP, then thr
         best = max(
             ok_rows,
             key=lambda r: (
-                r["best"]["val"].get("EV_bps", -1e30),
-                r["best"]["val"]["TP"],
-                -r["best"]["val"]["FP"],
-                r["best"]["decision_threshold"],
+                r["best"]["val"].get("EV_R", -1e30),
+                r["best"]["val"].get("TP", 0),
+                -r["best"]["val"].get("FP", 0),
+                r["best"].get("decision_threshold", 0.0),
             ),
         )
 
@@ -691,8 +1095,10 @@ def main():
         "data_root": DATA_ROOT,
         "hp_base": _json_sanitize(hp_base),
         "selection": {
-            "type": "EV",
-            "note": "VAL-only maximize EV (TP reward - FP penalty - flag penalties) using audit_p_thr_ev0",
+            "type": "EV_R",
+            "note": "VAL-only maximize EV_R from TP/SL simulation via audit_hit_step_* with HARD filters: allowed=(p>=thr)&(p>=audit_p_thr_ev0)&(flags==0)",
+            "tp_max": int(args.tp_max),
+            "sl_max": int(args.sl_max),
         },
         "results": results,
         "best": best,
@@ -713,8 +1119,8 @@ def main():
         manifest_uri = f"{RELEASE_BASE}/{release_name}/manifest.json"
 
         scaler_stats_uri = f"{META_DIR}/scaler_stats.json"
-        
-        b = best["best"] 
+
+        b = best["best"]
 
         manifest = {
             "model_uri": best["model_uri"],
@@ -723,7 +1129,7 @@ def main():
             "side": "go",
             "data_root": DATA_ROOT,
             "metrics": {
-                "selection": "VAL-only maximize EV (TP reward - FP penalty - flag penalties) using audit_p_thr_ev0",
+                "selection": "VAL-only maximize EV_R via audit_hit_step_* with HARD filters: allowed=(p>=thr)&(p>=audit_p_thr_ev0)&(flags==0)",
                 "best": best["best"],
             },
             "inference": {
@@ -731,12 +1137,22 @@ def main():
                 "proba_semantics": "p = P(Y=1)",
                 "invert_output": False,
                 "autoflip_allowed": False,
+                "tp_sl": {
+                    "side": b["tp_sl"]["side"],
+                    "tp_r": int(b["tp_sl"]["tp_r"]),
+                    "sl_r": int(b["tp_sl"]["sl_r"]),
+                    "note": "Chosen on VAL via audit_hit_step_* TP/SL simulation. If your live system uses different TP/SL logic, align it.",
+                },
                 "ev_fields": {
-                    "fp_cost_bps": "fp_cost_bps",
+                    # gating + baseline
+                    "audit_pnl_net_bps": "audit_pnl_net_bps",
                     "audit_market_toxic": "audit_market_toxic",
                     "audit_timeout": "audit_timeout",
                     "audit_early_abort": "audit_early_abort",
                     "audit_p_thr_ev0": "audit_p_thr_ev0",
+                    # new fields used for EV_R
+                    "audit_hit_step_p1R_L": "audit_hit_step_p1R_L",
+                    "audit_hit_step_p1R_S": "audit_hit_step_p1R_S",
                 },
             },
             "data_contract": {
@@ -745,9 +1161,9 @@ def main():
                 "features": feature_names,
                 "scaler_stats_uri": scaler_stats_uri,
                 "normalize_at_infer": False,
-                },
-            }
-        
+            },
+        }
+
         _s3_put_bytes_uri(s3c, manifest_uri, _json_dumps_safe(manifest))
         print(f"[manifest] écrit: {manifest_uri}")
     except Exception as e:

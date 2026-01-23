@@ -173,14 +173,15 @@ def _mfe_mae_and_barriers_R(
     """
     Post-entry (NON-FEATURE) audit stats on an exit-price segment:
       - MFE/MAE in bps and in R
-      - flags: hit +kR / -kR
-      - first touch: which +/-kR was hit first + step index from fill
+      - hit flags: hit +kR / -kR
+      - hit steps: first step where +kR / -kR is touched (-1 if never)
+      - first touch: signed k (+k if profit barrier first, -k if stop barrier first), plus step index
 
-    Returns dict keys:
-      mfe_bps, mae_bps, mfe_R, mae_R,
-      hit_p{k}R, hit_m{k}R,
-      first_touch (signed int), first_touch_step
+    Conventions:
+      - steps are 0-based within seg_exit (post-fill)
+      - -1 = never touched
     """
+    # --- invalid input guard ---
     if (
         seg_exit is None
         or seg_exit.size == 0
@@ -196,8 +197,10 @@ def _mfe_mae_and_barriers_R(
         }
         for k in k_pos:
             out[f"hit_p{k}R"] = 0
+            out[f"hit_step_p{k}R"] = -1
         for k in k_neg:
             out[f"hit_m{k}R"] = 0
+            out[f"hit_step_m{k}R"] = -1
         return out
 
     # define favorable/adverse so that "favorable_bps >= 0" always means favorable
@@ -208,8 +211,6 @@ def _mfe_mae_and_barriers_R(
         favorable_bps = (1.0 - seg_exit / entry_px) * 1e4
         adverse_bps   = (seg_exit / entry_px - 1.0) * 1e4
 
-    # numeric safety
-    # numeric safety (avoid NaN => +/-inf that would create fake touches)
     favorable_bps = np.asarray(favorable_bps, dtype=np.float64)
     adverse_bps   = np.asarray(adverse_bps,   dtype=np.float64)
 
@@ -225,42 +226,51 @@ def _mfe_mae_and_barriers_R(
         }
         for k in k_pos:
             out[f"hit_p{k}R"] = 0
+            out[f"hit_step_p{k}R"] = -1
         for k in k_neg:
             out[f"hit_m{k}R"] = 0
+            out[f"hit_step_m{k}R"] = -1
         return out
 
-    # Use only finite values
+    # MFE/MAE computed on finite values
     f = favorable_bps[ok_f]
     a = adverse_bps[ok_a]
-
     mfe_bps = float(np.max(f))
     mae_bps = float(np.max(a))
 
     mfe_R = float(mfe_bps / R_bps)
     mae_R = float(mae_bps / R_bps)
 
-    hits_pos = {k: int(np.any(favorable_bps >= (k * R_bps))) for k in k_pos}
-    hits_neg = {k: int(np.any(adverse_bps   >= (k * R_bps))) for k in k_neg}
+    # --- hits + hit steps ---
+    hits_pos: Dict[int, int] = {}
+    steps_pos: Dict[int, int] = {}
+    for k in k_pos:
+        idx = np.flatnonzero(favorable_bps >= (float(k) * float(R_bps)))
+        hits_pos[k] = int(idx.size > 0)
+        steps_pos[k] = int(idx[0]) if idx.size else -1
 
-    # earliest threshold crossing (first touch)
+    hits_neg: Dict[int, int] = {}
+    steps_neg: Dict[int, int] = {}
+    for k in k_neg:
+        idx = np.flatnonzero(adverse_bps >= (float(k) * float(R_bps)))
+        hits_neg[k] = int(idx.size > 0)
+        steps_neg[k] = int(idx[0]) if idx.size else -1
+
+    # --- first touch = min(step) across all barriers ---
     first_step = 10**12
     first_code = 0
 
     for k in k_pos:
-        idx = np.flatnonzero(favorable_bps >= (k * R_bps))
-        if idx.size:
-            s = int(idx[0])
-            if s < first_step:
-                first_step = s
-                first_code = +k
+        s = steps_pos[k]
+        if s >= 0 and s < first_step:
+            first_step = s
+            first_code = +int(k)
 
     for k in k_neg:
-        idx = np.flatnonzero(adverse_bps >= (k * R_bps))
-        if idx.size:
-            s = int(idx[0])
-            if s < first_step:
-                first_step = s
-                first_code = -k
+        s = steps_neg[k]
+        if s >= 0 and s < first_step:
+            first_step = s
+            first_code = -int(k)
 
     if first_step == 10**12:
         first_step = -1
@@ -272,10 +282,12 @@ def _mfe_mae_and_barriers_R(
         "first_touch": int(first_code),
         "first_touch_step": int(first_step),
     }
-    for k, v in hits_pos.items():
-        out[f"hit_p{k}R"] = v
-    for k, v in hits_neg.items():
-        out[f"hit_m{k}R"] = v
+    for k in k_pos:
+        out[f"hit_p{k}R"] = hits_pos[k]
+        out[f"hit_step_p{k}R"] = steps_pos[k]
+    for k in k_neg:
+        out[f"hit_m{k}R"] = hits_neg[k]
+        out[f"hit_step_m{k}R"] = steps_neg[k]
     return out
 
 # ============================================================
@@ -529,6 +541,56 @@ def _side_tp_sl_steps_after_fill(
 # NEW VERSION: process_symbol_year (Stage1 v3 audits)
 # ============================
 
+def _write_stage1_columns_json(
+    out_root: str,
+    so: dict,
+    tfs: List[str],
+    base_cols: List[str],
+    tf_cols: List[str],
+    audit_cols: List[str],
+):
+    payload = {
+        "stage": "stage1",
+        "task": "rr_labeling",
+        "schema_version": 1,
+        "row_id": "row_id",
+        "tfs": ["5m","15m","30m","1h","2h","4h"],
+        "timestamp_col": "t",
+        "base_cols": base_cols,
+        "tf_cols": tf_cols,
+        "audit_cols": audit_cols,
+        "n_features_stage1": 0,
+        "notes": {
+            "audit_step_convention": "-1 = never touched, else step index from post-fill segment (0-based).",
+            "per_tf_suffix": "All label/audit columns are suffixed with _{tf}. Stage2 should select one tf then strip suffix.",
+            "side_suffix": "Side is encoded as _L or _S in the column name.",
+        },
+        "stage2_hint": {
+            "select_tf_then_rename": {
+                "example_tf": (tfs[0] if tfs else ""),
+                "rename_rules": [
+                    "p_thr_ev0_{tf} -> audit_p_thr_ev0",
+                    "pnl_net_bps_{tf} -> audit_pnl_net_bps",
+                    "exit_reason_{tf} -> audit_exit_reason",
+                    "y_go_{tf} -> y_go",
+                    "audit_*_{L|S}_{tf} -> audit_*_{L|S}",
+                    "audit_cost_R_{tf} -> audit_cost_R",
+                    "audit_cost_bps_{tf} -> audit_cost_bps",
+                    "audit_R_bps_{tf} -> audit_R_bps",
+                    "audit_rr_min_{tf} -> audit_rr_min",
+                ],
+            }
+        },
+    }
+
+    path = f"{out_root.rstrip('/')}/stage1_columns.json"
+    if path.startswith("s3://"):
+        with fsspec.open(path, "wb", **so) as f:
+            f.write(json.dumps(payload, indent=2).encode("utf-8"))
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
 def process_symbol_year(
     symbol: str,
     year: int,
@@ -646,7 +708,6 @@ def process_symbol_year(
     out["rr_min_default"] = np.float32(rr_min_default)
 
     out["fill_mode"] = "conservative"
-    out["fill_window_sec"] = np.int16(fill_window_sec)
 
     # -------------------------
     # PREP arrays + indexer (ffill)
@@ -680,12 +741,30 @@ def process_symbol_year(
     atr_bps_arr = np.nan_to_num(atr_bps_arr, nan=0.0, posinf=0.0, neginf=0.0)
     R_bps_arr = np.maximum(float(risk_mult) * atr_bps_arr, float(risk_floor_bps)).astype(np.float64)
 
+    # --- NEW: audit cost in bps and in R (row-wise, independent of TF) ---
+    cost_bps_arr = cost.astype(np.float64, copy=False)
+
+    # guard: if R_bps is 0 (shouldn't, but safe), cost_R=+inf then later clipped
+    denR = np.maximum(R_bps_arr, 1e-12)
+    cost_R_arr = (cost_bps_arr / denR).astype(np.float64)
+
+    # optional safety clip (prevents insane values if ATR was 0 and floor tiny)
+    cost_R_arr = np.clip(cost_R_arr, 0.0, 100.0)
+
     n = len(out)
 
     # -------------------------
     # RR labeling + AUDIT per TF
     # -------------------------
     for tf in tfs:
+        k_pos = (1, 2, 3, 4, 5)
+        k_neg = (1, 2, 3)
+        
+        auditL_hit_step_p = {k: np.full(n, -1, dtype=np.int32) for k in k_pos}
+        auditL_hit_step_m = {k: np.full(n, -1, dtype=np.int32) for k in k_neg}
+        auditS_hit_step_p = {k: np.full(n, -1, dtype=np.int32) for k in k_pos}
+        auditS_hit_step_m = {k: np.full(n, -1, dtype=np.int32) for k in k_neg}
+
         horizon_sec = int(TF_HORIZONS_SEC[tf])
         window = int(horizon_sec // step_sec)
         if window < 1:
@@ -696,9 +775,9 @@ def process_symbol_year(
         SL_bps_arr = R_bps_arr  # 1R
 
         # --- EV threshold (EV=0) ---
-        cost_bps_arr = cost
+        cost_bps_local = cost_bps_arr  # row-wise, same for all TFs
         denom = np.maximum(TP_bps_arr + SL_bps_arr, 1e-12)
-        p_thr_ev0 = (SL_bps_arr + cost_bps_arr) / denom
+        p_thr_ev0 = (SL_bps_arr + cost_bps_local) / denom
         p_thr_ev0 = np.clip(p_thr_ev0, 0.0, 1.0).astype(np.float32)
         if not np.isfinite(p_thr_ev0).all():
             raise RuntimeError(f"{symbol} {year} tf={tf}: p_thr_ev0 contains NaN/inf")
@@ -717,6 +796,12 @@ def process_symbol_year(
         out[f"risk_r_bps_{tf}"] = R_bps_arr.astype("float32")
         out[f"tp_bps_{tf}"] = TP_bps_arr.astype("float32")
         out[f"sl_bps_{tf}"] = SL_bps_arr.astype("float32")
+
+        # --- NEW AUDIT FIELDS (for Stage4 TP/SL sweep EV gating) ---
+        out[f"audit_rr_min_{tf}"] = np.full(n, rr_tf, dtype=np.float32)
+        out[f"audit_R_bps_{tf}"] = R_bps_arr.astype("float32")        # row-wise
+        out[f"audit_cost_bps_{tf}"] = cost_bps_arr.astype("float32")  # row-wise
+        out[f"audit_cost_R_{tf}"] = cost_R_arr.astype("float32")      # row-wise
 
         # Labels / outcomes
         y_dir = np.zeros(n, dtype=np.int8)
@@ -819,6 +904,11 @@ def process_symbol_year(
                     auditL_mfe_R[i] = np.float32(dL["mfe_R"])
                     auditL_mae_R[i] = np.float32(dL["mae_R"])
                     auditL_first[i] = np.int8(dL["first_touch"])
+                    for k in k_pos:
+                        auditL_hit_step_p[k][i] = np.int32(dL[f"hit_step_p{k}R"])
+                    for k in k_neg:
+                        auditL_hit_step_m[k][i] = np.int32(dL[f"hit_step_m{k}R"])
+                    
                     fts = int(dL["first_touch_step"])
                     auditL_first_step[i] = np.int32((fill_step_L + fts) if (fts >= 0 and fill_step_L >= 0) else -1)
                     for k in k_pos:
@@ -864,6 +954,11 @@ def process_symbol_year(
                     auditS_mfe_R[i] = np.float32(dS["mfe_R"])
                     auditS_mae_R[i] = np.float32(dS["mae_R"])
                     auditS_first[i] = np.int8(dS["first_touch"])
+                    for k in k_pos:
+                        auditS_hit_step_p[k][i] = np.int32(dS[f"hit_step_p{k}R"])
+                    for k in k_neg:
+                        auditS_hit_step_m[k][i] = np.int32(dS[f"hit_step_m{k}R"])
+
                     fts = int(dS["first_touch_step"])
                     auditS_first_step[i] = np.int32((fill_step_S + fts) if (fts >= 0 and fill_step_S >= 0) else -1)
                     for k in k_pos:
@@ -939,22 +1034,34 @@ def process_symbol_year(
         # ============================
         # WRITE AUDIT (NON-FEATURE) COLUMNS
         # ============================
-        out[f"auditL_mfe_R_{tf}"] = auditL_mfe_R
-        out[f"auditL_mae_R_{tf}"] = auditL_mae_R
-        out[f"auditL_first_touch_{tf}"] = auditL_first
-        out[f"auditL_first_touch_step_{tf}"] = auditL_first_step
+        # Core audit per side (names "audit_*" directly)
+        out[f"audit_mfe_R_L_{tf}"] = auditL_mfe_R
+        out[f"audit_mae_R_L_{tf}"] = auditL_mae_R
+        out[f"audit_first_touch_L_{tf}"] = auditL_first
+        out[f"audit_first_touch_step_L_{tf}"] = auditL_first_step
 
-        out[f"auditS_mfe_R_{tf}"] = auditS_mfe_R
-        out[f"auditS_mae_R_{tf}"] = auditS_mae_R
-        out[f"auditS_first_touch_{tf}"] = auditS_first
-        out[f"auditS_first_touch_step_{tf}"] = auditS_first_step
+        out[f"audit_mfe_R_S_{tf}"] = auditS_mfe_R
+        out[f"audit_mae_R_S_{tf}"] = auditS_mae_R
+        out[f"audit_first_touch_S_{tf}"] = auditS_first
+        out[f"audit_first_touch_step_S_{tf}"] = auditS_first_step
 
+        add = {}
+
+        # Hit flags + steps
         for k in k_pos:
-            out[f"auditL_hit_p{k}R_{tf}"] = auditL_hit_p[k]
-            out[f"auditS_hit_p{k}R_{tf}"] = auditS_hit_p[k]
+            add[f"audit_hit_p{k}R_L_{tf}"]      = auditL_hit_p[k]
+            add[f"audit_hit_p{k}R_S_{tf}"]      = auditS_hit_p[k]
+            add[f"audit_hit_step_p{k}R_L_{tf}"] = auditL_hit_step_p[k]
+            add[f"audit_hit_step_p{k}R_S_{tf}"] = auditS_hit_step_p[k]
+
         for k in k_neg:
-            out[f"auditL_hit_m{k}R_{tf}"] = auditL_hit_m[k]
-            out[f"auditS_hit_m{k}R_{tf}"] = auditS_hit_m[k]
+            add[f"audit_hit_m{k}R_L_{tf}"]      = auditL_hit_m[k]
+            add[f"audit_hit_m{k}R_S_{tf}"]      = auditS_hit_m[k]
+            add[f"audit_hit_step_m{k}R_L_{tf}"] = auditL_hit_step_m[k]
+            add[f"audit_hit_step_m{k}R_S_{tf}"] = auditS_hit_step_m[k]
+
+        # ✅ ajoute tout d'un coup (beaucoup moins de fragmentation)
+        out = pd.concat([out, pd.DataFrame(add, index=out.index)], axis=1)
 
         logger.info(f"{symbol} {year} tf={tf} RR+AUDIT done in {_now()-t_tf0:.2f}s")
         gc.collect()
@@ -968,7 +1075,7 @@ def process_symbol_year(
         "spread_bps_entry", "atr_bps",
         "fee_exit_bps", "entry_spread_half_bps",
         "risk_mult", "risk_floor_bps", "rr_min_default",
-        "fill_mode", "fill_window_sec",
+        "fill_mode",
     ]
 
     tf_cols: List[str] = []
@@ -992,15 +1099,26 @@ def process_symbol_year(
 
         # AUDIT (NON-FEATURE)
         audit_cols += [
-            f"auditL_mfe_R_{tf}", f"auditL_mae_R_{tf}",
-            f"auditL_first_touch_{tf}", f"auditL_first_touch_step_{tf}",
-            f"auditS_mfe_R_{tf}", f"auditS_mae_R_{tf}",
-            f"auditS_first_touch_{tf}", f"auditS_first_touch_step_{tf}",
-        ]
-        for k in (1, 2, 3, 4, 5):
-            audit_cols += [f"auditL_hit_p{k}R_{tf}", f"auditS_hit_p{k}R_{tf}"]
-        for k in (1, 2, 3):
-            audit_cols += [f"auditL_hit_m{k}R_{tf}", f"auditS_hit_m{k}R_{tf}"]
+            f"audit_mfe_R_L_{tf}", f"audit_mae_R_L_{tf}",
+            f"audit_first_touch_L_{tf}", f"audit_first_touch_step_L_{tf}",
+            f"audit_mfe_R_S_{tf}", f"audit_mae_R_S_{tf}",
+            f"audit_first_touch_S_{tf}", f"audit_first_touch_step_S_{tf}",
+            f"audit_rr_min_{tf}",
+            f"audit_R_bps_{tf}",
+            f"audit_cost_bps_{tf}",
+            f"audit_cost_R_{tf}",
+            ]
+        
+        for k in (1,2,3,4,5):
+            audit_cols += [
+                f"audit_hit_p{k}R_L_{tf}", f"audit_hit_p{k}R_S_{tf}",
+                f"audit_hit_step_p{k}R_L_{tf}", f"audit_hit_step_p{k}R_S_{tf}",
+            ]
+        for k in (1,2,3):
+            audit_cols += [
+                f"audit_hit_m{k}R_L_{tf}", f"audit_hit_m{k}R_S_{tf}",
+                f"audit_hit_step_m{k}R_L_{tf}", f"audit_hit_step_m{k}R_S_{tf}",
+            ]
 
     out_df = out.reset_index(drop=True)[base_cols + tf_cols + audit_cols]
 
@@ -1019,6 +1137,15 @@ def process_symbol_year(
     else:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         out_df.to_csv(out_path, index=False)
+
+    _write_stage1_columns_json(
+        out_root=out_root,
+        so=so,
+        tfs=tfs,
+        base_cols=base_cols,
+        tf_cols=tf_cols,
+        audit_cols=audit_cols,
+    )
 
     logger.info(f"DONE {symbol} {year} rows={len(out_df):,} total_time={_now()-t0:.1f}s")
     print(f"[OK] {symbol} {year} → {len(out_df)} rows (base_tf={base_tf}, RR bid/ask, conservative fill) → {out_path}")

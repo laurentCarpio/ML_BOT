@@ -56,7 +56,7 @@ def dataset_stage2_all(fs: pafs.S3FileSystem, src_stage2_all_root: str, dataset_
     """
     base = _strip_s3(src_stage2_all_root.rstrip("/"))
     base = f"{base}/{dataset_name}"
-    return ds.dataset(base, filesystem=fs, format="parquet")
+    return ds.dataset(base, filesystem=fs, format="parquet", partitioning="hive")
 
 def _write_parquet(fs: pafs.S3FileSystem, path_s3: str, df: pd.DataFrame):
     table = pa.Table.from_pandas(df, preserve_index=False)
@@ -142,7 +142,7 @@ class EventFormulaChecks:
             return
 
         rid  = df.loc[ok, "row_id"].astype(str).values
-        task = df.loc[ok, "task"].astype(str).values
+        task = df.loc[ok, "task"].astype(str).str.strip().str.lower().values
         tf   = df.loc[ok, "tf"].astype(str).map(_norm_tf).values
         eid  = df.loc[ok, "event_id"].astype(str).values
 
@@ -295,8 +295,9 @@ def save_cutoffs_json(fs: pafs.S3FileSystem, dst_stage2_root: str, cutoffs: Dict
         f.write(json.dumps(payload, indent=2).encode("utf-8"))
 
 def assign_split(df: pd.DataFrame, cutoffs: dict) -> np.ndarray:
-    t = pd.to_datetime(df["t"], utc=True, errors="coerce")
-    tt = t.to_numpy(dtype="datetime64[ns]")
+    # IMPORTANT: df["t"] peut être timestamp[ns][pyarrow]
+    tt = df["t"].to_numpy(dtype="datetime64[ns]", na_value=np.datetime64("NaT"))
+
     out = np.full(len(df), "test", dtype=object)
 
     tf_col = df["tf"].astype(str).str.lower().str.strip().to_numpy()
@@ -322,15 +323,14 @@ def assign_split(df: pd.DataFrame, cutoffs: dict) -> np.ndarray:
         m_tf = (tf_col == str(tf).lower().strip())
         if not m_tf.any():
             continue
+        idx = np.where(m_tf)[0]
         tt_tf = tt[m_tf]
         m_tr = tt_tf <= tr64
         m_va = (tt_tf > tr64) & (tt_tf <= va64)
-        idx = np.where(m_tf)[0]
         out[idx[m_tr]] = "train"
         out[idx[m_va]] = "val"
 
     return out
-
 # ----------------------------
 # Main split runner per dataset
 # ----------------------------
@@ -414,7 +414,7 @@ def split_one_dataset(
             continue
 
         # normalize + filter bad t
-        df["t"] = pd.to_datetime(df["t"], utc=True, errors="coerce")
+        df["t"] = pd.to_datetime(df["t"], utc=True, errors="coerce").dt.tz_convert(None)
         df = df.dropna(subset=["t"])
         if df.empty:
             continue
