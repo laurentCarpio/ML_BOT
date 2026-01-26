@@ -574,8 +574,8 @@ AUDIT_CORE_COLS = [
     "audit_early_abort",
     "audit_timeout",
     "audit_market_toxic",
-    "audit_p_thr_ev0",
-    "audit_rr_min",  
+    "audit_p_thr_ev0",  
+    "audit_rr_min",
     "audit_R_bps",
     "audit_cost_bps",
     "audit_cost_R",
@@ -862,8 +862,14 @@ def _iter_x_ids_y_from_split(
         X = np.nan_to_num(X, copy=False, posinf=0.0, neginf=0.0)
 
         # ----- AUDIT (aligned, STRICT contract) -----
+      
+        rr_min = resolve_rr_min(df)
+        if not np.isfinite(rr_min.to_numpy()).any():
+            raise ValueError("Stage3: rr_min missing. Neither usable audit_rr_min nor rr_min_<tf> found.")
+        df["audit_rr_min"] = rr_min.to_numpy(dtype="float32", copy=False)
+        
         avail_cols = set(df.columns)
-
+        
         # core required
         for c in AUDIT_CORE_COLS:
             if c not in avail_cols:
@@ -921,15 +927,7 @@ def _iter_x_ids_y_from_split(
                 bad = df.iloc[idx][["row_id","event_id","tf",name]]
                 raise ValueError(f"{name} non-finite. Exemples:\n{bad}")
             return v.astype("float32", copy=False)
-
-        rr_min = resolve_rr_min(df)
-        if not np.isfinite(rr_min.to_numpy()).any():
-            # aucun rr_min valide => fail hard (data incorrect)
-            raise ValueError(
-                "Stage3: rr_min missing. Neither a usable audit_rr_min nor rr_min_<tf> columns found."
-            )
         
-        df["audit_rr_min"] = rr_min.to_numpy(dtype="float32", copy=False)
         audit_rr_min = df["audit_rr_min"].to_numpy(dtype="float32", copy=False)
         audit_R_bps    = _req_f32("audit_R_bps")
         audit_cost_bps = _req_f32("audit_cost_bps")
