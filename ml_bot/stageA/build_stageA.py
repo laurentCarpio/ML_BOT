@@ -261,6 +261,90 @@ def write_parquet_part(
     write_parquet(path, df, so, compression=compression)
     return path
 
+def prices_out_partition(prices_root: str, symbol: str, date_yyyy_mm_dd: str) -> str:
+    return f"{prices_root.rstrip('/')}/symbol={symbol}/date={date_yyyy_mm_dd}"
+
+def write_prices_1s_from_book_1s(
+    book_1s: pd.DataFrame,
+    prices_root: str,
+    symbol: str,
+    so: dict,
+    logger: logging.Logger,
+    *,
+    month_start: pd.Timestamp,
+    month_end: pd.Timestamp,
+    chunk_rows: int = 500_000,
+    overwrite: bool = False,
+):
+    """
+    Ecrit mid-price 1s en partitions par date:
+      prices_root/symbol=.../date=YYYY-MM-DD/part-00000.parquet
+    Colonnes: id_t (epoch sec int64), mid (float32)
+    """
+
+    if book_1s is None or book_1s.empty:
+        log(logger, f"[prices_1s] empty book_1s -> skip")
+        return
+
+    if "mid" not in book_1s.columns:
+        raise RuntimeError("[prices_1s] book_1s missing column 'mid'")
+
+    # restreint à la fenêtre du mois utile (UTC)
+    b = book_1s.loc[(book_1s.index >= month_start) & (book_1s.index <= month_end)].copy()
+    if b.empty:
+        log(logger, f"[prices_1s] no rows in month window -> skip")
+        return
+
+    # build minimal df
+    idx = b.index
+    # epoch seconds int64
+    id_t = (idx.view("int64") // 1_000_000_000).astype("int64")
+    out = pd.DataFrame({"id_t": id_t, "mid": b["mid"].astype("float32").to_numpy(copy=False)}, index=idx)
+
+    # partition par date (UTC)
+    dates = pd.Index(out.index.date).unique()
+    dates = sorted([d.isoformat() for d in dates])
+
+    log(logger, f"[prices_1s] writing {len(out):,} rows across {len(dates)} dates -> root={prices_root}")
+
+    for date_str in dates:
+        day_start = pd.Timestamp(date_str, tz="UTC")
+        day_end = day_start + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+        day = out.loc[(out.index >= day_start) & (out.index <= day_end)]
+        if day.empty:
+            continue
+
+        day_dir = prices_out_partition(prices_root, symbol, date_str)
+        safe_mkdir(day_dir, so)
+
+        # overwrite option: delete existing parts
+        if overwrite and day_dir.startswith("s3://"):
+            fs = fsspec.filesystem("s3", **so)
+            if fs.exists(day_dir):
+                old = fs.glob(day_dir.replace("s3://", "") + "/part-*.parquet")
+                for p in old:
+                    fs.rm(f"s3://{p}")
+        elif overwrite and (not day_dir.startswith("s3://")):
+            for p in Path(day_dir).glob("part-*.parquet"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        # write chunked parts
+        n = len(day)
+        n_parts = (n + chunk_rows - 1) // chunk_rows
+        for k in range(n_parts):
+            a = k * chunk_rows
+            b_ = min(n, (k + 1) * chunk_rows)
+            part = day.iloc[a:b_][["id_t", "mid"]].reset_index(drop=True)
+
+            out_path = f"{day_dir}/part-{k:05d}.parquet"
+            write_parquet(out_path, part, so, compression="snappy")
+
+        log(logger, f"[prices_1s] date={date_str} rows={n:,} parts={n_parts}")
+
 # =========================
 # ATR on candles 1m
 # =========================
@@ -969,6 +1053,8 @@ class StageAConfig:
     confirm_thr: float
     confirm_w_trades: float
     confirm_w_imb: float
+    prices_root: str
+    overwrite_prices: bool
 
 def load_candles_1m(path: str, so: dict, logger: logging.Logger) -> pd.DataFrame:
     if not exists(path, so):
@@ -1108,6 +1194,24 @@ def build_stageA_month(cfg: StageAConfig, logger: logging.Logger):
     num_cols = book_1s.select_dtypes(include=["number"]).columns
     book_1s[num_cols] = book_1s[num_cols].astype("float32")
 
+    # --- WRITE prices_1s (mid only) for StageC ---
+    month_start = pd.Timestamp(year=cfg.year, month=cfg.month, day=1, tz="UTC")
+    if cfg.month == 12:
+        month_end = pd.Timestamp(year=cfg.year+1, month=1, day=1, tz="UTC") - pd.Timedelta(seconds=1)
+    else:
+        month_end = pd.Timestamp(year=cfg.year, month=cfg.month+1, day=1, tz="UTC") - pd.Timedelta(seconds=1)
+
+    write_prices_1s_from_book_1s(
+        book_1s=book_1s,
+        prices_root=cfg.prices_root,
+        symbol=cfg.symbol,
+        so=so,
+        logger=logger,
+        month_start=month_start,
+        month_end=month_end,
+        chunk_rows=500_000,
+        overwrite=cfg.overwrite_prices,
+    )
 
     # SUPER IMPORTANT: on n'a plus besoin du book raw ensuite (énorme)
     del book
@@ -1271,6 +1375,9 @@ def main():
     ap.add_argument("--write-schema", action="store_true", help="write schemaA.json to out-root and exit")
     ap.add_argument("--verbose", action="store_true")
 
+    ap.add_argument("--prices-root", default="s3://tradebot-config-tokyo/data/stageA/prices_1s")
+    ap.add_argument("--overwrite-prices", action="store_true", help="overwrite existing prices_1s parts")
+
     args = ap.parse_args()
     logger = setup_logger(verbose=args.verbose)
 
@@ -1316,6 +1423,8 @@ def main():
                 confirm_thr=float(args.confirm_thr),
                 confirm_w_trades=float(args.confirm_w_trades),
                 confirm_w_imb=float(args.confirm_w_imb),
+                prices_root=str(args.prices_root),
+                overwrite_prices=bool(args.overwrite_prices),
             )
             try:
                 build_stageA_month(cfg, logger)

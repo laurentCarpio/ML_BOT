@@ -65,18 +65,6 @@ def _book_month_path(root_book: str, symbol: str, y: int, m: int) -> str:
 def _trade_month_path(root_trade: str, symbol: str, y: int, m: int) -> str:
     return f"{root_trade.rstrip('/')}/{symbol}/{y}-{m:02d}.parquet"
 
-# ──────────────────────────── reporting helpers ──────────────────────────────
-
-def _latency_report(ts: pd.Series, rt: pd.Series, label: str) -> None:
-    ok = ts.notna() & rt.notna()
-    if not ok.any():
-        print(f"{label} latency: n/a (missing columns or all NA)")
-        return
-    d = (rt[ok] - ts[ok]).dt.total_seconds() * 1000.0
-    neg = int((d < 0).sum())
-    p50, p90, p99 = np.nanpercentile(d, [50, 90, 99]) if len(d) else (np.nan, np.nan, np.nan)
-    print(f"{label} latency ms: median={p50:.2f}  p90={p90:.2f}  p99={p99:.2f}  negatives={neg}")
-
 # ─────────────────────── schema-level depth detection ────────────────────────
 
 def _detect_levels_from_schema(book_path: str, region: Optional[str]) -> tuple[tuple[int,int], tuple[int,int]]:
@@ -126,9 +114,6 @@ def _basic_book_checks(df: pd.DataFrame) -> None:
         print(f"duplicate timestamps: {int(df['timestamp'].duplicated().sum())}")
         if "received_time" in df.columns:
             print(f"time span (received_time): {_fmt_dt(df['received_time'].min())} → {_fmt_dt(df['received_time'].max())}")
-
-    if "received_time" in df.columns:
-        _latency_report(df["timestamp"], df["received_time"], "BOOK")
 
     print("\n── BOOK: structural sanity checks")
     chk = df[["bid_0_price","ask_0_price"]].dropna()
@@ -278,8 +263,7 @@ def _validate_trades_month(tr_path: str, region: Optional[str], n: int) -> None:
     print("✅ timestamp/price/qty present")
     print(f"time span: {_fmt_dt(view['timestamp'].min())} → {_fmt_dt(view['timestamp'].max())}")
     print(f"price<=0: {int((view['price']<=0).sum())}, qty<=0: {int((view['qty']<=0).sum())}")
-    if "received_time" in view.columns:
-        _latency_report(view["timestamp"], view["received_time"], "TRADES")
+
     if n>0:
         head = view.head(n).copy()
         head["timestamp"] = head["timestamp"].map(_fmt_dt)
@@ -292,11 +276,11 @@ def _validate_trades_month(tr_path: str, region: Optional[str], n: int) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="Validate BOOK(15) / TRADES monthly Parquet on S3 (RAM-safe, received_time-aware).")
-    ap.add_argument("--symbol", required=True)
-    ap.add_argument("--ym", required=True, help="YYYY-MM (e.g., 2023-01)")
+    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--ym", default="2024-06", help="YYYY-MM (e.g., 2023-01)")
     ap.add_argument("--aws-region", default="ap-northeast-1")
-    ap.add_argument("--root-book", required=True)
-    ap.add_argument("--root-trade", default=None)
+    ap.add_argument("--root-book", default="s3://tradebot-config-tokyo/data/book")
+    ap.add_argument("--root-trade", default="s3://tradebot-config-tokyo/data/trade")
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--probes", type=int, default=4)
     ap.add_argument("--probe-window-sec", type=int, default=5)

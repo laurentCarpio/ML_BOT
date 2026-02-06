@@ -266,9 +266,11 @@ def _cli():
     ap.add_argument("--thr-s", type=float, default="0.3977672740")
 
     ap.add_argument("--stageb-root", default="s3://tradebot-config-tokyo/data/stageB/dataset=v1")
-    ap.add_argument("--split", choices=["val", "test"], default="val")
-    ap.add_argument("--n-files", type=int, default=5)
-    ap.add_argument("--max-rows", type=int, default=200000)
+    #ap.add_argument("--split", choices=["val", "test"], default="val")
+    ap.add_argument("--split", default="train")
+    
+    ap.add_argument("--n-files", type=int, default=0)    #remettre 5 apres 
+    ap.add_argument("--max-rows", type=int, default=500000)    #remettre 200000 apres 
     ap.add_argument("--seed", type=int, default=42)
 
     # required columns in parquet for replay
