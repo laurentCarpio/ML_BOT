@@ -1,0 +1,269 @@
+🧠 1️⃣ Architecture Globale
+
+Ton système final repose sur :
+ML A  →  Filtre structurel (probabilité directionnelle)
+ML B  →  Filtre micro / confirmation
+A ∩ B →  Signal ultra sélectif
+Sizing →  Optimisation du rendement
+
+Le cœur du système n’est PAS le RR.
+Ce n’est PAS la volatilité.
+Ce n’est PAS un grid search.
+
+C’est :
+
+Intersection probabiliste + sizing monotone.
+
+
+🔵 2️⃣ Construction du modèle A (pA)
+
+🎯 Rôle
+
+ML A capture le setup structurel “retail pattern”
+(multi-timeframe SMA/EMA + logique ABCD, etc.)
+
+Il répond à la question :
+
+Est-ce que le contexte macro/structurel est favorable ?
+
+📦 Inputs typiques
+	•	Features multi-TF (20/200 cross)
+	•	Distance aux moyennes
+	•	Structure pullback / BOS
+	•	Regime tags
+	•	Peut inclure RSI gate
+	•	Features purement “candle structure”
+
+🧮 Output
+
+pA = probabilité que le signal directionnel soit correct
+
+🧪 Label
+
+Basé sur résultat futur :
+
+y = 1  (TP atteint)
+y = 0  (flat)
+y = -1 (SL atteint)
+
+Mais A est souvent entraîné en version binaire directionnelle.
+
+⸻
+
+🔎 Utilisation finale
+
+Filtre : 
+
+pA ≥ 0.70
+
+👉 A sert à filtrer les mauvais contextes.
+
+🟢 3️⃣ Construction du modèle B (pB)
+
+🎯 Rôle
+
+ML B capture la microstructure au moment d’entrée.
+
+Il répond à :
+
+Est-ce que le marché est réellement en train de pousser dans la direction attendue ?
+
+⸻
+
+📦 Inputs typiques
+	•	OBI (5 / 10 niveaux)
+	•	Microprice bias
+	•	Wall share
+	•	Slope bid/ask
+	•	Executed vs added
+	•	Spread / churn
+	•	Flux L1 / trades
+
+🧮 Output
+
+pB = probabilité micro que le trade déclenche réellement
+
+🔬 Ce que B fait très bien
+
+B ne crée pas l’edge.
+Il filtre les faux signaux de A.
+
+⸻
+
+🟣 4️⃣ Intersection A ∩ B
+
+Signal final :
+
+pA ≥ 0.70
+AND
+pB ≥ top10 TRAIN
+
+Avec :
+
+pB cutoff appris sur TRAIN uniquement
+cutoff ≈ 0.3124
+
+⚠️ Important :
+Le cutoff n’est PAS appris sur TEST.
+Zéro leakage.
+
+🧮 5️⃣ R Construction
+
+Tu as deux façons :
+
+❌ Méthode 1 (ancienne)
+
+Recalcul via mfe/mae
+
+✅ Méthode actuelle
+
+Basé sur label y :
+
+if y == 1 → +1.3R
+if y == -1 → -1R
+if y == 0 → 0R
+
+Pourquoi ?
+
+Parce que :
+	•	C’est stable
+	•	C’est cohérent avec ton entraînement
+	•	Pas de re-simulation hasardeuse
+
+⸻
+
+🟡 6️⃣ Split strict
+
+TRAIN = <= 2024-12-31
+TEST  = >= 2025-01-01
+
+Tout apprentissage (cutoff, bins, sizing) = TRAIN only.
+
+Application = TEST only.
+
+⸻
+
+🟠 7️⃣ Résultat stable actuel
+
+Sur TEST :
+	•	80 trades
+	•	17.5% win
+	•	0% loss
+	•	82.5% flat
+	•	+0.227R expectancy
+	•	0 drawdown
+
+Profil :
+
+Ultra conservateur
+Très asymétrique
+Filtre anti-mauvais-trades
+
+🔴 8️⃣ Sizing (nouvelle couche)
+
+🎯 Objectif
+
+Ne PAS changer les filtres.
+
+Optimiser rendement sans toucher à la stabilité.
+
+⸻
+
+🧠 Méthode
+
+1️⃣ Sur TRAIN selection uniquement :
+	•	découper pB en quantiles
+	•	mesurer expectancy par bin
+	•	vérifier monotonicité
+
+Tu as obtenu :
+
+Expectancy croît avec pB
+0.65 → 1.10
+
+Monotone propre.
+
+⸻
+
+🧮 Construction multiplicateur
+
+Pour chaque bin :
+
+mult = expectancy_bin / expectancy_global
+
+ou autre normalisation stable.
+
+Puis :
+
+Application sur TEST :
+
+R_sized = R_base × mult
+
+🎯 Résultat
+
+Expectancy TEST :
+
+0.227R → 0.379R
+
+Sans :
+	•	ajouter de pertes
+	•	augmenter DD
+	•	changer win rate
+	•	toucher aux filtres
+
+⸻
+
+🧠 9️⃣ Ce que tu as réellement construit
+
+Ce n’est pas un modèle ML unique.
+
+C’est :
+
+Stage 1  → Pattern structurel (A)
+Stage 2  → Micro confirmation (B)
+Stage 3  → Filtre intersection
+Stage 4  → Position sizing adaptatif
+
+C’est une architecture modulaire.
+
+⸻
+
+🏗️ Setup Final figé
+
+Voici ton setup propre :
+
+pA ≥ 0.70
+pB ≥ top10 TRAIN (≈0.3124)
+RR = 1.3
+R basé sur y
+Pas de filtre vol
+Split strict TRAIN → TEST
+Sizing monotone croissant avec pB
+Quantile-based learned on TRAIN
+
+💎 Pourquoi c’est élégant
+
+Parce que :
+	•	Pas de complexité inutile
+	•	Pas de regime filter
+	•	Pas de grid search
+	•	Pas d’overfit apparent
+	•	Pas d’optimisation brute
+	•	Structure monotone logique
+	•	Architecture claire
+
+⸻
+
+🧠 Ce que ça révèle
+
+Ton edge ne vient PAS de :
+	•	la volatilité
+	•	le regime
+	•	le RR tuning
+	•	le multi-paramètre
+
+Il vient de :
+
+La probabilité conjointe A ∩ B.
+
+Point.
