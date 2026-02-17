@@ -82,7 +82,10 @@ def compute_mfe_mae_R_on_events(
         pos[pos < 0] = np.where(ok[pos < 0], pos2[pos < 0], -1)
         miss = np.where(pos < 0)[0]
         if len(miss) > 0:
-            raise RuntimeError(f"{len(miss)} event t0 not found/snappable in 1m index")
+            # 👇 au lieu de raise, on laisse NaN et on droppera ensuite
+            bad_t0 = events_t0[miss]
+            print(f"[warn] {len(miss)} event t0 not snappable, dropping. sample={bad_t0[:5]}")
+            # pos reste à -1 pour ces lignes
 
     H = int(mfe_horizon_min)
     high = candles_1m["high"].to_numpy(dtype=float)
@@ -96,6 +99,8 @@ def compute_mfe_mae_R_on_events(
     Rb = R_bps.astype(float)
 
     for i, p0 in enumerate(pos):
+        if p0 < 0:
+            continue
         s = p0 + 1
         e = p0 + 1 + H
         if e > len(high):
@@ -191,6 +196,9 @@ def main():
     years = list(range(df.index.min().year, pd.Timestamp(args.end).year + 1))
     log(f"[load] candles 1m years={years}")
     candles_1m = load_candles_yearly(args.s3_candles_root, args.symbol, years=years).sort_index()
+
+    print("events span:", df.index.min(), "->", df.index.max())
+    print("candles span:", candles_1m.index.min(), "->", candles_1m.index.max())
 
     # compute mfe/mae
     mfe_mae = compute_mfe_mae_R_on_events(
