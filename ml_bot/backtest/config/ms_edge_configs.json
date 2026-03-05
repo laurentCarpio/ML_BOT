@@ -5,6 +5,8 @@
     "book_root": "s3://tradebot-config-tokyo/data/book",
     "candles_root": "s3://tradebot-config-tokyo/data/bougie",
     "out_root": "s3://tradebot-config-tokyo/research/ms_edge/runs",
+    "expected_trades_rows": 1281,
+    "n_vol_buckets": 5,
   
     "params": {
       "runaway_T": 30,

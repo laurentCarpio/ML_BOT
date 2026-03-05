@@ -178,11 +178,10 @@ def evaluate_config(events_m: pd.DataFrame, book_m: pd.DataFrame, *,
     return stats, trades
 
 def router_pick(trades_vol: pd.DataFrame, bo_name: str, mr_name: str) -> pd.DataFrame:
-    """
-    Rule: mid_vol -> MR else BO, on the actual trades tables (not paired events).
-    """
     t = trades_vol.copy()
-    pick = np.where(t["vol_bucket"] == "mid_vol", mr_name, bo_name)
+    # support both naming schemes
+    is_mid = (t["vol_bucket"] == "mid_vol") | (t["vol_bucket"] == "b2")
+    pick = np.where(is_mid, mr_name, bo_name)
     t["router_pick"] = pick
     return t.loc[t["config"] == t["router_pick"]].copy()
 
@@ -237,6 +236,18 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
     )
     print("res:", res.shape, "| trades:", trades.shape)
 
+    # ----------------------------
+    # GOLDEN CHECK (repro guardrail)
+    # ----------------------------
+    expected = cfg.get("expected_trades_rows", None)
+    if expected is not None:
+        got = int(len(trades))
+        if got != int(expected):
+            raise RuntimeError(
+                f"[GOLDEN CHECK] trades rows mismatch: expected={expected} got={got} "
+                f"(start={start}, end={end}, mode={mode})"
+            )
+
     # outputs tables
     ev_pivot = res.pivot_table(index="config", columns="month", values="EV_T_bps", aggfunc="mean")
     n_pivot  = res.pivot_table(index="config", columns="month", values="n", aggfunc="mean")
@@ -286,7 +297,12 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
         years = sorted(pd.to_datetime(trades["timestamp"], utc=True).dt.year.unique().tolist())
         candles_1m = load_candles_years(cfg["candles_root"], symbol, years)
         atr_tf = compute_atr_bps_from_1m(candles_1m, atr_n=int(p["atr_n"]), tf=str(p["atr_tf"]))
-        trades_vol = attach_vol_bucket(trades, atr_tf)
+
+        nb = int(cfg.get("n_vol_buckets", 3))
+        trades_vol = attach_vol_bucket(trades, atr_tf, n_buckets=nb)
+        
+        print("vol buckets:", sorted(trades_vol["vol_bucket"].unique().tolist()))
+        print("bucket counts:\n", trades_vol.groupby(["config","vol_bucket"]).size())
 
         write_parquet_s3(atr_tf, f"{out_run}/atr_tf.parquet")
         write_parquet_s3(trades_vol, f"{out_run}/trades_with_atr_buckets.parquet")
@@ -315,6 +331,9 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
         bo_name = cfg["router"]["bo_name"]
         mr_name = cfg["router"]["mr_name"]
         router_trades = router_pick(trades_vol, bo_name=bo_name, mr_name=mr_name)
+
+        print("router pick counts:\n", router_trades.groupby(["router_pick","vol_bucket"]).size())
+        print("router trades:", router_trades.shape)
 
         x = router_trades["pnl_net_bps"].to_numpy(dtype="float64")
         ci_iid = bootstrap_iid(x, n_boot=int(p["n_boot"]), seed=int(p["seed"]))

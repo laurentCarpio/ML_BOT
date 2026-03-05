@@ -39,12 +39,13 @@ def compute_atr_bps_from_1m(candles_1m: pd.DataFrame, atr_n: int, tf: str) -> pd
     ohlc["atr_bps"] = (ohlc["atr"] / ohlc["close"]) * 1e4
     return ohlc[["timestamp", "atr_bps"]]
 
-
-def attach_vol_bucket(trades: pd.DataFrame, atr_tf_df: pd.DataFrame) -> pd.DataFrame:
+def attach_vol_bucket(trades: pd.DataFrame, atr_tf_df: pd.DataFrame, n_buckets: int = 3) -> pd.DataFrame:
     """
     trades: timestamp (trade time), pnl_net_bps, config
     atr_tf_df: timestamp (tf bar), atr_bps
-    attaches nearest past atr (asof backward), then tercile bucket.
+    attaches nearest past atr (asof backward), then quantile buckets.
+    n_buckets=3 -> low/mid/high
+    n_buckets=5 -> b0..b4 (or keep names if you prefer)
     """
     t = trades.copy()
     t["timestamp"] = pd.to_datetime(t["timestamp"], utc=True)
@@ -54,20 +55,31 @@ def attach_vol_bucket(trades: pd.DataFrame, atr_tf_df: pd.DataFrame) -> pd.DataF
     t2 = pd.merge_asof(t, a, on="timestamp", direction="backward")
     t2 = t2.dropna(subset=["atr_bps"]).copy()
 
-    q1 = float(t2["atr_bps"].quantile(1/3))
-    q2 = float(t2["atr_bps"].quantile(2/3))
+    nb = int(n_buckets)
+    if nb < 2:
+        raise ValueError("n_buckets must be >= 2")
 
-    def bucket(v):
-        if v <= q1:
-            return "low_vol"
-        if v <= q2:
-            return "mid_vol"
-        return "high_vol"
+    # quantile edges: 0, 1/nb, 2/nb, ..., 1
+    qs = [i / nb for i in range(1, nb)]
+    edges = [float(t2["atr_bps"].quantile(q)) for q in qs]
+
+    def bucket(v: float) -> str:
+        # bucket index in [0..nb-1]
+        k = 0
+        for e in edges:
+            if v <= e:
+                return f"b{k}"
+            k += 1
+        return f"b{nb-1}"
 
     t2["vol_bucket"] = t2["atr_bps"].map(bucket)
-    t2["t_atr"] = t2["timestamp"]  # keep column name used in notebook
-    return t2
 
+    # optional: keep legacy names when nb==3
+    if nb == 3:
+        t2["vol_bucket"] = t2["vol_bucket"].map({"b0": "low_vol", "b1": "mid_vol", "b2": "high_vol"})
+
+    t2["t_atr"] = t2["timestamp"]
+    return t2
 
 def load_candles_years(candles_root: str, symbol: str, years: List[int]) -> pd.DataFrame:
     parts = []
