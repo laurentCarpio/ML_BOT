@@ -1,0 +1,42 @@
+{
+    "symbol": "BTCUSDT",
+    "events_tagged_root": "s3://tradebot-config-tokyo/data/v1",
+    "events_evalready_root": "s3://tradebot-config-tokyo/data/v1_evalready",
+    "book_root": "s3://tradebot-config-tokyo/data/book",
+    "candles_root": "s3://tradebot-config-tokyo/data/bougie",
+    "out_root": "s3://tradebot-config-tokyo/research/ms_edge/runs",
+  
+    "params": {
+      "runaway_T": 30,
+      "tol_s": 0.25,
+      "pad_pre_s": 2.0,
+      "pad_post_s": 185.0,
+      "atr_tf": "15min",
+      "atr_n": 14,
+      "n_boot": 2000,
+      "seed": 7
+    },
+  
+    "configs": [
+      {
+        "name": "BO | rw>-15 | gate=T60>0 | 60_if_neg_else_180",
+        "mode": "BO",
+        "runaway_min_bps": -15,
+        "gate": "T60>0",
+        "exit_rule": "exit:60_if_neg_else_180"
+      },
+      {
+        "name": "MR | rw>-15 | gate=T60>0 | 60_if_neg_else_180",
+        "mode": "MR",
+        "runaway_min_bps": -15,
+        "gate": "T60>0",
+        "exit_rule": "exit:60_if_neg_else_180"
+      }
+    ],
+  
+    "router": {
+      "bo_name": "BO | rw>-15 | gate=T60>0 | 60_if_neg_else_180",
+      "mr_name": "MR | rw>-15 | gate=T60>0 | 60_if_neg_else_180",
+      "rule": "mid->MR else BO"
+    }
+  }
