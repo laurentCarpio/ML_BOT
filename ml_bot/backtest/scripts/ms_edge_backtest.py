@@ -3,7 +3,7 @@
 # ml_bot/backtest/scripts/ms_edge_backtest.py
 
 from __future__ import annotations
-import json
+
 import numpy as np
 import pandas as pd
 import fsspec
@@ -14,7 +14,7 @@ from ml_bot.backtest.lib.s3_paths import events_tagged_month_path, events_evalre
 from ml_bot.backtest.lib.windows import build_windows
 from ml_bot.backtest.lib.book_windows import read_book_with_next_windows
 from ml_bot.backtest.lib.pnl import pnl_at_T_bps, apply_exit_rule
-from ml_bot.backtest.lib.bootstrap import bootstrap_iid, bootstrap_block_by_day
+from ml_bot.backtest.lib.bootstrap import bootstrap_iid, bootstrap_block_by_day, bootstrap_block_delta_by_day
 from ml_bot.backtest.lib.atr_vol import load_candles_years, compute_atr_bps_from_1m, attach_vol_bucket
 
 
@@ -177,12 +177,14 @@ def evaluate_config(events_m: pd.DataFrame, book_m: pd.DataFrame, *,
 
     return stats, trades
 
-def router_pick(trades_vol: pd.DataFrame, bo_name: str, mr_name: str) -> pd.DataFrame:
+def router_pick(trades_vol: pd.DataFrame, bo_name: str, mr_name: str, n_buckets: int) -> pd.DataFrame:
     t = trades_vol.copy()
-    # support both naming schemes
-    is_mid = (t["vol_bucket"] == "mid_vol") | (t["vol_bucket"] == "b2")
-    pick = np.where(is_mid, mr_name, bo_name)
-    t["router_pick"] = pick
+    if "mid_vol" in t["vol_bucket"].unique():
+        is_mr = (t["vol_bucket"] == "mid_vol")
+    else:
+        mid_idx = n_buckets // 2   # 5->2, 7->3
+        is_mr = (t["vol_bucket"] == f"b{mid_idx}")
+    t["router_pick"] = np.where(is_mr, mr_name, bo_name)
     return t.loc[t["config"] == t["router_pick"]].copy()
 
 def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
@@ -268,6 +270,7 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
     write_parquet_s3(stability.reset_index(), f"{out_run}/stability.parquet")
     write_json_s3({"cfg": cfg, "start": start, "end": end, "mode": mode, "run_id": run_id}, f"{out_run}/run_config.json")
 
+
     # ----------------------------
     # Pool + bootstrap for target configs
     # ----------------------------
@@ -330,7 +333,7 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
         # router
         bo_name = cfg["router"]["bo_name"]
         mr_name = cfg["router"]["mr_name"]
-        router_trades = router_pick(trades_vol, bo_name=bo_name, mr_name=mr_name)
+        router_trades = router_pick(trades_vol, bo_name=bo_name, mr_name=mr_name, n_buckets=nb)
 
         print("router pick counts:\n", router_trades.groupby(["router_pick","vol_bucket"]).size())
         print("router trades:", router_trades.shape)
@@ -348,7 +351,112 @@ def run_backtest(cfg: dict, start: str, end: str, mode: str = "tagged") -> None:
             "CI_blk_lo": ci_blk[0], "CI_blk_hi": ci_blk[1],
         }])
 
+        # ----------------------------
+        # Router candidates search (which buckets -> MR)
+        # Objective: maximize CI_blk_lo (robust edge)
+        # ----------------------------
+        buckets = sorted(trades_vol["vol_bucket"].dropna().unique().tolist())
+        bo_name = cfg["router"]["bo_name"]
+        mr_name = cfg["router"]["mr_name"]
+
+        def router_pick_custom(trades_vol_df: pd.DataFrame, mr_buckets: set[str]) -> pd.DataFrame:
+            t = trades_vol_df.copy()
+            pick = np.where(t["vol_bucket"].isin(list(mr_buckets)), mr_name, bo_name)
+            t["router_pick"] = pick
+            return t.loc[t["config"] == t["router_pick"]].copy()
+
+        cand_rows = []
+
+        # candidate sets: single bucket + contiguous ranges (by index) + all-but-one
+        # (simple + interpretable, avoids 2^K explosion)
+        bucket_sets = []
+
+        # singles
+        for b in buckets:
+            bucket_sets.append({b})
+
+        # contiguous ranges
+        for i in range(len(buckets)):
+            for j in range(i, len(buckets)):
+                bucket_sets.append(set(buckets[i:j+1]))
+
+        # all-but-one
+        for b in buckets:
+            bucket_sets.append(set([x for x in buckets if x != b]))
+
+        # de-dup
+        uniq = []
+        seen = set()
+        for s in bucket_sets:
+            key = ",".join(sorted(s))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(s)
+
+        for mr_set in uniq:
+            rt = router_pick_custom(trades_vol, mr_buckets=mr_set)
+            x = rt["pnl_net_bps"].to_numpy(dtype="float64")
+            if len(x) == 0:
+                continue
+            ci_blk = bootstrap_block_by_day(rt, value_col="pnl_net_bps", day_col="day",
+                                            n_boot=int(p["n_boot"]), seed=int(p["seed"]))
+            cand_rows.append({
+                "mr_buckets": ",".join(sorted(mr_set)),
+                "n_trades": int(len(x)),
+                "n_days": int(rt["day"].nunique()),
+                "EV_bps": float(np.mean(x)),
+                "CI_blk_lo": float(ci_blk[0]),
+                "CI_blk_hi": float(ci_blk[1]),
+            })
+
+        router_candidates = pd.DataFrame(cand_rows).sort_values(["CI_blk_lo","EV_bps"], ascending=[False, False])
+        write_parquet_s3(router_candidates, f"{out_run}/router_candidates.parquet")
+
         write_parquet_s3(router_trades, f"{out_run}/router_trades.parquet")
         write_parquet_s3(router_summary, f"{out_run}/router_summary.parquet")
+
+        # ----------------------------
+        # Bucket DELTA: MR - BO (block bootstrap by day)
+        # ----------------------------
+        bo_name = cfg["router"]["bo_name"]
+        mr_name = cfg["router"]["mr_name"]
+
+        # sanity
+        if bo_name not in set(trades_vol["config"].unique()) or mr_name not in set(trades_vol["config"].unique()):
+            print("[WARN] bucket_delta skipped: bo/mr config names not found in trades_vol")
+        else:
+            delta_rows = []
+            for bucket in sorted(trades_vol["vol_bucket"].dropna().unique().tolist()):
+                bo = trades_vol[(trades_vol["config"] == bo_name) & (trades_vol["vol_bucket"] == bucket)].copy()
+                mr = trades_vol[(trades_vol["config"] == mr_name) & (trades_vol["vol_bucket"] == bucket)].copy()
+
+                x_bo = bo["pnl_net_bps"].to_numpy(dtype="float64")
+                x_mr = mr["pnl_net_bps"].to_numpy(dtype="float64")
+
+                ev_bo = float(np.mean(x_bo)) if len(x_bo) else np.nan
+                ev_mr = float(np.mean(x_mr)) if len(x_mr) else np.nan
+                delta_ev = (ev_mr - ev_bo) if np.isfinite(ev_bo) and np.isfinite(ev_mr) else np.nan
+
+                # block bootstrap CI on EV difference (by day)
+                # simplest + robust: resample days within each group separately, then subtract means
+                ci_lo, ci_hi = bootstrap_block_delta_by_day(
+                    bo, mr,
+                    value_col="pnl_net_bps", day_col="day",
+                    n_boot=int(p["n_boot"]), seed=int(p["seed"])
+                )
+
+                delta_rows.append({
+                    "bucket": bucket,
+                    "delta_EV_bps": float(delta_ev) if np.isfinite(delta_ev) else np.nan,
+                    "CI_blk_lo": float(ci_lo),
+                    "CI_blk_hi": float(ci_hi),
+                    "n_bo": int(len(x_bo)),
+                    "n_mr": int(len(x_mr)),
+                    "days_bo": int(bo["day"].nunique()),
+                    "days_mr": int(mr["day"].nunique()),
+                })
+
+            bucket_delta = pd.DataFrame(delta_rows).sort_values("bucket")
+            write_parquet_s3(bucket_delta, f"{out_run}/bucket_delta.parquet")
 
     print(f"✅ done. outputs at: {out_run}")
