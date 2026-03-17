@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ml_bot/backtest/scripts/run_range.py
+
 from __future__ import annotations
 import argparse, json
 

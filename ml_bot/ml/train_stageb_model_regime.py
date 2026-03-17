@@ -7,6 +7,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 
+import json
+import tempfile
+from pathlib import Path
+
+import boto3
 import numpy as np
 import pandas as pd
 
@@ -58,6 +63,15 @@ BASE_EXCLUDE = {
     "pnl_net_bps", "y_go", "y_strong", "is_tradeable_baseline", "fees_rt_bps", "slip_bps",
 }
 
+def write_file_s3(local_path: str, s3_path: str) -> None:
+    if not s3_path.startswith("s3://"):
+        raise ValueError(f"Expected s3 path, got: {s3_path}")
+
+    no_scheme = s3_path[len("s3://"):]
+    bucket, key = no_scheme.split("/", 1)
+
+    s3 = boto3.client("s3")
+    s3.upload_file(local_path, bucket, key)
 
 def map_regime3(v: str) -> str:
     if v in ("b0", "b1"):
@@ -68,7 +82,6 @@ def map_regime3(v: str) -> str:
         return "high"
     return "other"
 
-
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     if "micro_bias_bps" in x.columns:
@@ -78,7 +91,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "OBI_10" in x.columns:
         x["abs_OBI_10"] = x["OBI_10"].abs()
     return x
-
 
 def eval_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
     out = {}
@@ -91,7 +103,6 @@ def eval_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
         out["ap"] = np.nan
         out["logloss"] = np.nan
     return out
-
 
 def make_decile_table(df_scored: pd.DataFrame, label_col: str) -> pd.DataFrame:
     x = df_scored.copy().dropna(subset=["score", "pnl_net_bps", label_col])
@@ -114,7 +125,6 @@ def make_decile_table(df_scored: pd.DataFrame, label_col: str) -> pd.DataFrame:
     )
     return out
 
-
 def make_topk_table(df_scored: pd.DataFrame, top_fracs: tuple[float, ...], label_col: str) -> pd.DataFrame:
     x = df_scored.copy().dropna(subset=["score", "pnl_net_bps", label_col]).sort_values("score", ascending=False)
     n = len(x)
@@ -133,7 +143,6 @@ def make_topk_table(df_scored: pd.DataFrame, top_fracs: tuple[float, ...], label
             "score_cut": float(sub["score"].iloc[-1]),
         })
     return pd.DataFrame(rows)
-
 
 def main():
     ap = argparse.ArgumentParser("Train StageB BO model by vol regime")
@@ -244,6 +253,12 @@ def main():
     print(imp.to_string(index=False))
     write_parquet_s3(imp, f"{out_run}/feature_importance.parquet")
 
+    # save model artifact
+    with tempfile.TemporaryDirectory() as td:
+        model_path = str(Path(td) / "xgb_model.json")
+        model.get_booster().save_model(model_path)
+        write_file_s3(model_path, f"{out_run}/xgb_model.json")
+
     write_json_s3({
         "run_id": run_id,
         "config": asdict(cfg),
@@ -251,10 +266,12 @@ def main():
         "n_train": int(len(train)),
         "n_val": int(len(val)),
         "n_test": int(len(test)),
+        "model_artifact": "xgb_model.json",
+        "score_column": "score",
+        "model_type": "xgboost_binary_classifier",
     }, f"{out_run}/run_config.json")
 
     print(f"\n✅ run written to: {out_run}")
-
 
 if __name__ == "__main__":
     main()
