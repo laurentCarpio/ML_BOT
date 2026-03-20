@@ -8,14 +8,17 @@ import argparse
 from dataclasses import asdict
 import gc
 import time
-
+import numpy as np
 import pandas as pd
 
 from ml_bot.backtest.lib.io_s3 import write_json_s3
 from ml_bot.core.stage0.spr_v1 import (
     Stage0SPRConfig,
     fit_thresholds,
+    candidate_filter_masks,
+    compute_ms,
 )
+
 from ml_bot.cli.run_stage0_spr_walkforward import (
     ym_range_end_exclusive,
     mk_paths,
@@ -135,6 +138,28 @@ def main():
 
     thr = fit_thresholds(train_df, cfg)
 
+    # Rebuild hard-pass mask on the train sample, then compute MS cut exactly as in backtest
+    masks = candidate_filter_masks(train_df, cfg, thr)
+
+    pass_all_hard = pd.Series(True, index=train_df.index)
+    for cond in masks.values():
+        pass_all_hard &= pd.Series(cond, index=train_df.index)
+
+    n_pass_all_hard = int(pass_all_hard.sum())
+    print(f"[prod_thr] n_pass_all_hard={n_pass_all_hard:,}", flush=True)
+
+    if n_pass_all_hard == 0:
+        raise SystemExit("[prod_thr] no hard-pass rows in training sample, cannot compute ms_cut_value")
+
+    ms_series = compute_ms(train_df.loc[pass_all_hard], thr).astype("float64")
+    ms_cut_value = float(np.nanpercentile(ms_series.values, cfg.ms_keep_quantile))
+
+    print(
+        f"[prod_thr] ms_keep_quantile={cfg.ms_keep_quantile} "
+        f"ms_cut_value={ms_cut_value:.6f}",
+        flush=True,
+    )
+
     # optional but useful: save regime meta too for future production reuse
     reg_meta = fit_regime_from_train(
         train_df,
@@ -145,6 +170,8 @@ def main():
     )
 
     thresholds_payload = asdict(thr)
+    thresholds_payload["ms_cut_value"] = ms_cut_value
+    
     cfg_payload = asdict(cfg)
 
     meta_payload = {
@@ -156,6 +183,9 @@ def main():
         "train_sample_seed": int(args.train_sample_seed),
         "n_train_rows": int(len(train_df)),
         "regime_meta": reg_meta,
+        "n_pass_all_hard": n_pass_all_hard,
+        "ms_keep_quantile": float(cfg.ms_keep_quantile),
+        "ms_cut_value": float(ms_cut_value),
         "paths": {
             "root_book": args.root_book,
             "root_trades": args.root_trades,

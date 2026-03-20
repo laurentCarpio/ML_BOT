@@ -106,7 +106,10 @@ def build_feats_month_full(book_path: str, trades_path: str, cfg: Stage0SPRConfi
 # -----------------------
 
 def train_need_cols(regime_src_col: str) -> list[str]:
-    # minimal for fit_thresholds + regime quantiles
+    # minimal for:
+    # - fit_thresholds
+    # - regime quantiles
+    # - candidate_filter_masks / pass_all_hard reconstruction
     cols = [
         "timestamp",
         "spread_ticks_1s",
@@ -118,6 +121,10 @@ def train_need_cols(regime_src_col: str) -> list[str]:
         "TI",
         "nps",
         "thinning_opp_3",
+        "dir0",
+        "Ntot",
+        "persist_micro_ms",
+        "persist_obi10_ms",
     ]
     if regime_src_col and regime_src_col not in cols:
         cols.append(regime_src_col)

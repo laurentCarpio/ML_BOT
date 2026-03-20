@@ -779,7 +779,6 @@ def candidate_filter_masks(df: pd.DataFrame, cfg: Stage0SPRConfig, thr: SPRThres
 
     return masks
 
-
 def apply_candidate_filters(df: pd.DataFrame, masks: "OrderedDict[str, np.ndarray]") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
